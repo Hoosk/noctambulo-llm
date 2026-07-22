@@ -1,0 +1,10 @@
+# Burn 0.21 Performance Configuration
+
+[fusion]
+enabled = true
+
+[autotune]
+mode = "fastest"
+
+[wgpu]
+autotune = true

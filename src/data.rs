@@ -172,7 +172,9 @@ impl LlmTokenizer {
 }
 
 pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let local_cache = PathBuf::from(format!("dataset_{}_{}", repo_id.replace("/", "_"), filename));
+    let datasets_dir = PathBuf::from("datasets");
+    std::fs::create_dir_all(&datasets_dir)?;
+    let local_cache = datasets_dir.join(format!("dataset_{}_{}", repo_id.replace("/", "_"), filename));
     if local_cache.exists() {
         println!("Using cached dataset file: {:?}", local_cache);
         return Ok(local_cache);
@@ -187,6 +189,68 @@ pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf
     println!("Saved dataset locally to {:?}", local_cache);
     Ok(local_cache)
 }
+
+pub fn combine_and_mix_datasets(
+    sources: &[PathBuf],
+    output_path: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if sources.len() == 1 {
+        return Ok(sources[0].clone());
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    println!("Combining and mixing {} datasets into {:?}...", sources.len(), output_path);
+
+    let mut readers: Vec<BufReader<File>> = Vec::new();
+    for src in sources {
+        let file = File::open(src).map_err(|e| format!("Failed to open dataset file {:?}: {}", src, e))?;
+        readers.push(BufReader::with_capacity(1 * 1024 * 1024, file));
+    }
+
+    let out_file = File::create(output_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(2 * 1024 * 1024, out_file);
+
+    let mut total_lines = 0u64;
+    let mut active_count = readers.len();
+    let mut active_flags = vec![true; readers.len()];
+    let mut line_buf = String::new();
+
+    while active_count > 0 {
+        for i in 0..readers.len() {
+            if !active_flags[i] {
+                continue;
+            }
+            line_buf.clear();
+            match readers[i].read_line(&mut line_buf) {
+                Ok(0) => {
+                    active_flags[i] = false;
+                    active_count -= 1;
+                }
+                Ok(_) => {
+                    let trimmed = line_buf.trim();
+                    if !trimmed.is_empty() {
+                        writer.write_all(trimmed.as_bytes())?;
+                        writer.write_all(b"\n")?;
+                        total_lines += 1;
+                    }
+                }
+                Err(e) => {
+                    println!("Warning: error reading from dataset {:?}: {}", sources[i], e);
+                    active_flags[i] = false;
+                    active_count -= 1;
+                }
+            }
+        }
+    }
+
+    writer.flush()?;
+    println!("Combined dataset ready: {} lines written to {:?}.", total_lines, output_path);
+    Ok(output_path.to_path_buf())
+}
+
 
 pub fn train_custom_tokenizer(
     corpus_path: &str,

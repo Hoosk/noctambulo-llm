@@ -2,11 +2,15 @@
 /target/
 
 # Datasets pesados y archivos de datos locales
+datasets/
 dataset_roneneldan_TinyStories_TinyStories-train.txt
 corpus.txt
 
+
 # Salidas y checkpoints del modelo
 /model_output/
+/exported/
+
 
 # Archivos del sistema y configuraciones locales
 .DS_Store

@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 # Deep Learning (última versión disponible en crates.io)
-burn = { version = "0.21", features = ["wgpu", "train", "autodiff"] }
+burn = { version = "0.21", features = ["wgpu", "train", "autodiff", "fusion"] }
+
 
 # Tokenización y acceso a Hugging Face
 tokenizers = "0.23"

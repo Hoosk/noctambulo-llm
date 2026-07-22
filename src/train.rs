@@ -148,8 +148,14 @@ pub fn train<B: AutodiffBackend>(
     let mut optim = AdamWConfig::new().init();
 
     let num_batches = dataset.len() / batch_size;
-    println!("Starting LLM training loop: {} epochs, {} batches per epoch...", epochs, num_batches);
+    let total_steps = epochs * num_batches;
+    let warmup_steps = std::cmp::min(1000, total_steps / 10);
+    let min_lr = lr * 0.1;
+
+    println!("Starting 2026 LLM training loop: {} epochs, {} batches/epoch (Total steps: {})...", epochs, num_batches, total_steps);
     println!("===============================================================================");
+
+    let mut global_step = 0usize;
 
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
@@ -162,6 +168,17 @@ pub fn train<B: AutodiffBackend>(
         let log_interval = std::cmp::max(1, num_batches / 10);
 
         for batch_idx in 0..num_batches {
+            global_step += 1;
+
+            // Cosine Learning Rate Schedule with Warmup
+            let current_lr = if global_step <= warmup_steps {
+                lr * (global_step as f64 / warmup_steps as f64)
+            } else {
+                let progress = (global_step - warmup_steps) as f64 / (total_steps - warmup_steps) as f64;
+                let cosine_decay = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+                min_lr + (lr - min_lr) * cosine_decay
+            };
+
             let start = batch_idx * batch_size;
             let end = start + batch_size;
             let indices: Vec<usize> = (start..end).collect();
@@ -176,17 +193,15 @@ pub fn train<B: AutodiffBackend>(
             let target_log_probs = log_probs.gather(1, targets_flat);
             let loss = target_log_probs.mean().neg();
 
-
-
             // Accumulate loss ON GPU detached from autograd graph
             accum_loss_tensor = accum_loss_tensor + loss.clone().detach();
             accum_count += 1;
 
             let grads = loss.backward();
             let grads_params = GradientsParams::from_grads(grads, &model);
-            model = optim.step(lr, model, grads_params);
+            model = optim.step(current_lr, model, grads_params);
 
-            // Live progress line (no GPU sync, just shows batch counter and ETA)
+            // Live progress line
             if last_live_update.elapsed().as_millis() >= 500 {
                 last_live_update = Instant::now();
                 let elapsed = epoch_start.elapsed().as_secs_f64();
@@ -202,13 +217,13 @@ pub fn train<B: AutodiffBackend>(
                 let elapsed_s = elapsed as u64 % 60;
 
                 print!(
-                    "\r  [Epoch {}/{}] {:5.1}% | Batch {}/{} | {:.0} batch/s | Elapsed: {:02}m {:02}s | ETA: {:02}m {:02}s   ",
-                    epoch, epochs, pct, batch_idx + 1, num_batches, batches_per_sec, elapsed_min, elapsed_s, eta_min, eta_s
+                    "\r  [Epoch {}/{}] {:5.1}% | Batch {}/{} | {:.0} batch/s | LR: {:.2e} | Elapsed: {:02}m {:02}s | ETA: {:02}m {:02}s   ",
+                    epoch, epochs, pct, batch_idx + 1, num_batches, batches_per_sec, current_lr, elapsed_min, elapsed_s, eta_min, eta_s
                 );
                 let _ = std::io::stdout().flush();
             }
 
-            // Full GPU-synced log line at intervals (~10x per epoch)
+            // Full GPU-synced log line at intervals
             let is_log_step = (batch_idx + 1) % log_interval == 0 || batch_idx == num_batches - 1;
             if is_log_step {
                 let interval_loss = accum_loss_tensor
@@ -227,8 +242,8 @@ pub fn train<B: AutodiffBackend>(
                 let progress = ((batch_idx + 1) as f32 / num_batches as f32) * 100.0;
 
                 println!(
-                    "\r  [Epoch {:2}/{:2}] Batch {:6}/{:6} ({:5.1}%) | Step Loss: {:.4} | Avg Loss: {:.4}        ",
-                    epoch, epochs, batch_idx + 1, num_batches, progress, interval_avg, current_epoch_avg
+                    "\r  [Epoch {:2}/{:2}] Batch {:6}/{:6} ({:5.1}%) | Step Loss: {:.4} | Avg Loss: {:.4} | LR: {:.2e}        ",
+                    epoch, epochs, batch_idx + 1, num_batches, progress, interval_avg, current_epoch_avg, current_lr
                 );
 
                 // Reset GPU loss accumulator for next interval
@@ -236,7 +251,6 @@ pub fn train<B: AutodiffBackend>(
                 accum_count = 0;
             }
         }
-
 
         let elapsed = epoch_start.elapsed().as_secs_f32();
         let final_epoch_avg = if total_batches > 0 { total_epoch_loss / total_batches as f32 } else { 0.0 };
@@ -249,8 +263,11 @@ pub fn train<B: AutodiffBackend>(
             &model.valid(),
             tokenizer,
             "Once upon a time",
-            20,
+            25,
             0.7,
+            40,
+            0.9,
+            1.1,
             42 + epoch as u64,
             device,
         ) {
@@ -260,6 +277,7 @@ pub fn train<B: AutodiffBackend>(
             "==============================================================================="
         );
     }
+
 
     println!("Training finished successfully!");
 
