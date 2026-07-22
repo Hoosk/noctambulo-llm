@@ -1,0 +1,14 @@
+# Rust / Cargo
+/target/
+
+# Datasets pesados y archivos de datos locales
+dataset_roneneldan_TinyStories_TinyStories-train.txt
+corpus.txt
+
+# Salidas y checkpoints del modelo
+/model_output/
+
+# Archivos del sistema y configuraciones locales
+.DS_Store
+Thumbs.db
+/.agents/
