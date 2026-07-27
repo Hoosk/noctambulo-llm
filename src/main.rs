@@ -4,22 +4,20 @@ mod export;
 mod generate;
 mod model;
 mod train;
+mod tui;
 
+use clap::{Args, Parser, Subcommand};
 use config::ModelConfig;
 use data::{combine_and_mix_datasets, download_dataset_from_hf, train_custom_tokenizer, LlmTokenizer};
-
 use export::export_to_gguf;
 use generate::generate;
-use model::{LlmConfig, Llm};
+use model::Llm;
 use std::path::{Path, PathBuf};
 use train::train;
 
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
 use burn::module::Module;
-
-
-
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
 const DEFAULT_CORPUS: &str = "\
@@ -37,80 +35,144 @@ This model will learn the statistics of the words and start producing text \
 that sounds like a tutorial or technical documentation on Rust and Burn. \
 ";
 
+#[derive(Parser)]
+#[command(name = "kuro-neko", author, version, about = "🐈‍⬛ Kuro-Neko 2026 Engine", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Train a custom BPE tokenizer on corpus or datasets
+    TrainTokenizer(TrainTokenizerArgs),
+    /// Train the causal transformer model
+    Train(TrainArgs),
+    /// Generate text autoregressively from a prompt
+    Generate(GenerateArgs),
+    /// Export model weights and metadata to GGUF format
+    Export(ExportArgs),
+    /// Print model parameter count, VRAM footprint, and FLOPs statistics
+    Stats,
+}
+
+#[derive(Args)]
+struct TrainTokenizerArgs {
+    /// HF dataset repo ID(s) (comma-separated, e.g. roneneldan/TinyStories)
+    #[arg(long, value_delimiter = ',')]
+    dataset: Vec<String>,
+    /// Local dataset file path
+    #[arg(long)]
+    file: Option<String>,
+    /// Target file name inside HF dataset repo
+    #[arg(long, default_value = "TinyStories-train.txt")]
+    dataset_file: String,
+    /// Vocabulary size
+    #[arg(long, default_value_t = 8000)]
+    vocab_size: usize,
+}
+
+#[derive(Args)]
+struct TrainArgs {
+    /// HF dataset repo ID(s) (comma-separated, e.g. roneneldan/TinyStories)
+    #[arg(long, value_delimiter = ',')]
+    dataset: Vec<String>,
+    /// Local dataset file path
+    #[arg(long)]
+    file: Option<String>,
+    /// Target file name inside HF dataset repo
+    #[arg(long, default_value = "TinyStories-train.txt")]
+    dataset_file: String,
+    /// Batch size
+    #[arg(long, default_value_t = 128)]
+    batch_size: usize,
+    /// Number of epochs
+    #[arg(long, default_value_t = 3)]
+    epochs: usize,
+    /// Max dataset tokens to load (0 = all)
+    #[arg(long, default_value_t = 10_000_000)]
+    max_tokens: usize,
+    /// Sliding window step in tokens (default: same as n-ctx)
+    #[arg(long)]
+    step: Option<usize>,
+    /// Context window size
+    #[arg(long, default_value_t = 256)]
+    n_ctx: usize,
+    /// Embedding dimension
+    #[arg(long, default_value_t = 256)]
+    n_embd: usize,
+    /// Attention query heads count
+    #[arg(long, default_value_t = 4)]
+    n_head: usize,
+    /// Attention key/value heads count for GQA (0 or None = same as n-head)
+    #[arg(long)]
+    n_kv_head: Option<usize>,
+    /// Transformer layers count
+    #[arg(long, default_value_t = 4)]
+    n_layer: usize,
+    /// Learning rate
+    #[arg(long, default_value_t = 3e-4)]
+    lr: f64,
+    /// Dropout probability
+    #[arg(long, default_value_t = 0.1)]
+    dropout: f64,
+    /// Attention score softcapping threshold (0.0 = disabled, 50.0 = Gemma 4 math)
+    #[arg(long, default_value_t = 0.0)]
+    attn_softcap: f32,
+}
+
+#[derive(Args)]
+struct GenerateArgs {
+    /// Prompt text for completion
+    prompt: String,
+    /// Sampling temperature
+    #[arg(long, default_value_t = 0.7)]
+    temp: f32,
+    /// Top-K sampling
+    #[arg(long, default_value_t = 40)]
+    top_k: usize,
+    /// Top-P (nucleus) sampling
+    #[arg(long, default_value_t = 0.9)]
+    top_p: f32,
+    /// Min-P sampling threshold (0.05 = standard 2026 value)
+    #[arg(long, default_value_t = 0.05)]
+    min_p: f32,
+    /// Repetition penalty
+    #[arg(long, default_value_t = 1.1)]
+    rep_penalty: f32,
+    /// Maximum new tokens to generate
+    #[arg(long, default_value_t = 50)]
+    max_tokens: usize,
+    /// Random seed
+    #[arg(long)]
+    seed: Option<u64>,
+}
+
+#[derive(Args)]
+struct ExportArgs {
+    /// Name of the exported GGUF model binary
+    #[arg(long, default_value = "kuro-neko-qwen")]
+    model_name: String,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.len() < 2 {
-        println!("==========================================================================");
-        println!("                    🔥 Kuro-Neko 2026 Engine 🔥                          ");
-        println!("==========================================================================");
-        println!("Commands:");
-        println!("  cargo run --release train-tokenizer [--dataset <repo>] [--file <path>] [--vocab-size <n>]");
-        println!("  cargo run --release train [OPTIONS]");
-        println!("      Options:");
-        println!("        --dataset <repo>     HF dataset repo ID (e.g. roneneldan/TinyStories)");
-        println!("        --file <path>        Local dataset file path");
-        println!("        --batch-size <n>     Batch size (default: 128)");
-        println!("        --epochs <n>         Number of epochs (default: 3)");
-        println!("        --max-tokens <n>     Max dataset tokens to load (default: 10000000, 0=all)");
-
-        println!("        --step <n>           Sliding window step in tokens (default: same as n-ctx)");
-        println!("        --n-ctx <n>          Context window size (default: 64)");
-        println!("        --n-embd <n>         Embedding dimension (default: 256)");
-        println!("        --n-head <n>         Attention heads count (default: 4)");
-        println!("        --n-layer <n>        Transformer layers count (default: 4)");
-        println!("        --lr <float>         Learning rate (default: 0.001)");
-        println!("  cargo run --release generate \"<prompt>\" [--temp <f>] [--top-k <n>] [--top-p <f>] [--rep-penalty <f>]");
-        println!("  cargo run --release export [--outfile <path.gguf>]");
-        println!("==========================================================================");
-        return Ok(());
-    }
-
-    let mode = &args[1];
-
-    let default_vocab_size = 8000;
-    let mut n_embd = 256;
-    let mut n_head = 4;
-    let mut n_layer = 4;
-    let mut n_ctx = 256;
-    let mut epochs = 3;
-    let mut batch_size = 128;
-    let mut max_tokens: Option<usize> = Some(10_000_000);
-
-
-    let mut custom_step: Option<usize> = None;
-    let mut lr = 1e-3;
-
+    let cli = Cli::parse();
     let output_dir = "model_output";
     let custom_tokenizer_file = "custom_tokenizer.json";
-
     let device = WgpuDevice::default();
 
-    match mode.as_str() {
-        "train-tokenizer" => {
-            let mut vocab_size = default_vocab_size;
+    match cli.command {
+        Commands::TrainTokenizer(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();
-
-            let mut i = 2;
-            while i < args.len() {
-                if args[i] == "--vocab-size" && i + 1 < args.len() {
-                    vocab_size = args[i + 1].parse().unwrap_or(default_vocab_size);
-                    i += 2;
-                } else if (args[i] == "--dataset" || args[i] == "--datasets") && i + 1 < args.len() {
-                    for repo in args[i + 1].split(',') {
-                        let repo = repo.trim();
-                        if !repo.is_empty() {
-                            let downloaded = download_dataset_from_hf(repo, "TinyStories-train.txt")?;
-                            sources.push(downloaded);
-                        }
-                    }
-                    i += 2;
-                } else if args[i] == "--file" && i + 1 < args.len() {
-                    sources.push(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else {
-                    i += 1;
+            for repo in &args.dataset {
+                let repo = repo.trim();
+                if !repo.is_empty() {
+                    let downloaded = download_dataset_from_hf(repo, &args.dataset_file)?;
+                    sources.push(downloaded);
                 }
+            }
+            if let Some(file_path) = args.file {
+                sources.push(PathBuf::from(file_path));
             }
 
             let corpus_path = if sources.is_empty() {
@@ -126,61 +188,40 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 combined.to_string_lossy().to_string()
             };
 
-            train_custom_tokenizer(&corpus_path, custom_tokenizer_file, vocab_size)?;
+            println!("Training custom BPE tokenizer (vocab_size={}) on '{}'...", args.vocab_size, corpus_path);
+            train_custom_tokenizer(&corpus_path, custom_tokenizer_file, args.vocab_size)?;
+            println!("Tokenizer successfully trained and saved to '{}'.", custom_tokenizer_file);
         }
-        "train" => {
+        Commands::Train(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();
             let mut raw_text: Option<String> = None;
 
-            let mut i = 2;
-            while i < args.len() {
-                if (args[i] == "--dataset" || args[i] == "--datasets") && i + 1 < args.len() {
-                    for repo in args[i + 1].split(',') {
-                        let repo = repo.trim();
-                        if !repo.is_empty() {
-                            let downloaded = download_dataset_from_hf(repo, "TinyStories-train.txt")?;
-                            sources.push(downloaded);
-                        }
-                    }
-                    i += 2;
-                } else if args[i] == "--file" && i + 1 < args.len() {
-                    sources.push(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else if args[i] == "--batch-size" && i + 1 < args.len() {
-                    batch_size = args[i + 1].parse().unwrap_or(128);
-                    i += 2;
-                } else if args[i] == "--epochs" && i + 1 < args.len() {
-                    epochs = args[i + 1].parse().unwrap_or(3);
-                    i += 2;
-                } else if args[i] == "--max-tokens" && i + 1 < args.len() {
-                    let val: usize = args[i + 1].parse().unwrap_or(50_000_000);
-                    max_tokens = if val == 0 { None } else { Some(val) };
-                    i += 2;
-                } else if args[i] == "--step" && i + 1 < args.len() {
-                    custom_step = Some(args[i + 1].parse().unwrap_or(64));
-                    i += 2;
-                } else if args[i] == "--n-ctx" && i + 1 < args.len() {
-                    n_ctx = args[i + 1].parse().unwrap_or(256);
-                    i += 2;
-                } else if args[i] == "--n-embd" && i + 1 < args.len() {
-                    n_embd = args[i + 1].parse().unwrap_or(256);
-                    i += 2;
-                } else if args[i] == "--n-head" && i + 1 < args.len() {
-                    n_head = args[i + 1].parse().unwrap_or(4);
-                    i += 2;
-                } else if args[i] == "--n-layer" && i + 1 < args.len() {
-                    n_layer = args[i + 1].parse().unwrap_or(4);
-                    i += 2;
-                } else if args[i] == "--lr" && i + 1 < args.len() {
-                    lr = args[i + 1].parse().unwrap_or(1e-3);
-                    i += 2;
-                } else {
-                    i += 1;
+            for repo in &args.dataset {
+                let repo = repo.trim();
+                if !repo.is_empty() {
+                    let downloaded = download_dataset_from_hf(repo, &args.dataset_file)?;
+                    sources.push(downloaded);
                 }
+            }
+            if let Some(file_path) = args.file {
+                sources.push(PathBuf::from(file_path));
             }
 
             let dataset_path_buf: Option<PathBuf> = if sources.is_empty() {
-                if Path::new("corpus.txt").exists() {
+                let mut found_dataset: Option<PathBuf> = None;
+                if let Ok(entries) = std::fs::read_dir(".") {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with("dataset_") && name.ends_with(".txt") {
+                            found_dataset = Some(entry.path());
+                            break;
+                        }
+                    }
+                }
+                if let Some(ds_path) = found_dataset {
+                    tui::print_info(&format!("Auto-detected cached dataset file: {:?}", ds_path));
+                    Some(ds_path)
+                } else if Path::new("corpus.txt").exists() {
                     Some(PathBuf::from("corpus.txt"))
                 } else {
                     raw_text = Some(DEFAULT_CORPUS.to_string());
@@ -192,79 +233,46 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some(combine_and_mix_datasets(&sources, Path::new("datasets/combined_corpus.txt"))?)
             };
 
-
             let tokenizer = if Path::new(custom_tokenizer_file).exists() {
-                println!("Loading trained custom tokenizer from '{}'...", custom_tokenizer_file);
+                tui::print_info(&format!("Loading trained custom tokenizer from '{}'...", custom_tokenizer_file));
                 LlmTokenizer::from_file(custom_tokenizer_file)?
             } else {
-                println!("No custom tokenizer found. Training custom tokenizer first...");
-                train_custom_tokenizer("corpus.txt", custom_tokenizer_file, default_vocab_size)?;
+                tui::print_warning("No custom tokenizer found. Training custom tokenizer first...");
+                train_custom_tokenizer("corpus.txt", custom_tokenizer_file, 8000)?;
                 LlmTokenizer::from_file(custom_tokenizer_file)?
             };
 
             let vocab_size = tokenizer.vocab_size();
-            println!("Tokenizer ready. Total vocabulary size: {}", vocab_size);
+            tui::print_success(&format!("Tokenizer ready. Total vocabulary size: {}", tui::format_number(vocab_size)));
 
-            let model_config = ModelConfig::new(vocab_size, n_embd, n_head, n_layer, n_ctx);
+            let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
+
+            let model_config = ModelConfig::new(
+                vocab_size,
+                args.n_embd,
+                args.n_head,
+                args.n_kv_head,
+                args.n_layer,
+                args.n_ctx,
+                args.dropout,
+                args.attn_softcap,
+            );
+
             train::<Autodiff<Wgpu>>(
-
-
                 dataset_path_buf.as_deref(),
                 raw_text.as_deref(),
                 model_config,
                 &tokenizer,
-                epochs,
-                batch_size,
-                lr,
-                custom_step,
+                args.epochs,
+                args.batch_size,
+                args.lr,
+                args.step,
                 max_tokens,
                 &device,
                 output_dir,
             )?;
         }
-        "generate" => {
-            if args.len() < 3 {
-                println!("Error: Please provide a prompt for completion.");
-                println!("Example: cargo run generate \"Once upon a time\" --temp 0.7 --top-k 40 --top-p 0.9");
-                return Ok(());
-            }
-
-            let mut prompt = String::new();
-            let mut temp = 0.7f32;
-            let mut top_k = 40usize;
-            let mut top_p = 0.9f32;
-            let mut rep_penalty = 1.1f32;
-            let mut max_new_tokens = 50usize;
-            let mut user_seed: Option<u64> = None;
-
-            let mut i = 2;
-            while i < args.len() {
-                if args[i] == "--temp" && i + 1 < args.len() {
-                    temp = args[i + 1].parse().unwrap_or(0.7);
-                    i += 2;
-                } else if args[i] == "--top-k" && i + 1 < args.len() {
-                    top_k = args[i + 1].parse().unwrap_or(40);
-                    i += 2;
-                } else if args[i] == "--top-p" && i + 1 < args.len() {
-                    top_p = args[i + 1].parse().unwrap_or(0.9);
-                    i += 2;
-                } else if args[i] == "--rep-penalty" && i + 1 < args.len() {
-                    rep_penalty = args[i + 1].parse().unwrap_or(1.1);
-                    i += 2;
-                } else if (args[i] == "--tokens" || args[i] == "--max-tokens" || args[i] == "--length") && i + 1 < args.len() {
-                    max_new_tokens = args[i + 1].parse().unwrap_or(50);
-                    i += 2;
-                } else if args[i] == "--seed" && i + 1 < args.len() {
-                    user_seed = args[i + 1].parse().ok();
-                    i += 2;
-                } else if prompt.is_empty() {
-                    prompt = args[i].clone();
-                    i += 1;
-                } else {
-                    i += 1;
-                }
-            }
-
+        Commands::Generate(args) => {
             let config_path = Path::new(output_dir).join("config.json");
             let weights_path = Path::new(output_dir).join("model_weights");
 
@@ -282,40 +290,37 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
             };
 
-            let llm_config = LlmConfig {
-                vocab_size: model_config.vocab_size,
-                n_embd: model_config.n_embd,
-                n_head: model_config.n_head,
-                n_layer: model_config.n_layer,
-                n_ctx: model_config.n_ctx,
-            };
-
-            let model: Llm<Wgpu> = llm_config.init(&device);
+            let model: Llm<Wgpu> = model_config.init_model(&device);
             let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-            let record = recorder.load(weights_path, &device)
+            let record = recorder
+                .load(weights_path, &device)
                 .map_err(|e| format!("Failed to load weights: {:?}", e))?;
             let model = model.load_record(record);
 
-            let seed = user_seed.unwrap_or_else(|| {
+            let seed = args.seed.unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as u64)
                     .unwrap_or(42)
             });
 
-            let result = generate(&model, &tokenizer, &prompt, max_new_tokens, temp, top_k, top_p, rep_penalty, seed, &device)?;
+            let result = generate(
+                &model,
+                &tokenizer,
+                &args.prompt,
+                args.max_tokens,
+                args.temp,
+                args.top_k,
+                args.top_p,
+                args.min_p,
+                args.rep_penalty,
+                seed,
+                &device,
+            )?;
 
             println!("Generation Result:\n{}", result);
-
         }
-        "export" => {
-            let mut model_name = "kuro-neko-2026".to_string();
-            for i in 2..args.len() {
-                if (args[i] == "--model-name" || args[i] == "--outfile" || args[i] == "--name") && i + 1 < args.len() {
-                    model_name = args[i + 1].clone();
-                }
-            }
-
+        Commands::Export(args) => {
             let config_path = Path::new(output_dir).join("config.json");
             let weights_path = Path::new(output_dir).join("model_weights");
 
@@ -327,27 +332,72 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let config_str = std::fs::read_to_string(config_path)?;
             let model_config: ModelConfig = serde_json::from_str(&config_str)?;
 
-            let llm_config = LlmConfig {
-                vocab_size: model_config.vocab_size,
-                n_embd: model_config.n_embd,
-                n_head: model_config.n_head,
-                n_layer: model_config.n_layer,
-                n_ctx: model_config.n_ctx,
-            };
-
-            let model: Llm<Wgpu> = llm_config.init(&device);
-
-
+            let model: Llm<Wgpu> = model_config.init_model(&device);
             let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-            let record = recorder.load(weights_path, &device)
+            let record = recorder
+                .load(weights_path, &device)
                 .map_err(|e| format!("Failed to load weights: {:?}", e))?;
             let model = model.load_record(record);
 
-            export_to_gguf(&model, &model_config, &model_name, custom_tokenizer_file)?;
+            export_to_gguf(&model, &model_config, custom_tokenizer_file, &args.model_name, "exported")?;
         }
+        Commands::Stats => {
+            let config_path = Path::new(output_dir).join("config.json");
+            let model_config = if config_path.exists() {
+                let config_str = std::fs::read_to_string(&config_path)?;
+                serde_json::from_str::<ModelConfig>(&config_str)?
+            } else {
+                ModelConfig::new(8000, 256, 4, None, 4, 256, 0.1, 0.0)
+            };
 
-        _ => {
-            println!("Unknown command: '{}'. Use 'train-tokenizer', 'train', 'generate', or 'export'.", mode);
+            let n_embd = model_config.n_embd;
+            let n_head = model_config.n_head;
+            let n_kv_head = model_config.get_n_kv_head();
+            let head_dim = n_embd / n_head;
+            let kv_dim = n_kv_head * head_dim;
+            let n_layer = model_config.n_layer;
+            let vocab_size = model_config.vocab_size;
+
+            let raw_hidden = (8 * n_embd) / 3;
+            let hidden_dim = raw_hidden.div_ceil(256) * 256;
+
+            // Parameter Count Breakdown
+            let embed_params = vocab_size * n_embd;
+            let q_params = n_embd * n_embd + n_embd; // with bias
+            let k_params = n_embd * kv_dim + kv_dim; // with bias
+            let v_params = n_embd * kv_dim + kv_dim; // with bias
+            let out_params = n_embd * n_embd;
+            let attn_norm_params = n_embd;
+            let ffn_norm_params = n_embd;
+            let gate_params = n_embd * hidden_dim;
+            let up_params = n_embd * hidden_dim;
+            let down_params = hidden_dim * n_embd;
+
+            let block_params = attn_norm_params + q_params + k_params + v_params + out_params + ffn_norm_params + gate_params + up_params + down_params;
+            let final_norm_params = n_embd;
+            let total_params = embed_params + (n_layer * block_params) + final_norm_params;
+
+            let fp32_bytes = total_params * 4;
+            let fp32_mb = fp32_bytes as f64 / (1024.0 * 1024.0);
+            let flops_per_token = 2 * total_params;
+
+            println!("===============================================================================");
+            println!("🐈‍⬛ Kuro-Neko 2026 Model Architecture Statistics");
+            println!("===============================================================================");
+            println!("  Vocab Size       : {} tokens", vocab_size);
+            println!("  Context Window   : {} tokens", model_config.n_ctx);
+            println!("  Embedding Dim    : {}", n_embd);
+            println!("  Hidden SwiGLU Dim: {} (aligned to 256)", hidden_dim);
+            println!("  Query Heads      : {}", n_head);
+            println!("  KV Heads (GQA)   : {} (Ratio 1:{})", n_kv_head, n_head / n_kv_head);
+            println!("  Layers           : {}", n_layer);
+            println!("  Softcapping Cap  : {}", if model_config.attn_softcap > 0.0 { format!("{:.1}", model_config.attn_softcap) } else { "Disabled".to_string() });
+            println!("-------------------------------------------------------------------------------");
+            println!("  Total Parameters : {} ({:.2} Million)", total_params, total_params as f64 / 1_000_000.0);
+            println!("  Model Size (FP32): {:.2} MB", fp32_mb);
+            println!("  FLOPs per Token  : {:.2} GFLOPs", flops_per_token as f64 / 1_000_000_000.0);
+            println!("  GQA Cache Saving : {:.1}% KV-cache VRAM reduction", (1.0 - (n_kv_head as f64 / n_head as f64)) * 100.0);
+            println!("===============================================================================");
         }
     }
 

@@ -1,17 +1,13 @@
 use crate::config::ModelConfig;
 use crate::data::LlmTokenizer;
-use crate::generate::generate;
-use crate::model::LlmConfig;
+use crate::generate::{generate, XorshiftRng};
+use crate::tui;
+use burn::grad_clipping::GradientClippingConfig;
 use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Int, Tensor, TensorData};
-
-
-
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
@@ -29,10 +25,10 @@ impl TextDataset {
         custom_step: Option<usize>,
         max_tokens: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let mut tokens = tokenizer.encode_file_streaming(path)?;
+        let mut tokens = tokenizer.encode_file_streaming(path, max_tokens)?;
         if let Some(limit) = max_tokens {
             if limit > 0 && tokens.len() > limit {
-                println!("Limiting training dataset to {} tokens (out of {} total loaded).", limit, tokens.len());
+                tui::print_warning(&format!("Limiting training dataset to {} tokens.", tui::format_number(limit)));
                 tokens.truncate(limit);
             }
         }
@@ -59,7 +55,6 @@ impl TextDataset {
         let step = std::cmp::max(1, step);
         Self { tokens, n_ctx, step }
     }
-
 
     pub fn len(&self) -> usize {
         let chunk_size = self.n_ctx + 1;
@@ -107,6 +102,14 @@ impl TextDataset {
     }
 }
 
+fn shuffle_indices(indices: &mut [usize], rng: &mut XorshiftRng) {
+    let len = indices.len();
+    for i in (1..len).rev() {
+        let j = (rng.next_f32() * (i + 1) as f32) as usize % (i + 1);
+        indices.swap(i, j);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn train<B: AutodiffBackend>(
     dataset_path: Option<&Path>,
@@ -133,29 +136,34 @@ pub fn train<B: AutodiffBackend>(
         return Err("Dataset contains 0 valid sequence samples for the current context length.".into());
     }
 
-    println!("Dataset prepared: {} total training sequences.", dataset.len());
+    tui::print_info("Initializing model architecture on WGPU device...");
+    let mut model = model_config.init_model::<B>(device);
+    let mut optim = AdamWConfig::new()
+        .with_weight_decay(0.1f32)
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
+        .init();
 
-    let llm_config = LlmConfig {
-        vocab_size: model_config.vocab_size,
-        n_embd: model_config.n_embd,
-        n_head: model_config.n_head,
-        n_layer: model_config.n_layer,
-        n_ctx: model_config.n_ctx,
-    };
-
-    println!("Initializing model architecture on WGPU device...");
-    let mut model = llm_config.init::<B>(device);
-    let mut optim = AdamWConfig::new().init();
-
-    let num_batches = dataset.len() / batch_size;
+    let effective_batch_size = std::cmp::min(batch_size, dataset.len());
+    let num_batches = dataset.len().div_ceil(effective_batch_size);
     let total_steps = epochs * num_batches;
-    let warmup_steps = std::cmp::min(1000, total_steps / 10);
+    let warmup_steps = if total_steps <= 10 { 0 } else { std::cmp::min(1000, total_steps / 10) };
     let min_lr = lr * 0.1;
 
-    println!("Starting 2026 LLM training loop: {} epochs, {} batches/epoch (Total steps: {})...", epochs, num_batches, total_steps);
-    println!("===============================================================================");
+    tui::print_training_header(
+        &model_config,
+        dataset.len(),
+        dataset.tokens.len(),
+        epochs,
+        num_batches,
+        effective_batch_size,
+        lr,
+    );
 
     let mut global_step = 0usize;
+    let mut shuffle_rng = XorshiftRng::new(42);
+    let mut last_loss = 0.0f32;
+    let mut last_avg_loss = 0.0f32;
+    let training_start = Instant::now();
 
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
@@ -167,21 +175,27 @@ pub fn train<B: AutodiffBackend>(
 
         let log_interval = std::cmp::max(1, num_batches / 10);
 
+        // Shuffle sequence sample indices per epoch
+        let mut sample_indices: Vec<usize> = (0..dataset.len()).collect();
+        shuffle_indices(&mut sample_indices, &mut shuffle_rng);
+
         for batch_idx in 0..num_batches {
             global_step += 1;
 
             // Cosine Learning Rate Schedule with Warmup
-            let current_lr = if global_step <= warmup_steps {
+            let current_lr = if warmup_steps > 0 && global_step <= warmup_steps {
                 lr * (global_step as f64 / warmup_steps as f64)
-            } else {
+            } else if total_steps > warmup_steps {
                 let progress = (global_step - warmup_steps) as f64 / (total_steps - warmup_steps) as f64;
                 let cosine_decay = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
                 min_lr + (lr - min_lr) * cosine_decay
+            } else {
+                lr
             };
 
-            let start = batch_idx * batch_size;
-            let end = start + batch_size;
-            let indices: Vec<usize> = (start..end).collect();
+            let start = batch_idx * effective_batch_size;
+            let end = std::cmp::min(start + effective_batch_size, dataset.len());
+            let indices: Vec<usize> = sample_indices[start..end].to_vec();
 
             let (inputs, targets) = dataset.get_batch::<B>(&indices, model_config.n_ctx, device);
             let logits = model.forward(inputs);
@@ -201,28 +215,6 @@ pub fn train<B: AutodiffBackend>(
             let grads_params = GradientsParams::from_grads(grads, &model);
             model = optim.step(current_lr, model, grads_params);
 
-            // Live progress line
-            if last_live_update.elapsed().as_millis() >= 500 {
-                last_live_update = Instant::now();
-                let elapsed = epoch_start.elapsed().as_secs_f64();
-                let done = (batch_idx + 1) as f64;
-                let total = num_batches as f64;
-                let pct = done / total * 100.0;
-                let batches_per_sec = if elapsed > 0.0 { done / elapsed } else { 0.0 };
-                let remaining = total - done;
-                let eta_secs = if batches_per_sec > 0.0 { (remaining / batches_per_sec) as u64 } else { 0 };
-                let eta_min = eta_secs / 60;
-                let eta_s = eta_secs % 60;
-                let elapsed_min = elapsed as u64 / 60;
-                let elapsed_s = elapsed as u64 % 60;
-
-                print!(
-                    "\r  [Epoch {}/{}] {:5.1}% | Batch {}/{} | {:.0} batch/s | LR: {:.2e} | Elapsed: {:02}m {:02}s | ETA: {:02}m {:02}s   ",
-                    epoch, epochs, pct, batch_idx + 1, num_batches, batches_per_sec, current_lr, elapsed_min, elapsed_s, eta_min, eta_s
-                );
-                let _ = std::io::stdout().flush();
-            }
-
             // Full GPU-synced log line at intervals
             let is_log_step = (batch_idx + 1) % log_interval == 0 || batch_idx == num_batches - 1;
             if is_log_step {
@@ -237,29 +229,51 @@ pub fn train<B: AutodiffBackend>(
                 total_epoch_loss += interval_loss;
                 total_batches += accum_count;
 
-                let interval_avg = interval_loss / (accum_count as f32);
-                let current_epoch_avg = total_epoch_loss / (total_batches as f32);
-                let progress = ((batch_idx + 1) as f32 / num_batches as f32) * 100.0;
-
-                println!(
-                    "\r  [Epoch {:2}/{:2}] Batch {:6}/{:6} ({:5.1}%) | Step Loss: {:.4} | Avg Loss: {:.4} | LR: {:.2e}        ",
-                    epoch, epochs, batch_idx + 1, num_batches, progress, interval_avg, current_epoch_avg, current_lr
-                );
+                last_loss = interval_loss / (accum_count as f32);
+                last_avg_loss = total_epoch_loss / (total_batches as f32);
 
                 // Reset GPU loss accumulator for next interval
                 accum_loss_tensor = Tensor::<B, 1>::zeros([1], device);
                 accum_count = 0;
             }
+
+            // Live progress line
+            if last_live_update.elapsed().as_millis() >= 500 || is_log_step {
+                last_live_update = Instant::now();
+                let total_elapsed = training_start.elapsed().as_secs_f64();
+                let done_steps = (epoch - 1) * num_batches + batch_idx + 1;
+                let pct = (done_steps as f64 / total_steps as f64) * 100.0;
+                let batches_per_sec = if total_elapsed > 0.0 { done_steps as f64 / total_elapsed } else { 0.0 };
+                let remaining_steps = total_steps.saturating_sub(done_steps);
+                let eta_secs = if batches_per_sec > 0.0 { (remaining_steps as f64 / batches_per_sec) as u64 } else { 0 };
+                let eta_min = eta_secs / 60;
+                let eta_s = eta_secs % 60;
+                let elapsed_min = total_elapsed as u64 / 60;
+                let elapsed_s = total_elapsed as u64 % 60;
+
+                tui::print_training_progress(
+                    epoch,
+                    epochs,
+                    pct,
+                    batch_idx + 1,
+                    num_batches,
+                    batches_per_sec,
+                    current_lr,
+                    last_loss,
+                    last_avg_loss,
+                    elapsed_min,
+                    elapsed_s,
+                    eta_min,
+                    eta_s,
+                );
+            }
         }
+        println!();
 
         let elapsed = epoch_start.elapsed().as_secs_f32();
         let final_epoch_avg = if total_batches > 0 { total_epoch_loss / total_batches as f32 } else { 0.0 };
-        println!(
-            "-------------------------------------------------------------------------------"
-        );
-        println!("🚀 Epoch {}/{} Complete | Avg Loss: {:.4} | Time: {:.2}s", epoch, epochs, final_epoch_avg, elapsed);
 
-        if let Ok(sample) = generate::<B::InnerBackend>(
+        let preview = generate::<B::InnerBackend>(
             &model.valid(),
             tokenizer,
             "Once upon a time",
@@ -267,19 +281,20 @@ pub fn train<B: AutodiffBackend>(
             0.7,
             40,
             0.9,
+            0.05,
             1.1,
             42 + epoch as u64,
             device,
-        ) {
-            println!("  ✨ Story Generation Preview: \"{}\"", sample.replace("\n", " "));
-        }
-        println!(
-            "==============================================================================="
+        ).ok();
+
+        tui::print_epoch_complete(
+            epoch,
+            epochs,
+            final_epoch_avg,
+            elapsed,
+            preview.as_deref(),
         );
     }
-
-
-    println!("Training finished successfully!");
 
     std::fs::create_dir_all(output_dir)?;
     let config_path = Path::new(output_dir).join("config.json");
@@ -292,8 +307,7 @@ pub fn train<B: AutodiffBackend>(
         .record(model.into_record(), weights_path.clone())
         .map_err(|e| format!("Failed to save model record: {:?}", e))?;
 
-    println!("Saved config to {:?}", config_path);
-    println!("Saved model weights to {:?}", weights_path.with_extension("bin"));
+    tui::print_training_complete(&config_path, &weights_path.with_extension("bin"));
 
     Ok(())
 }

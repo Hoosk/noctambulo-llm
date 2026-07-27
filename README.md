@@ -1,102 +1,150 @@
-# 🐈‍⬛ Kuro-Neko (my-rust-llm)
+# 🐈‍⬛ Kuro-Neko (kuro-neko-llm)
 
-**Kuro-Neko** es un motor de entrenamiento e inferencia de Modelos de Lenguaje (LLM) de arquitectura GPT-2 escrito totalmente en **Rust**, acelerado por GPU mediante **Burn 0.21** y **WGPU**, con soporte directo para exportación binaria a formato **GGUF v3** (compatible con LM Studio, llama.cpp y Ollama).
+**Kuro-Neko** es un motor de entrenamiento e inferencia de Modelos de Lenguaje (LLM) de arquitectura **Qwen (Qwen2.5 / Qwen3)** escrito totalmente en **Rust**, acelerado por GPU mediante **Burn 0.21** y **WGPU**, con soporte directo para exportación binaria a formato **GGUF v3** (compatible con LM Studio, llama.cpp y Ollama).
 
 ---
 
-## 🚀 Caracteristicas Principales
+## 🚀 Características Principales
 
-- **Arquitectura Causal Transformer (GPT-2)**: Atencion Causal Multi-Cabeza, Capas MLP con activaciones GELU, LayerNorm pre-LN, Embeddings Posicionales y Token Embeddings.
-- **Aceleracion GPU con WGPU / Burn 0.21**: Ejecucion multiplataforma en GPU (Vulkan, Metal, DX12, WebGPU).
-- **Tokenizacion Paralela Streaming**: Carga streaming multihilo linea por linea con tokenizador BPE Byte-Level y barra de progreso dinamica con ETA.
-- **Pipeline de Entrenamiento Ultraoptimizado**:
-  - **Perdida Esparsa ($NLL$)**: Calculo de entropia cruzada con `log_softmax` + `gather` con consumo de memoria de 32 KB por lote en lugar de matrices one-hot de 262 MB.
-  - **Acumulacion de Perdida en GPU**: Sin stalls de sincronizacion GPU $\to$ CPU por lote.
-  - **Mascara Causal Directa**: Asignacion de mascara triangular superior sin pases booleanos adicionales.
-  - **Reporte en Tiempo Real**: Estadisticas dinamicas de batches/s, ETA y previsualizacion automatica de historias al finalizar cada epoca.
-- **Exportador GGUF v3 Nativo**: Serializacion directa de todos los tensores de pesos del modelo alineados a 32 bytes con cabeceras GGUF v3.
-- **Parametrizacion Completa por CLI**: Control de hyperparametros via flags de linea de comandos.
+- **Arquitectura Causal Transformer (Qwen2.5 / Qwen3)**:
+  - Atención Causal Multi-Cabeza con **RoPE** ($\theta = 10.000$), sesgo activo en proyecciones QKV (`with_bias(true)`) y máscara triangular `triu_mask`.
+  - Capas MLP con **SwiGLU** (activaciones SiLU alineadas a múltiplos de 256).
+  - Normalización **RMSNorm** con precision $\epsilon = 10^{-6}$.
+  - **Tied Word Embeddings** con inicialización gaussiana normal $\mathcal{N}(0, 0.02)$ para evitar saturación de logits.
+  - Regularización **Dropout** y **Weight Decay** ($0.1$).
+- **Aceleración GPU con WGPU / Burn 0.21**: Ejecución multiplataforma en GPU (Vulkan, Metal, DX12, WebGPU).
+- **Tokenización Paralela Streaming**: Carga streaming multihilo línea por línea con tokenizador BPE Byte-Level, estimación dinámica de capacidad y reporte de errores.
+- **Pipeline de Entrenamiento Optimizado**:
+  - **Shuffling de datos** por época (Fisher-Yates) para mejor convergencia.
+  - **Gradient Clipping** por norma $L_2$ (`Norm(1.0)`) y **Weight Decay** (`0.1`).
+  - **Schedule de LR Cosine** con Warmup configurable.
+  - **Cálculo Esparso de Pérdida ($NLL$)** con `log_softmax` + `gather`.
+  - **Acumulación de Pérdida en GPU** sin stalls de sincronización GPU $\to$ CPU por lote.
+- **Exportador GGUF v3 Nativo**: Serialización directa de todos los tensores de pesos y biases del modelo alineados a 32 bytes con cabeceras GGUF v3 y clave `general.alignment`.
+- **CLI Moderno con Clap**: Interfaz CLI basada en derive macros con validación estricta y `--help` automático.
 
 ---
 
 ## 🛠️ Requisitos Previos
 
-- **Rust**: 1.80+ (`cargo` y `rustc`).
+- **Rust**: 1.80+ en canal **Stable** (`cargo` y `rustc`).
 - **Drivers de GPU**: Soporte Vulkan / Metal / DX12.
 
 ---
 
-## ⚙️ Uso de la Linea de Comandos (CLI)
+## ⚙️ Uso de la Línea de Comandos (CLI)
 
 ### 1. Entrenar el Modelo (`train`)
 
 Ejecuta el entrenamiento acelerado por GPU usando un dataset de Hugging Face o un archivo local:
 
 ```bash
-# Entrenar en TinyStories (Configuracion optimizada por defecto: 50M tokens, batch 128, 3 epocas)
-cargo run --release train --dataset roneneldan/TinyStories
+# Entrenar en TinyStories (Configuración por defecto: 10M tokens, batch 128, 3 épocas)
+cargo run --release -- train --dataset roneneldan/TinyStories
 ```
 
-#### Opciones de Entrenador (CLI Flags)
+#### Opciones del Entrenador (CLI Flags)
 
-| Flag | Descripcion | Valor por Defecto |
+| Flag | Descripción | Valor por Defecto |
 |:---|:---|:---|
-| `--dataset <repo>` | Repositorio de Hugging Face (ej. `roneneldan/TinyStories`) | `None` |
-| `--file <path>` | Archivo de texto local para entrenar | `corpus.txt` |
+| `--dataset <repo>` | Repositorio(s) de Hugging Face (ej. `roneneldan/TinyStories`) | `[]` |
+| `--file <path>` | Archivo de texto local para entrenar | `None` |
+| `--dataset-file <filename>` | Nombre de archivo dentro del repo de HF | `TinyStories-train.txt` |
 | `--batch-size <n>` | Tamaño de lote (Batch size) | `128` |
-| `--epochs <n>` | Numero de epocas de entrenamiento | `3` |
-| `--max-tokens <n>` | Maximo de tokens a cargar (`0` = sin limite) | `50000000` |
-| `--step <n>` | Paso de ventana deslizante (`0` o omitido = `n-ctx`) | `n-ctx` |
-| `--n-ctx <n>` | Ventana de contexto del modelo | `64` |
-| `--n-embd <n>` | Dimension de embedding | `256` |
-| `--n-head <n>` | Cabezas de atencion causal | `4` |
-| `--n-layer <n>` | Numero de bloques Transformer | `4` |
-| `--lr <float>` | Tasa de aprendizaje (Learning rate) | `0.001` |
+| `--epochs <n>` | Número de épocas de entrenamiento | `3` |
+| `--max-tokens <n>` | Máximo de tokens a cargar (`0` = sin límite) | `10000000` |
+| `--step <n>` | Paso de ventana deslizante (`None` = `n-ctx`) | `None` |
+| `--n-ctx <n>` | Ventana de contexto del modelo | `256` |
+| `--n-embd <n>` | Dimensión de embedding | `256` |
+| `--n-head <n>` | Cabezas de atención causal (Query) | `4` |
+| `--n-kv-head <n>` | Cabezas Key/Value para GQA (`None` = igual a `n-head`) | `None` |
+| `--n-layer <n>` | Número de bloques Transformer | `4` |
+| `--lr <float>` | Tasa de aprendizaje (Learning rate) | `0.0003` |
+| `--dropout <float>` | Probabilidad de dropout | `0.1` |
+| `--attn-softcap <float>` | Capping de atención (`0.0` desactivado, `50.0` Gemma 4) | `0.0` |
 
 #### Ejemplos de Entrenamientos Personalizados
 
 ```bash
-# Prueba ultra-rapida de 2 minutos (10M tokens)
-cargo run --release train --dataset roneneldan/TinyStories --max-tokens 10000000
+# Entrenamiento rápido de prueba con 1M tokens y GQA (n_kv_head=2)
+cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 1000000 --n-kv-head 2
 
-# Entrenar sobre TODO el dataset sin limite de tokens
-cargo run --release train --dataset roneneldan/TinyStories --max-tokens 0
+# Entrenar sobre TODO el dataset sin límite de tokens
+cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 0
 
-# Configurar un modelo mas grande (512 embd, 8 heads, 8 layers)
-cargo run --release train --dataset roneneldan/TinyStories --n-embd 512 --n-head 8 --n-layer 8 --batch-size 64
+# Configurar un modelo más grande con GQA y Softcapping
+cargo run --release -- train --dataset roneneldan/TinyStories --n-embd 512 --n-head 8 --n-kv-head 2 --n-layer 8 --attn-softcap 50.0
 ```
 
 ---
 
 ### 2. Entrenar Tokenizador Custom (`train-tokenizer`)
 
-Entrena un tokenizador BPE Byte-Level desde cero sobre un corpus especifico:
+Entrena un tokenizador BPE Byte-Level desde cero sobre un corpus específico:
 
 ```bash
-cargo run --release train-tokenizer --dataset roneneldan/TinyStories --vocab-size 8000
+cargo run --release -- train-tokenizer --dataset roneneldan/TinyStories --vocab-size 8000
 ```
+
+#### Opciones del Tokenizador (CLI Flags)
+
+| Flag | Descripción | Valor por Defecto |
+|:---|:---|:---|
+| `--dataset <repo>` | Repositorio(s) de Hugging Face (comma-separated, ej. `roneneldan/TinyStories`) | `[]` |
+| `--file <path>` | Archivo de texto plano local para entrenar el vocabulario | `None` |
+| `--dataset-file <filename>` | Nombre del archivo objetivo dentro del repositorio del dataset de HF | `TinyStories-train.txt` |
+| `--vocab-size <n>` | Tamaño total de la tabla de vocabulario resultante | `8000` |
 
 ---
 
 ### 3. Generar Texto / Inferencia (`generate`)
 
-Genera texto autorregresivo a partir de una frase semilla usando el modelo entrenado:
+Genera texto autorregresivo a partir de una frase semilla usando el modelo entrenado, con muestreo Top-K, Top-P, Min-P y Repetition Penalty:
 
 ```bash
-cargo run --release generate "Once upon a time"
+cargo run --release -- generate "Once upon a time" --temp 0.7 --top-k 40 --top-p 0.9 --min-p 0.05 --max-tokens 50
+```
+
+#### Opciones del Generador (CLI Flags)
+
+| Flag / Argumento | Descripción | Valor por Defecto |
+|:---|:---|:---|
+| `<prompt>` | Frase semilla (prompt) para iniciar la generación (Posicional) | *Requerido* |
+| `--temp <float>` | Temperatura de muestreo para controlar la creatividad/aleatoriedad | `0.7` |
+| `--top-k <n>` | Límite superior de tokens candidatos a evaluar (Muestreo Top-K) | `40` |
+| `--top-p <float>` | Umbral acumulado de probabilidad para muestreo Nucleus (Top-P) | `0.9` |
+| `--min-p <float>` | Umbral de probabilidad relativa Min-P | `0.05` |
+| `--rep-penalty <float>` | Factor de penalización por repetición de tokens | `1.1` |
+| `--max-tokens <n>` | Cantidad máxima de nuevos tokens a generar | `50` |
+| `--seed <n>` | Semilla del generador pseudoaleatorio para reproducibilidad | `None` |
+
+---
+
+### 4. Inspeccionar Estadísticas del Modelo (`stats`)
+
+Muestra el número total de parámetros, huella de memoria FP32, FLOPs por token y compresión GQA:
+
+```bash
+cargo run --release -- stats
 ```
 
 ---
 
-### 4. Exportar a Formato GGUF (`export`)
+### 5. Exportar a Formato GGUF (`export`)
 
 Exporta los pesos del modelo guardados en `model_output` directamente a un binario **GGUF v3**:
 
 ```bash
-cargo run --release export --outfile model_output/model.gguf
+cargo run --release -- export --model-name kuro-neko-2026
 ```
 
-El archivo `.gguf` resultante se puede abrir directamente en **LM Studio**, **llama.cpp** u **Ollama**.
+El archivo `.gguf` resultante se guardará en `exported/kuro-neko-2026.gguf` y se puede abrir directamente en **LM Studio**, **llama.cpp** u **Ollama**.
+
+#### Opciones de Exportación (CLI Flags)
+
+| Flag | Descripción | Valor por Defecto |
+|:---|:---|:---|
+| `--model-name <name>` | Nombre base del archivo `.gguf` resultante | `kuro-neko-qwen` |
 
 ---
 
@@ -104,22 +152,14 @@ El archivo `.gguf` resultante se puede abrir directamente en **LM Studio**, **ll
 
 ```
 kuro-neko/
-├── Cargo.toml          # Dependencias (Burn 0.21, tokenizers, hf-hub, serde)
+├── Cargo.toml          # Dependencias (Burn 0.21, tokenizers, hf-hub, serde, clap)
 ├── src/
-│   ├── main.rs         # Punto de entrada y parsing de CLI flags
-│   ├── config.rs       # Estructura ModelConfig con validaciones defensivas
-│   ├── model.rs        # Arquitectura Transformer Causal (Llm, Block, Attention, Mlp)
-│   ├── data.rs         # LlmTokenizer y carga streaming multihilo con ETA
-│   ├── train.rs        # Bucle de entrenamiento GPU, acumulacion y perdida esparsa
-│   ├── generate.rs     # Motor de muestreo autorregresivo (temperature, top-p/greedy)
-│   └── export.rs       # Serializador binario nativo GGUF v3 (pesos y metadatos)
+│   ├── main.rs         # Punto de entrada y CLI con Clap derive
+│   ├── config.rs       # Estructura ModelConfig unificada
+│   ├── model.rs        # Arquitectura LLaMA (Llm, Block, Attention, SwiGLU, Weight Tying)
+│   ├── data.rs         # LlmTokenizer y carga streaming multihilo
+│   ├── train.rs        # Bucle GPU con Shuffling, Grad Clipping, Weight Decay y AdamW
+│   ├── generate.rs     # Inferencia autorregresiva con bounds check y XorshiftRng*
+│   ├── export.rs       # Serializador binario GGUF v3 (pesos alineados a 32 bytes)
+│   └── tui.rs          # Utilidades visuales de terminal (ANSI, cajas Unicode y progreso)
 ```
-
----
-
-## 📊 Diseno Tecnico y Optimización de Rendimiento
-
-1. **Memoria Zero-Copy**: Uso de `std::mem::take` durante el streaming de tokenizacion para transferir ownership de lotes de strings sin clonar en el Heap.
-2. **Optimizacion de Atencion Causal**: Mascara triangular superior directa construida mediante `arange.unsqueeze_dim(0).greater(arange.unsqueeze_dim(1))` que evita inversiones booleanas redundantes en cada capa.
-3. **Calculo Esparso de Perdida**: Implementado como `loss = -log_softmax(logits).gather(targets).mean()`, lo que elimina la creacion de matrices `one_hot` gigantes en la memoria VRAM de la GPU.
-4. **Sincronizacion GPU Incremental**: Las llamadas a `.into_data()` solo se realizan en intervalos de reporte programados, manteniendo la canalizacion (pipeline) de WGPU al 100% de saturacion sin stalls.

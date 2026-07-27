@@ -2,6 +2,7 @@ use hf_hub::api::sync::Api;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use crate::tui;
 use std::time::Instant;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::models::bpe::{BpeTrainerBuilder, BPE};
@@ -55,22 +56,24 @@ impl LlmTokenizer {
     pub fn encode_file_streaming<P: AsRef<Path>>(
         &self,
         file_path: P,
+        max_tokens: Option<usize>,
     ) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
         let path = file_path.as_ref();
         let file = File::open(path)?;
         let total_bytes = file.metadata()?.len();
 
         let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-        let mut all_tokens = Vec::with_capacity(300_000_000);
+        let estimated_tokens = match max_tokens {
+            Some(limit) if limit > 0 => limit + 1024,
+            _ => (total_bytes as usize / 3).min(500_000_000),
+        };
+        let mut all_tokens = Vec::with_capacity(estimated_tokens);
         let mut bytes_read = 0u64;
 
         let start_time = Instant::now();
         let mut last_update = Instant::now();
 
-        println!(
-            "Streaming parallel multi-threaded tokenization ({:.2} MB)...",
-            total_bytes as f64 / 1_048_576.0
-        );
+        tui::print_tokenization_start(total_bytes);
 
         let batch_line_capacity = 8192;
         let mut line_batch: Vec<String> = Vec::with_capacity(batch_line_capacity);
@@ -83,7 +86,25 @@ impl LlmTokenizer {
 
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                line_batch.push(trimmed.to_string());
+                let text_entry = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                        if let Some(s) = v.get("story").and_then(|s| s.as_str()) {
+                            s.to_string()
+                        } else if let Some(s) = v.get("text").and_then(|s| s.as_str()) {
+                            s.to_string()
+                        } else if let Some(s) = v.get("story_text").and_then(|s| s.as_str()) {
+                            s.to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    } else {
+                        trimmed.to_string()
+                    }
+                } else {
+                    trimmed.to_string()
+                };
+
+                line_batch.push(text_entry);
             }
 
             if line_batch.len() >= batch_line_capacity {
@@ -94,9 +115,20 @@ impl LlmTokenizer {
                 let current_batch = std::mem::take(&mut line_batch);
                 line_batch = Vec::with_capacity(batch_line_capacity);
 
-                if let Ok(encodings) = self.tokenizer.encode_batch(current_batch, true) {
-                    for enc in encodings {
-                        all_tokens.extend(enc.get_ids());
+                match self.tokenizer.encode_batch(current_batch, true) {
+                    Ok(encodings) => {
+                        for enc in encodings {
+                            all_tokens.extend(enc.get_ids());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\nWarning: Tokenizer batch failed to encode: {}", e);
+                    }
+                }
+
+                if let Some(limit) = max_tokens {
+                    if limit > 0 && all_tokens.len() >= limit {
+                        break;
                     }
                 }
 
@@ -115,11 +147,15 @@ impl LlmTokenizer {
                     let mb_total = total_bytes as f64 / 1_048_576.0;
                     let mb_per_sec = bytes_per_sec / 1_048_576.0;
 
-                    print!(
-                        "\r[Tokenizing] {:5.1}% ({:.1}/{:.1} MB) | {:.1} MB/s | Tokens: {} | ETA: {:02}m {:02}s   ",
-                        pct, mb_read, mb_total, mb_per_sec, all_tokens.len(), eta_min, eta_s
+                    tui::print_tokenization_progress(
+                        pct,
+                        mb_read,
+                        mb_total,
+                        mb_per_sec,
+                        all_tokens.len(),
+                        eta_min,
+                        eta_s,
                     );
-                    let _ = std::io::stdout().flush();
                 }
             }
         }
@@ -128,9 +164,14 @@ impl LlmTokenizer {
         if !line_batch.is_empty() {
             let current_batch = std::mem::take(&mut line_batch);
 
-            if let Ok(encodings) = self.tokenizer.encode_batch(current_batch, true) {
-                for enc in encodings {
-                    all_tokens.extend(enc.get_ids());
+            match self.tokenizer.encode_batch(current_batch, true) {
+                Ok(encodings) => {
+                    for enc in encodings {
+                        all_tokens.extend(enc.get_ids());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("\nWarning: Tokenizer batch failed to encode: {}", e);
                 }
             }
         }
@@ -139,13 +180,12 @@ impl LlmTokenizer {
         let mb_total = total_bytes as f64 / 1_048_576.0;
         let mb_per_sec = if elapsed_secs > 0.0 { mb_total / elapsed_secs } else { 0.0 };
 
-        print!(
-            "\r[Tokenizing] 100.0% ({:.1}/{:.1} MB) | {:.1} MB/s | Tokens: {} | ETA: 00m 00s   \n",
-            mb_total, mb_total, mb_per_sec, all_tokens.len()
+        tui::print_tokenization_complete(
+            mb_total,
+            mb_per_sec,
+            all_tokens.len(),
+            elapsed_secs,
         );
-        let _ = std::io::stdout().flush();
-
-        println!("Parallel tokenization complete in {:.2}s: {} total tokens loaded.", elapsed_secs, all_tokens.len());
         Ok(all_tokens)
     }
 
@@ -172,22 +212,68 @@ impl LlmTokenizer {
 }
 
 pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let datasets_dir = PathBuf::from("datasets");
-    std::fs::create_dir_all(&datasets_dir)?;
-    let local_cache = datasets_dir.join(format!("dataset_{}_{}", repo_id.replace("/", "_"), filename));
-    if local_cache.exists() {
-        println!("Using cached dataset file: {:?}", local_cache);
-        return Ok(local_cache);
+    let mut candidates = vec![filename];
+    if filename != "TinyStories-train.txt" {
+        candidates.push("TinyStories-train.txt");
+    }
+    if filename != "stories_00.json" {
+        candidates.push("stories_00.json");
+    }
+    if filename != "tinystories.jsonl" {
+        candidates.push("tinystories.jsonl");
+    }
+    if filename != "spanish_stories.txt" {
+        candidates.push("spanish_stories.txt");
+    }
+    if filename != "train.txt" {
+        candidates.push("train.txt");
+    }
+    if filename != "data.txt" {
+        candidates.push("data.txt");
     }
 
-    println!("Downloading dataset '{}' ({}) from Hugging Face Hub...", repo_id, filename);
+    // 1. Check local cache first for any candidate
+    for cand in &candidates {
+        let dataset_name = format!("dataset_{}_{}", repo_id.replace("/", "_"), cand);
+        let root_cache = PathBuf::from(&dataset_name);
+        if root_cache.exists() {
+            println!("Using existing cached dataset file: {:?}", root_cache);
+            return Ok(root_cache);
+        }
+
+        let datasets_dir = PathBuf::from("datasets");
+        let local_cache = datasets_dir.join(&dataset_name);
+        if local_cache.exists() {
+            println!("Using cached dataset file: {:?}", local_cache);
+            return Ok(local_cache);
+        }
+    }
+
+    // 2. Download from HF Hub trying candidates in order
     let api = Api::new().map_err(|e| format!("HF Api error: {}", e))?;
     let repo = api.dataset(repo_id.to_string());
-    let downloaded_file = repo.get(filename).map_err(|e| format!("HF dataset get error: {}", e))?;
+    let datasets_dir = PathBuf::from("datasets");
+    std::fs::create_dir_all(&datasets_dir)?;
 
-    std::fs::copy(&downloaded_file, &local_cache)?;
-    println!("Saved dataset locally to {:?}", local_cache);
-    Ok(local_cache)
+    let mut last_err = None;
+    for cand in &candidates {
+        let dataset_name = format!("dataset_{}_{}", repo_id.replace("/", "_"), cand);
+        let local_cache = datasets_dir.join(&dataset_name);
+
+        println!("Downloading dataset '{}' ({}) from Hugging Face Hub...", repo_id, cand);
+        match repo.get(cand) {
+            Ok(downloaded_file) => {
+                std::fs::copy(&downloaded_file, &local_cache)?;
+                println!("Saved dataset locally to {:?}", local_cache);
+                return Ok(local_cache);
+            }
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(format!("Failed to download dataset from HF repo '{}': {:?}", repo_id, last_err.unwrap()).into())
 }
 
 pub fn combine_and_mix_datasets(
@@ -207,7 +293,7 @@ pub fn combine_and_mix_datasets(
     let mut readers: Vec<BufReader<File>> = Vec::new();
     for src in sources {
         let file = File::open(src).map_err(|e| format!("Failed to open dataset file {:?}: {}", src, e))?;
-        readers.push(BufReader::with_capacity(1 * 1024 * 1024, file));
+        readers.push(BufReader::with_capacity(1024 * 1024, file));
     }
 
     let out_file = File::create(output_path)?;

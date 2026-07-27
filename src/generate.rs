@@ -17,27 +17,33 @@ impl XorshiftRng {
         self.state ^= self.state << 13;
         self.state ^= self.state >> 7;
         self.state ^= self.state << 17;
-        (self.state as f64 / u64::MAX as f64) as f32
+        let scrambled = self.state.wrapping_mul(0x2545F4914F6CDD1D);
+        (scrambled as f64 / u64::MAX as f64) as f32
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_logits(
     logits_vec: &mut [f32],
     tokens: &[u32],
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    min_p: f32,
     repetition_penalty: f32,
     rng: &mut XorshiftRng,
 ) -> u32 {
     if repetition_penalty > 1.0 {
+        let mut seen = std::collections::HashSet::new();
         for &token in tokens {
-            let idx = token as usize;
-            if idx < logits_vec.len() {
-                if logits_vec[idx] < 0.0 {
-                    logits_vec[idx] *= repetition_penalty;
-                } else {
-                    logits_vec[idx] /= repetition_penalty;
+            if seen.insert(token) {
+                let idx = token as usize;
+                if idx < logits_vec.len() {
+                    if logits_vec[idx] < 0.0 {
+                        logits_vec[idx] *= repetition_penalty;
+                    } else {
+                        logits_vec[idx] /= repetition_penalty;
+                    }
                 }
             }
         }
@@ -55,6 +61,7 @@ fn sample_logits(
         indexed_scores.truncate(top_k);
     }
 
+    // Top-P Nucleus Sampling
     if top_p > 0.0 && top_p < 1.0 {
         let max_val = indexed_scores.first().map(|s| s.1).unwrap_or(0.0);
         let mut sum_exp = 0.0f32;
@@ -79,6 +86,37 @@ fn sample_logits(
         }
 
         indexed_scores.truncate(cutoff_idx);
+    }
+
+    // Min-P Sampling Math (Relative Probability Thresholding)
+    if min_p > 0.0 && min_p <= 1.0 && !indexed_scores.is_empty() {
+        let max_val = indexed_scores[0].1;
+        let mut sum_exp = 0.0f32;
+        let exps: Vec<f32> = indexed_scores
+            .iter()
+            .map(|(_, score)| {
+                let e = (score - max_val).exp();
+                sum_exp += e;
+                e
+            })
+            .collect();
+
+        if sum_exp > 0.0 {
+            let max_prob = exps[0] / sum_exp;
+            let threshold = min_p * max_prob;
+            let mut keep_count = 0;
+            for (i, &exp) in exps.iter().enumerate() {
+                let prob = exp / sum_exp;
+                if prob >= threshold {
+                    keep_count = i + 1;
+                } else {
+                    break;
+                }
+            }
+            if keep_count > 0 {
+                indexed_scores.truncate(keep_count);
+            }
+        }
     }
 
     let max_val = indexed_scores.first().map(|s| s.1).unwrap_or(0.0);
@@ -116,6 +154,7 @@ pub fn generate<B: Backend>(
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    min_p: f32,
     repetition_penalty: f32,
     seed: u64,
     device: &B::Device,
@@ -125,6 +164,16 @@ pub fn generate<B: Backend>(
     if tokens.is_empty() {
         return Ok(String::new());
     }
+
+    if tokens.len() > model.n_ctx {
+        eprintln!(
+            "Warning: prompt length ({}) exceeds model context window ({}). Truncating prompt.",
+            tokens.len(),
+            model.n_ctx
+        );
+        tokens.truncate(model.n_ctx);
+    }
+
     let initial_prompt_len = tokens.len();
     let eos_token_id = tokenizer.end_of_text_id();
 
@@ -145,7 +194,16 @@ pub fn generate<B: Backend>(
         .to_vec::<f32>()
         .map_err(|e| format!("Failed to convert tensor data: {:?}", e))?;
 
-    let sampled_token = sample_logits(&mut logits_vec, &tokens, temperature, top_k, top_p, repetition_penalty, &mut rng);
+    let sampled_token = sample_logits(
+        &mut logits_vec,
+        &tokens,
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition_penalty,
+        &mut rng,
+    );
     tokens.push(sampled_token);
 
     if let Some(eos_id) = eos_token_id {
@@ -159,6 +217,12 @@ pub fn generate<B: Backend>(
     for _ in 1..max_new_tokens {
         let last_token = tokens.last().copied().unwrap_or(0) as i32;
         let start_pos = tokens.len() - 1;
+
+        if start_pos >= model.n_ctx {
+            println!("\n[Reached maximum context length ({}). Stopping generation.]", model.n_ctx);
+            break;
+        }
+
         let input_data = TensorData::new(vec![last_token], [1, 1]);
         let input = Tensor::<B, 2, Int>::from_data(input_data, device);
 
@@ -169,7 +233,16 @@ pub fn generate<B: Backend>(
             .to_vec::<f32>()
             .map_err(|e| format!("Failed to convert tensor data: {:?}", e))?;
 
-        let sampled_token = sample_logits(&mut logits_vec, &tokens, temperature, top_k, top_p, repetition_penalty, &mut rng);
+        let sampled_token = sample_logits(
+            &mut logits_vec,
+            &tokens,
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            repetition_penalty,
+            &mut rng,
+        );
         tokens.push(sampled_token);
 
         if let Some(eos_id) = eos_token_id {
