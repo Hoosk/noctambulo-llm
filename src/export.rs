@@ -8,6 +8,8 @@ use std::path::Path;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_VERSION: u32 = 3;
 
+const GGUF_TYPE_BOOL: u32 = 7;
+const GGUF_TYPE_INT32: u32 = 5;
 const GGUF_TYPE_UINT32: u32 = 4;
 const GGUF_TYPE_FLOAT32: u32 = 6;
 const GGUF_TYPE_STRING: u32 = 8;
@@ -33,34 +35,31 @@ fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     transposed
 }
 
-fn permute_rope_weight(data: &[f32], n_head: usize, n_embd: usize) -> Vec<f32> {
-    let head_size = n_embd / n_head;
+fn permute_rope_weight(data: &[f32], n_heads: usize, head_size: usize, cols: usize) -> Vec<f32> {
     let half_dim = head_size / 2;
     let mut out = vec![0.0f32; data.len()];
 
-    for r_head in 0..n_head {
+    for r_head in 0..n_heads {
         for i in 0..half_dim {
             let r_in1 = r_head * head_size + i;
             let r_in2 = r_head * head_size + i + half_dim;
             let r_out1 = r_head * head_size + 2 * i;
             let r_out2 = r_head * head_size + 2 * i + 1;
 
-            for c in 0..n_embd {
-                out[r_out1 * n_embd + c] = data[r_in1 * n_embd + c];
-                out[r_out2 * n_embd + c] = data[r_in2 * n_embd + c];
+            for c in 0..cols {
+                out[r_out1 * cols + c] = data[r_in1 * cols + c];
+                out[r_out2 * cols + c] = data[r_in2 * cols + c];
             }
         }
     }
     out
 }
 
-fn permute_rope_bias(bias: &[f32], n_head: usize) -> Vec<f32> {
-    let n_embd = bias.len();
-    let head_size = n_embd / n_head;
+fn permute_rope_bias(bias: &[f32], n_heads: usize, head_size: usize) -> Vec<f32> {
     let half_dim = head_size / 2;
-    let mut out = vec![0.0f32; n_embd];
+    let mut out = vec![0.0f32; bias.len()];
 
-    for r_head in 0..n_head {
+    for r_head in 0..n_heads {
         for i in 0..half_dim {
             let r_in1 = r_head * head_size + i;
             let r_in2 = r_head * head_size + i + half_dim;
@@ -101,6 +100,37 @@ fn load_vocab_tokens(tokenizer_path: &str, vocab_size: usize) -> Vec<String> {
     tokens
 }
 
+fn load_vocab_token_types(vocab_size: usize) -> Vec<i32> {
+    let mut types = vec![1i32; vocab_size]; // 1 = GGML_TOKEN_TYPE_NORMAL
+    if vocab_size > 0 { types[0] = 3; } // 3 = GGML_TOKEN_TYPE_CONTROL
+    if vocab_size > 1 { types[1] = 3; }
+    types
+}
+
+fn load_vocab_merges(tokenizer_path: &str) -> Vec<String> {
+    let mut merges = Vec::new();
+    if Path::new(tokenizer_path).exists() {
+        if let Ok(content) = std::fs::read_to_string(tokenizer_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(merges_arr) = v.get("model").and_then(|m| m.get("merges")).and_then(|m| m.as_array()) {
+                    for m_val in merges_arr {
+                        if let Some(pair) = m_val.as_array() {
+                            if pair.len() == 2 {
+                                if let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
+                                    merges.push(format!("{} {}", a, b));
+                                }
+                            }
+                        } else if let Some(m_str) = m_val.as_str() {
+                            merges.push(m_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    merges
+}
+
 pub struct NamedTensor {
     pub name: String,
     pub dims: Vec<u64>,
@@ -119,16 +149,9 @@ pub fn export_to_gguf<B: Backend>(
 
     println!("Exporting Qwen2.5/Qwen3 model architecture to GGUF format at: '{}'...", gguf_path);
 
-    let tokens = load_vocab_tokens(tokenizer_path, config.vocab_size);
-    let eos_token_id = tokens
-        .iter()
-        .position(|t| t == "<|endoftext|>" || t == "</s>" || t == "<eos>" || t == "<|im_end|>")
-        .unwrap_or(2) as u32;
-
-    let bos_token_id = tokens
-        .iter()
-        .position(|t| t == "<|im_start|>" || t == "<s>" || t == "<bos>")
-        .unwrap_or(1) as u32;
+    let vocab_tokens = load_vocab_tokens(tokenizer_path, config.vocab_size);
+    let token_types = load_vocab_token_types(config.vocab_size);
+    let vocab_merges = load_vocab_merges(tokenizer_path);
 
     let mut named_tensors: Vec<NamedTensor> = Vec::new();
 
@@ -164,10 +187,14 @@ pub fn export_to_gguf<B: Backend>(
         });
 
         // Self Attention Projections (Q, K, V, O)
+        let n_kv_head = config.n_kv_head;
+        let head_dim = config.n_embd / config.n_head;
+        let kv_dim = n_kv_head * head_dim;
+
         let q = block.attn.q_proj.weight.val().into_data().to_vec::<f32>()
             .map_err(|e| format!("Failed to extract q_proj weight: {:?}", e))?;
         let q_trans = transpose_2d(&q, config.n_embd, config.n_embd);
-        let q_permuted = permute_rope_weight(&q_trans, config.n_head, config.n_embd);
+        let q_permuted = permute_rope_weight(&q_trans, config.n_head, head_dim, config.n_embd);
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_q.weight", prefix),
             dims: vec![config.n_embd as u64, config.n_embd as u64],
@@ -177,7 +204,7 @@ pub fn export_to_gguf<B: Backend>(
         if let Some(ref q_b_param) = block.attn.q_proj.bias {
             let q_b = q_b_param.val().into_data().to_vec::<f32>()
                 .map_err(|e| format!("Failed to extract q_proj bias: {:?}", e))?;
-            let q_b_permuted = permute_rope_bias(&q_b, config.n_head);
+            let q_b_permuted = permute_rope_bias(&q_b, config.n_head, head_dim);
             named_tensors.push(NamedTensor {
                 name: format!("{}.attn_q.bias", prefix),
                 dims: vec![config.n_embd as u64],
@@ -187,21 +214,21 @@ pub fn export_to_gguf<B: Backend>(
 
         let k = block.attn.k_proj.weight.val().into_data().to_vec::<f32>()
             .map_err(|e| format!("Failed to extract k_proj weight: {:?}", e))?;
-        let k_trans = transpose_2d(&k, config.n_embd, config.n_embd);
-        let k_permuted = permute_rope_weight(&k_trans, config.n_head, config.n_embd);
+        let k_trans = transpose_2d(&k, kv_dim, config.n_embd);
+        let k_permuted = permute_rope_weight(&k_trans, n_kv_head, head_dim, config.n_embd);
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_k.weight", prefix),
-            dims: vec![config.n_embd as u64, config.n_embd as u64],
+            dims: vec![config.n_embd as u64, kv_dim as u64],
             data: k_permuted,
         });
 
         if let Some(ref k_b_param) = block.attn.k_proj.bias {
             let k_b = k_b_param.val().into_data().to_vec::<f32>()
                 .map_err(|e| format!("Failed to extract k_proj bias: {:?}", e))?;
-            let k_b_permuted = permute_rope_bias(&k_b, config.n_head);
+            let k_b_permuted = permute_rope_bias(&k_b, n_kv_head, head_dim);
             named_tensors.push(NamedTensor {
                 name: format!("{}.attn_k.bias", prefix),
-                dims: vec![config.n_embd as u64],
+                dims: vec![kv_dim as u64],
                 data: k_b_permuted,
             });
         }
@@ -210,8 +237,8 @@ pub fn export_to_gguf<B: Backend>(
             .map_err(|e| format!("Failed to extract v_proj weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_v.weight", prefix),
-            dims: vec![config.n_embd as u64, config.n_embd as u64],
-            data: transpose_2d(&v, config.n_embd, config.n_embd),
+            dims: vec![config.n_embd as u64, kv_dim as u64],
+            data: transpose_2d(&v, kv_dim, config.n_embd),
         });
 
         if let Some(ref v_b_param) = block.attn.v_proj.bias {
@@ -219,7 +246,7 @@ pub fn export_to_gguf<B: Backend>(
                 .map_err(|e| format!("Failed to extract v_proj bias: {:?}", e))?;
             named_tensors.push(NamedTensor {
                 name: format!("{}.attn_v.bias", prefix),
-                dims: vec![config.n_embd as u64],
+                dims: vec![kv_dim as u64],
                 data: v_b,
             });
         }
@@ -247,7 +274,7 @@ pub fn export_to_gguf<B: Backend>(
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_gate.weight", prefix),
             dims: vec![config.n_embd as u64, hidden_dim as u64],
-            data: transpose_2d(&gate, config.n_embd, hidden_dim),
+            data: transpose_2d(&gate, hidden_dim, config.n_embd),
         });
 
         let up = block.mlp.up_proj.weight.val().into_data().to_vec::<f32>()
@@ -255,7 +282,7 @@ pub fn export_to_gguf<B: Backend>(
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_up.weight", prefix),
             dims: vec![config.n_embd as u64, hidden_dim as u64],
-            data: transpose_2d(&up, config.n_embd, hidden_dim),
+            data: transpose_2d(&up, hidden_dim, config.n_embd),
         });
 
         let down = block.mlp.down_proj.weight.val().into_data().to_vec::<f32>()
@@ -263,7 +290,7 @@ pub fn export_to_gguf<B: Backend>(
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_down.weight", prefix),
             dims: vec![hidden_dim as u64, config.n_embd as u64],
-            data: transpose_2d(&down, hidden_dim, config.n_embd),
+            data: transpose_2d(&down, config.n_embd, hidden_dim),
         });
     }
 
@@ -286,101 +313,142 @@ pub fn export_to_gguf<B: Backend>(
 
     let file = File::create(&gguf_path)?;
     let mut w = BufWriter::new(file);
+    let mut current_offset: u64 = 0;
 
     // Header
     w.write_all(GGUF_MAGIC)?;
     w.write_all(&GGUF_VERSION.to_le_bytes())?;
-    w.write_all(&(named_tensors.len() as u64).to_le_bytes())?;
 
-    let head_size = (config.n_embd / config.n_head) as u32;
+    let tensor_count = named_tensors.len() as u64;
 
-    let metadata_kv: Vec<(&str, u32, Box<dyn Fn(&mut BufWriter<File>) -> std::io::Result<usize>>)> = vec![
-        ("general.architecture", GGUF_TYPE_STRING, Box::new(|w| write_gguf_string(w, "llama"))),
-        ("general.name", GGUF_TYPE_STRING, Box::new(|w| write_gguf_string(w, model_name))),
-        ("general.alignment", GGUF_TYPE_UINT32, Box::new(|w| { w.write_all(&32u32.to_le_bytes())?; Ok(4) })),
+    let tokens_clone = vocab_tokens.clone();
+    let types_clone = token_types.clone();
+    let merges_clone = vocab_merges.clone();
+
+    let kv_pairs: Vec<(&str, u32, Box<dyn Fn(&mut BufWriter<File>) -> std::io::Result<u64>>)> = vec![
+        ("general.architecture", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "llama")? as u64) })),
+        ("general.name", GGUF_TYPE_STRING, Box::new(move |w| { Ok(write_gguf_string(w, model_name)? as u64) })),
         ("llama.context_length", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&((config.n_ctx * 2) as u32).to_le_bytes())?; Ok(4) })),
-        ("llama.embedding_length", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.n_embd as u32).to_le_bytes())?; Ok(4) })),
-        ("llama.block_count", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.n_layer as u32).to_le_bytes())?; Ok(4) })),
+        ("llama.embedding_length", GGUF_TYPE_UINT32, Box::new(|w| { w.write_all(&(config.n_embd as u32).to_le_bytes())?; Ok(4) })),
+        ("llama.block_count", GGUF_TYPE_UINT32, Box::new(|w| { w.write_all(&(config.n_layer as u32).to_le_bytes())?; Ok(4) })),
         ("llama.feed_forward_length", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(hidden_dim as u32).to_le_bytes())?; Ok(4) })),
         ("llama.attention.head_count", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.n_head as u32).to_le_bytes())?; Ok(4) })),
         ("llama.attention.head_count_kv", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.get_n_kv_head() as u32).to_le_bytes())?; Ok(4) })),
-        ("llama.attention.layer_norm_rms_epsilon", GGUF_TYPE_FLOAT32, Box::new(|w| { w.write_all(&1e-6f32.to_le_bytes())?; Ok(4) })),
-        ("llama.rope.dimension_count", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&head_size.to_le_bytes())?; Ok(4) })),
-        ("llama.rope.freq_base", GGUF_TYPE_FLOAT32, Box::new(|w| { w.write_all(&10000.0f32.to_le_bytes())?; Ok(4) })),
-        ("tokenizer.ggml.model", GGUF_TYPE_STRING, Box::new(|w| write_gguf_string(w, "llama"))),
+        ("llama.attention.layer_norm_rms_epsilon", GGUF_TYPE_FLOAT32, Box::new(|w| { w.write_all(&1e-5f32.to_le_bytes())?; Ok(4) })),
+        ("tokenizer.ggml.model", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "gpt2")? as u64) })),
+        ("tokenizer.ggml.pre", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "gpt-2")? as u64) })),
+        ("tokenizer.ggml.add_prefix_space", GGUF_TYPE_BOOL, Box::new(|w| { w.write_all(&[1u8])?; Ok(1) })),
+        ("tokenizer.ggml.add_bos_token", GGUF_TYPE_BOOL, Box::new(|w| { w.write_all(&[0u8])?; Ok(1) })),
+        ("tokenizer.ggml.bos_token_id", GGUF_TYPE_UINT32, Box::new(|w| { w.write_all(&0u32.to_le_bytes())?; Ok(4) })),
+        ("tokenizer.ggml.eos_token_id", GGUF_TYPE_UINT32, Box::new(|w| { w.write_all(&0u32.to_le_bytes())?; Ok(4) })),
         ("tokenizer.ggml.tokens", GGUF_TYPE_ARRAY, Box::new(move |w| {
-            let mut bytes = 0;
             w.write_all(&GGUF_TYPE_STRING.to_le_bytes())?;
-            w.write_all(&(tokens.len() as u64).to_le_bytes())?;
-            bytes += 12;
-            for t in &tokens {
-                bytes += write_gguf_string(w, t)?;
+            w.write_all(&(tokens_clone.len() as u64).to_le_bytes())?;
+            let mut written = 12u64;
+            for tok in &tokens_clone {
+                written += write_gguf_string(w, tok)? as u64;
             }
-            Ok(bytes)
+            Ok(written)
         })),
-        ("tokenizer.ggml.bos_token_id", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&bos_token_id.to_le_bytes())?; Ok(4) })),
-        ("tokenizer.ggml.eos_token_id", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&eos_token_id.to_le_bytes())?; Ok(4) })),
+        ("tokenizer.ggml.scores", GGUF_TYPE_ARRAY, Box::new(move |w| {
+            w.write_all(&GGUF_TYPE_FLOAT32.to_le_bytes())?;
+            w.write_all(&(vocab_tokens.len() as u64).to_le_bytes())?;
+            let mut written = 12u64;
+            let zero = 0.0f32.to_le_bytes();
+            for _ in 0..vocab_tokens.len() {
+                w.write_all(&zero)?;
+                written += 4;
+            }
+            Ok(written)
+        })),
+        ("tokenizer.ggml.token_type", GGUF_TYPE_ARRAY, Box::new(move |w| {
+            w.write_all(&GGUF_TYPE_INT32.to_le_bytes())?;
+            w.write_all(&(types_clone.len() as u64).to_le_bytes())?;
+            let mut written = 12u64;
+            for &t in &types_clone {
+                w.write_all(&t.to_le_bytes())?;
+                written += 4;
+            }
+            Ok(written)
+        })),
+        ("tokenizer.ggml.merges", GGUF_TYPE_ARRAY, Box::new(move |w| {
+            w.write_all(&GGUF_TYPE_STRING.to_le_bytes())?;
+            w.write_all(&(merges_clone.len() as u64).to_le_bytes())?;
+            let mut written = 12u64;
+            for m in &merges_clone {
+                written += write_gguf_string(w, m)? as u64;
+            }
+            Ok(written)
+        })),
     ];
 
-    w.write_all(&(metadata_kv.len() as u64).to_le_bytes())?;
+    w.write_all(&tensor_count.to_le_bytes())?;
+    w.write_all(&(kv_pairs.len() as u64).to_le_bytes())?;
+    current_offset += 4 + 4 + 8 + 8;
 
-    for (key, val_type, write_fn) in &metadata_kv {
-        write_gguf_string(&mut w, key)?;
+    // Metadata KV
+    for (key, val_type, write_fn) in kv_pairs {
+        current_offset += write_gguf_string(&mut w, key)? as u64;
         w.write_all(&val_type.to_le_bytes())?;
-        write_fn(&mut w)?;
+        current_offset += 4;
+        let value_bytes_written = write_fn(&mut w)?;
+        current_offset += value_bytes_written;
     }
 
-    struct LocalTensorHeader {
-        _offset: u64,
-        data_len: u64,
-        tensor_idx: usize,
-    }
+    // Calculate tensor offsets & write tensor info headers
+    let mut tensor_data_offsets: Vec<u64> = Vec::with_capacity(named_tensors.len());
+    let mut data_offset_counter: u64 = 0;
 
-    let mut tensor_headers = Vec::new();
-    let mut current_offset = 0u64;
+    for tensor in &named_tensors {
+        let align_offset = (ALIGNMENT - (data_offset_counter % ALIGNMENT)) % ALIGNMENT;
+        data_offset_counter += align_offset;
+        tensor_data_offsets.push(data_offset_counter);
 
-    for (idx, tensor) in named_tensors.iter().enumerate() {
-        write_gguf_string(&mut w, &tensor.name)?;
+        let element_count: u64 = tensor.dims.iter().product();
+        let bytes_len = element_count * 4;
+        data_offset_counter += bytes_len;
+
+        current_offset += write_gguf_string(&mut w, &tensor.name)? as u64;
         w.write_all(&(tensor.dims.len() as u32).to_le_bytes())?;
+        current_offset += 4;
+
         for d in &tensor.dims {
             w.write_all(&d.to_le_bytes())?;
+            current_offset += 8;
         }
+
         w.write_all(&GGML_TYPE_F32.to_le_bytes())?;
-        w.write_all(&current_offset.to_le_bytes())?;
-
-        let tensor_bytes = (tensor.data.len() * std::mem::size_of::<f32>()) as u64;
-        tensor_headers.push(LocalTensorHeader {
-            _offset: current_offset,
-            data_len: tensor_bytes,
-            tensor_idx: idx,
-        });
-
-        current_offset += tensor_bytes;
-        let pad = (ALIGNMENT - (tensor_bytes % ALIGNMENT)) % ALIGNMENT;
-        current_offset += pad;
+        w.write_all(&tensor_data_offsets.last().unwrap().to_le_bytes())?;
+        current_offset += 4 + 8;
     }
 
-    let current_pos = w.stream_position()?;
-    let pad = (ALIGNMENT - (current_pos % ALIGNMENT)) % ALIGNMENT;
-    if pad > 0 {
-        let zero_buf = vec![0u8; pad as usize];
-        w.write_all(&zero_buf)?;
+    // Alignment padding before tensor binary data
+    let current_pos = current_offset;
+    let padding_bytes = (ALIGNMENT - (current_pos % ALIGNMENT)) % ALIGNMENT;
+    if padding_bytes > 0 {
+        let zeroes = vec![0u8; padding_bytes as usize];
+        w.write_all(&zeroes)?;
     }
 
-    for h in &tensor_headers {
-        let tensor = &named_tensors[h.tensor_idx];
+    // Write binary tensor data
+    for tensor in &named_tensors {
+        let current_file_pos = w.stream_position()?;
+        let pad = (ALIGNMENT - (current_file_pos % ALIGNMENT)) % ALIGNMENT;
+        if pad > 0 {
+            let zeroes = vec![0u8; pad as usize];
+            w.write_all(&zeroes)?;
+        }
+
         for &val in &tensor.data {
             w.write_all(&val.to_le_bytes())?;
-        }
-        let pad = (ALIGNMENT - (h.data_len % ALIGNMENT)) % ALIGNMENT;
-        if pad > 0 {
-            let zero_buf = vec![0u8; pad as usize];
-            w.write_all(&zero_buf)?;
         }
     }
 
     w.flush()?;
-    println!("GGUF export finished successfully. Binary size: {} MB", (w.stream_position()? as f64) / (1024.0 * 1024.0));
+
+    let metadata = std::fs::metadata(&gguf_path)?;
+    let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+    println!("GGUF export finished successfully. Binary size: {} MB", size_mb);
 
     Ok(gguf_path)
 }

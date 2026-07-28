@@ -11,13 +11,30 @@ use burn::tensor::{Int, Tensor, TensorData};
 use std::path::Path;
 use std::time::Instant;
 
+#[derive(Clone)]
 pub struct TextDataset {
-    tokens: Vec<u32>,
-    n_ctx: usize,
-    step: usize,
+    pub tokens: Vec<u32>,
+    pub n_ctx: usize,
+    pub step: usize,
 }
 
 impl TextDataset {
+    pub fn split(self, val_ratio: f32) -> (Self, Self) {
+        let val_ratio = val_ratio.clamp(0.0, 0.9);
+        if val_ratio <= 0.0 || self.tokens.len() < (self.n_ctx + 1) * 2 {
+            return (self.clone(), Self { tokens: vec![], n_ctx: self.n_ctx, step: self.step });
+        }
+
+        let split_idx = ((self.tokens.len() as f32) * (1.0 - val_ratio)) as usize;
+        let train_tokens = self.tokens[..split_idx].to_vec();
+        let val_tokens = self.tokens[split_idx..].to_vec();
+
+        (
+            Self { tokens: train_tokens, n_ctx: self.n_ctx, step: self.step },
+            Self { tokens: val_tokens, n_ctx: self.n_ctx, step: self.step },
+        )
+    }
+
     pub fn from_file<P: AsRef<Path>>(
         path: P,
         tokenizer: &LlmTokenizer,
@@ -65,7 +82,7 @@ impl TextDataset {
         }
     }
 
-    pub fn get_batch<B: AutodiffBackend>(
+    pub fn get_batch<B: burn::tensor::backend::Backend>(
         &self,
         indices: &[usize],
         n_ctx: usize,
@@ -110,6 +127,27 @@ fn shuffle_indices(indices: &mut [usize], rng: &mut XorshiftRng) {
     }
 }
 
+pub fn compute_scheduled_n_ctx(
+    global_step: usize,
+    warmup_steps: usize,
+    target_n_ctx: usize,
+) -> usize {
+    if warmup_steps == 0 || global_step >= warmup_steps {
+        return target_n_ctx;
+    }
+
+    let min_ctx = std::cmp::max(32, target_n_ctx / 4);
+    if min_ctx >= target_n_ctx {
+        return target_n_ctx;
+    }
+
+    let progress = (global_step as f32 / warmup_steps as f32).clamp(0.0, 1.0);
+    let scheduled = (min_ctx as f32 + progress * (target_n_ctx - min_ctx) as f32) as usize;
+
+    let aligned = (scheduled / 16) * 16;
+    aligned.clamp(min_ctx, target_n_ctx)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn train<B: AutodiffBackend>(
     dataset_path: Option<&Path>,
@@ -121,10 +159,15 @@ pub fn train<B: AutodiffBackend>(
     lr: f64,
     custom_step: Option<usize>,
     max_tokens: Option<usize>,
+    val_split: f32,
+    grad_accum_steps: usize,
+    seq_warmup_steps: usize,
+    save_dir: Option<&Path>,
+    resume_path: Option<&Path>,
     device: &B::Device,
     output_dir: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let dataset = if let Some(path) = dataset_path {
+    let full_dataset = if let Some(path) = dataset_path {
         TextDataset::from_file(path, tokenizer, model_config.n_ctx, custom_step, max_tokens)?
     } else if let Some(text) = raw_text {
         TextDataset::from_raw_text(text, tokenizer, model_config.n_ctx, custom_step, max_tokens)
@@ -132,27 +175,57 @@ pub fn train<B: AutodiffBackend>(
         return Err("No dataset path or raw text provided for training.".into());
     };
 
-    if dataset.len() == 0 {
+    if full_dataset.len() == 0 {
         return Err("Dataset contains 0 valid sequence samples for the current context length.".into());
     }
 
+    let (train_dataset, val_dataset) = if val_split > 0.0 {
+        let (tr, va) = full_dataset.split(val_split);
+        println!("Dataset split: {} training samples, {} validation samples ({:.1}% val).", tr.len(), va.len(), val_split * 100.0);
+        (tr, va)
+    } else {
+        (full_dataset, TextDataset { tokens: vec![], n_ctx: model_config.n_ctx, step: custom_step.unwrap_or(model_config.n_ctx) })
+    };
+
     tui::print_info("Initializing model architecture on WGPU device...");
     let mut model = model_config.init_model::<B>(device);
+
+    if let Some(res_path) = resume_path {
+        let rec_file = if res_path.is_file() {
+            res_path.with_extension("")
+        } else {
+            res_path.to_path_buf()
+        };
+        println!("Resuming model weights from {:?}...", rec_file);
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        if let Ok(record) = recorder.load(rec_file, device) {
+            model = model.load_record(record);
+            println!("Successfully loaded checkpoint weights!");
+        } else {
+            println!("Warning: Failed to load checkpoint from {:?}. Proceeding with fresh weights.", res_path);
+        }
+    }
+
     let mut optim = AdamWConfig::new()
         .with_weight_decay(0.1f32)
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
-    let effective_batch_size = std::cmp::min(batch_size, dataset.len());
-    let num_batches = dataset.len().div_ceil(effective_batch_size);
+    let effective_batch_size = std::cmp::min(batch_size, train_dataset.len());
+    let num_batches = train_dataset.len().div_ceil(effective_batch_size);
     let total_steps = epochs * num_batches;
     let warmup_steps = if total_steps <= 10 { 0 } else { std::cmp::min(1000, total_steps / 10) };
     let min_lr = lr * 0.1;
+    let grad_accum = grad_accum_steps.max(1);
+
+    if seq_warmup_steps > 0 {
+        println!("Sequence Length Warmup active: scaling context length over the first {} steps.", seq_warmup_steps);
+    }
 
     tui::print_training_header(
         &model_config,
-        dataset.len(),
-        dataset.tokens.len(),
+        train_dataset.len(),
+        train_dataset.tokens.len(),
         epochs,
         num_batches,
         effective_batch_size,
@@ -176,7 +249,7 @@ pub fn train<B: AutodiffBackend>(
         let log_interval = std::cmp::max(1, num_batches / 10);
 
         // Shuffle sequence sample indices per epoch
-        let mut sample_indices: Vec<usize> = (0..dataset.len()).collect();
+        let mut sample_indices: Vec<usize> = (0..train_dataset.len()).collect();
         shuffle_indices(&mut sample_indices, &mut shuffle_rng);
 
         for batch_idx in 0..num_batches {
@@ -193,11 +266,13 @@ pub fn train<B: AutodiffBackend>(
                 lr
             };
 
+            let current_n_ctx = compute_scheduled_n_ctx(global_step, seq_warmup_steps, model_config.n_ctx);
+
             let start = batch_idx * effective_batch_size;
-            let end = std::cmp::min(start + effective_batch_size, dataset.len());
+            let end = std::cmp::min(start + effective_batch_size, train_dataset.len());
             let indices: Vec<usize> = sample_indices[start..end].to_vec();
 
-            let (inputs, targets) = dataset.get_batch::<B>(&indices, model_config.n_ctx, device);
+            let (inputs, targets) = train_dataset.get_batch::<B>(&indices, current_n_ctx, device);
             let logits = model.forward(inputs);
             let [b, t, v] = logits.dims();
 
@@ -205,7 +280,11 @@ pub fn train<B: AutodiffBackend>(
             let log_probs = burn::tensor::activation::log_softmax(logits_flat, 1);
             let targets_flat = targets.reshape([b * t, 1]);
             let target_log_probs = log_probs.gather(1, targets_flat);
-            let loss = target_log_probs.mean().neg();
+            let mut loss = target_log_probs.mean().neg();
+
+            if grad_accum > 1 {
+                loss = loss / (grad_accum as f32);
+            }
 
             // Accumulate loss ON GPU detached from autograd graph
             accum_loss_tensor = accum_loss_tensor + loss.clone().detach();
@@ -213,7 +292,10 @@ pub fn train<B: AutodiffBackend>(
 
             let grads = loss.backward();
             let grads_params = GradientsParams::from_grads(grads, &model);
-            model = optim.step(current_lr, model, grads_params);
+
+            if (batch_idx + 1) % grad_accum == 0 || batch_idx == num_batches - 1 {
+                model = optim.step(current_lr, model, grads_params);
+            }
 
             // Full GPU-synced log line at intervals
             let is_log_step = (batch_idx + 1) % log_interval == 0 || batch_idx == num_batches - 1;
@@ -273,6 +355,22 @@ pub fn train<B: AutodiffBackend>(
         let elapsed = epoch_start.elapsed().as_secs_f32();
         let final_epoch_avg = if total_batches > 0 { total_epoch_loss / total_batches as f32 } else { 0.0 };
 
+        if val_dataset.len() > 0 {
+            let (val_loss, val_ppl) = evaluate_dataset(&model.valid(), &val_dataset, effective_batch_size, device);
+            println!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl);
+        }
+
+        if let Some(s_dir) = save_dir {
+            std::fs::create_dir_all(s_dir)?;
+            let ckpt_path = s_dir.join(format!("checkpoint_epoch_{}", epoch));
+            let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+            if let Err(e) = recorder.record(model.clone().into_record(), ckpt_path.clone()) {
+                println!("Warning: Failed to save checkpoint at {:?}: {:?}", ckpt_path, e);
+            } else {
+                println!("Saved checkpoint: {:?}", ckpt_path.with_extension("bin"));
+            }
+        }
+
         let preview = generate::<B::InnerBackend>(
             &model.valid(),
             tokenizer,
@@ -311,3 +409,138 @@ pub fn train<B: AutodiffBackend>(
 
     Ok(())
 }
+
+pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
+    model: &crate::model::Llm<B>,
+    dataset: &TextDataset,
+    batch_size: usize,
+    device: &B::Device,
+) -> (f32, f32) {
+    if dataset.len() == 0 {
+        return (0.0, 1.0);
+    }
+    let total_batches = dataset.len().div_ceil(batch_size);
+    let eval_batches = total_batches.min(100);
+    let mut total_loss = 0.0f32;
+
+    for batch_idx in 0..eval_batches {
+        let start = batch_idx * batch_size;
+        let end = std::cmp::min(start + batch_size, dataset.len());
+        let indices: Vec<usize> = (start..end).collect();
+
+        let (inputs, targets) = dataset.get_batch::<B>(&indices, model.n_ctx, device);
+        let logits = model.forward(inputs);
+        let [b, t, v] = logits.dims();
+
+        let logits_flat = logits.reshape([b * t, v]);
+        let log_probs = burn::tensor::activation::log_softmax(logits_flat, 1);
+        let targets_flat = targets.reshape([b * t, 1]);
+        let target_log_probs = log_probs.gather(1, targets_flat);
+        let loss = target_log_probs.mean().neg();
+
+        let loss_val = loss
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap_or_default()
+            .first()
+            .copied()
+            .unwrap_or(0.0);
+
+        total_loss += loss_val;
+    }
+
+    let avg_loss = total_loss / (eval_batches as f32);
+    let perplexity = avg_loss.exp();
+    (avg_loss, perplexity)
+}
+
+pub fn run_eval<B: AutodiffBackend>(
+    model_dir: &Path,
+    dataset_path: &Path,
+    tokenizer: &LlmTokenizer,
+    n_ctx: Option<usize>,
+    device: &B::Device,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config_path = model_dir.join("config.json");
+    if !config_path.exists() {
+        return Err(format!("Model config not found at {:?}", config_path).into());
+    }
+    let config_str = std::fs::read_to_string(&config_path)?;
+    let mut config: ModelConfig = serde_json::from_str(&config_str)?;
+
+    if let Some(ctx) = n_ctx {
+        config.n_ctx = ctx;
+    }
+
+    println!("Loading model config from {:?}...", config_path);
+    let model: crate::model::Llm<B> = config.init_model(device);
+
+    let weights_path = model_dir.join("model_weights.bin");
+    let model = if weights_path.exists() {
+        println!("Loading model weights from {:?}...", weights_path);
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+        let record = recorder
+            .load(model_dir.join("model_weights"), device)
+            .map_err(|e| format!("Failed to load model record: {:?}", e))?;
+        model.load_record(record)
+    } else {
+        println!("Warning: model_weights.bin not found in {:?}. Evaluating initialized model.", model_dir);
+        model
+    };
+
+    let dataset = TextDataset::from_file(dataset_path, tokenizer, config.n_ctx, None, None)?;
+    println!("Evaluating model on dataset {:?} ({} samples, {} tokens)...", dataset_path, dataset.len(), dataset.tokens.len());
+
+    let start_time = Instant::now();
+    let (loss, ppl) = evaluate_dataset::<B>(&model, &dataset, 32, device);
+    let elapsed = start_time.elapsed().as_secs_f64();
+
+    println!("\n╔══════════════════════════════════════════════════════════════╗");
+    println!("║                    EVALUATION RESULTS                        ║");
+    println!("╠══════════════════════════════════════════════════════════════╣");
+    println!("║ Cross-Entropy Loss : {:<39.4} ║", loss);
+    println!("║ Perplexity (PPL)   : {:<39.4} ║", ppl);
+    println!("║ Evaluation Time    : {:<35.2}s ║", elapsed);
+    println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_train_val_split() {
+        let tokens: Vec<u32> = (0..1000).collect();
+        let dataset = TextDataset { tokens, n_ctx: 32, step: 32 };
+
+        let (train_ds, val_ds) = dataset.split(0.2);
+        assert_eq!(train_ds.tokens.len(), 800);
+        assert_eq!(val_ds.tokens.len(), 200);
+    }
+
+    #[test]
+    fn test_perplexity_formula() {
+        let loss = 2.302585f32; // ln(10)
+        let ppl = loss.exp();
+        assert!((ppl - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_sequence_length_warmup() {
+        let target_ctx = 256;
+        let warmup_steps = 1000;
+
+        let ctx_start = compute_scheduled_n_ctx(0, warmup_steps, target_ctx);
+        let ctx_mid = compute_scheduled_n_ctx(500, warmup_steps, target_ctx);
+        let ctx_end = compute_scheduled_n_ctx(1000, warmup_steps, target_ctx);
+        let ctx_after = compute_scheduled_n_ctx(1500, warmup_steps, target_ctx);
+
+        assert_eq!(ctx_start, 64);
+        assert!(ctx_mid > ctx_start && ctx_mid < ctx_end);
+        assert_eq!(ctx_end, target_ctx);
+        assert_eq!(ctx_after, target_ctx);
+    }
+}
+

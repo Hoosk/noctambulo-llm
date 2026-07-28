@@ -10,6 +10,7 @@ corpus.txt
 # Salidas y checkpoints del modelo
 /model_output/
 /exported/
+/checkpoints/
 
 
 # Archivos del sistema y configuraciones locales

@@ -8,12 +8,12 @@ mod tui;
 
 use clap::{Args, Parser, Subcommand};
 use config::ModelConfig;
-use data::{combine_and_mix_datasets, download_dataset_from_hf, train_custom_tokenizer, LlmTokenizer};
+use data::{combine_and_mix_datasets, download_dataset_from_hf, prepare_binary_dataset, train_custom_tokenizer, LlmTokenizer};
 use export::export_to_gguf;
 use generate::generate;
 use model::Llm;
 use std::path::{Path, PathBuf};
-use train::train;
+use train::{run_eval, train};
 
 use burn::backend::wgpu::WgpuDevice;
 use burn::backend::{Autodiff, Wgpu};
@@ -46,8 +46,12 @@ struct Cli {
 enum Commands {
     /// Train a custom BPE tokenizer on corpus or datasets
     TrainTokenizer(TrainTokenizerArgs),
+    /// Pre-tokenize corpus or HF dataset to compact binary dataset format (.bin)
+    PrepareDataset(PrepareDatasetArgs),
     /// Train the causal transformer model
     Train(TrainArgs),
+    /// Evaluate model cross-entropy loss and perplexity (PPL) on dataset
+    Eval(EvalArgs),
     /// Generate text autoregressively from a prompt
     Generate(GenerateArgs),
     /// Export model weights and metadata to GGUF format
@@ -70,6 +74,44 @@ struct TrainTokenizerArgs {
     /// Vocabulary size
     #[arg(long, default_value_t = 8000)]
     vocab_size: usize,
+}
+
+#[derive(Args)]
+struct PrepareDatasetArgs {
+    /// HF dataset repo ID(s) (comma-separated, e.g. roneneldan/TinyStories)
+    #[arg(long, value_delimiter = ',')]
+    dataset: Vec<String>,
+    /// Local dataset file path
+    #[arg(long)]
+    file: Option<String>,
+    /// Target file name inside HF dataset repo
+    #[arg(long, default_value = "TinyStories-train.txt")]
+    dataset_file: String,
+    /// Output binary dataset file path (.bin)
+    #[arg(long, default_value = "datasets/dataset.bin")]
+    output: String,
+    /// Max dataset tokens to tokenize (0 = all)
+    #[arg(long, default_value_t = 0)]
+    max_tokens: usize,
+}
+
+#[derive(Args)]
+struct EvalArgs {
+    /// Model output directory containing config.json and model_weights.bin
+    #[arg(long, default_value = "model_output")]
+    model_dir: String,
+    /// HF dataset repo ID(s)
+    #[arg(long, value_delimiter = ',')]
+    dataset: Vec<String>,
+    /// Local dataset file path (.txt or .bin)
+    #[arg(long)]
+    file: Option<String>,
+    /// Target file name inside HF dataset repo
+    #[arg(long, default_value = "TinyStories-train.txt")]
+    dataset_file: String,
+    /// Context window size override
+    #[arg(long)]
+    n_ctx: Option<usize>,
 }
 
 #[derive(Args)]
@@ -119,6 +161,21 @@ struct TrainArgs {
     /// Attention score softcapping threshold (0.0 = disabled, 50.0 = Gemma 4 math)
     #[arg(long, default_value_t = 0.0)]
     attn_softcap: f32,
+    /// Validation set ratio (0.1 = 10% validation split)
+    #[arg(long, default_value_t = 0.1)]
+    val_split: f32,
+    /// Gradient accumulation steps (default = 1)
+    #[arg(long, default_value_t = 1)]
+    grad_accum: usize,
+    /// Directory to save epoch checkpoints (default: None)
+    #[arg(long)]
+    save_dir: Option<String>,
+    /// Checkpoint file path to resume training from
+    #[arg(long)]
+    resume: Option<String>,
+    /// Number of steps for progressive sequence length warmup (0 = disabled)
+    #[arg(long, default_value_t = 0)]
+    seq_warmup_steps: usize,
 }
 
 #[derive(Args)]
@@ -192,6 +249,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             train_custom_tokenizer(&corpus_path, custom_tokenizer_file, args.vocab_size)?;
             println!("Tokenizer successfully trained and saved to '{}'.", custom_tokenizer_file);
         }
+        Commands::PrepareDataset(args) => {
+            let mut sources: Vec<PathBuf> = Vec::new();
+            for repo in &args.dataset {
+                let repo = repo.trim();
+                if !repo.is_empty() {
+                    let downloaded = download_dataset_from_hf(repo, &args.dataset_file)?;
+                    sources.push(downloaded);
+                }
+            }
+            if let Some(file_path) = args.file {
+                sources.push(PathBuf::from(file_path));
+            }
+
+            let corpus_path = if sources.is_empty() {
+                let default_file = Path::new("corpus.txt");
+                if !default_file.exists() {
+                    std::fs::write(default_file, DEFAULT_CORPUS)?;
+                }
+                default_file.to_path_buf()
+            } else if sources.len() == 1 {
+                sources[0].clone()
+            } else {
+                combine_and_mix_datasets(&sources, Path::new("datasets/combined_corpus.txt"))?
+            };
+
+            let tokenizer = if Path::new(custom_tokenizer_file).exists() {
+                LlmTokenizer::from_file(custom_tokenizer_file)?
+            } else {
+                println!("No custom tokenizer found. Training default tokenizer first...");
+                train_custom_tokenizer("corpus.txt", custom_tokenizer_file, 8000)?;
+                LlmTokenizer::from_file(custom_tokenizer_file)?
+            };
+
+            let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
+            prepare_binary_dataset(&corpus_path, &args.output, &tokenizer, max_tokens)?;
+        }
         Commands::Train(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();
             let mut raw_text: Option<String> = None;
@@ -212,7 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Ok(entries) = std::fs::read_dir(".") {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with("dataset_") && name.ends_with(".txt") {
+                        if name.starts_with("dataset_") && (name.ends_with(".txt") || name.ends_with(".bin")) {
                             found_dataset = Some(entry.path());
                             break;
                         }
@@ -258,6 +351,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.attn_softcap,
             );
 
+            let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
+            let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
+
             train::<Autodiff<Wgpu>>(
                 dataset_path_buf.as_deref(),
                 raw_text.as_deref(),
@@ -268,8 +364,52 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.lr,
                 args.step,
                 max_tokens,
+                args.val_split,
+                args.grad_accum,
+                args.seq_warmup_steps,
+                save_dir_buf.as_deref(),
+                resume_path_buf.as_deref(),
                 &device,
                 output_dir,
+            )?;
+        }
+        Commands::Eval(args) => {
+            let mut sources: Vec<PathBuf> = Vec::new();
+            for repo in &args.dataset {
+                let repo = repo.trim();
+                if !repo.is_empty() {
+                    let downloaded = download_dataset_from_hf(repo, &args.dataset_file)?;
+                    sources.push(downloaded);
+                }
+            }
+            if let Some(file_path) = args.file {
+                sources.push(PathBuf::from(file_path));
+            }
+
+            let dataset_path = if sources.is_empty() {
+                if Path::new("datasets/dataset.bin").exists() {
+                    PathBuf::from("datasets/dataset.bin")
+                } else if Path::new("corpus.txt").exists() {
+                    PathBuf::from("corpus.txt")
+                } else {
+                    return Err("No evaluation dataset specified (--file or --dataset).".into());
+                }
+            } else {
+                sources[0].clone()
+            };
+
+            let tokenizer = if Path::new(custom_tokenizer_file).exists() {
+                LlmTokenizer::from_file(custom_tokenizer_file)?
+            } else {
+                LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
+            };
+
+            run_eval::<Autodiff<Wgpu>>(
+                Path::new(&args.model_dir),
+                &dataset_path,
+                &tokenizer,
+                args.n_ctx,
+                &device,
             )?;
         }
         Commands::Generate(args) => {

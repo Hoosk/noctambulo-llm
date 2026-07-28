@@ -1,6 +1,6 @@
 use hf_hub::api::sync::Api;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use crate::tui;
 use std::time::Instant;
@@ -59,6 +59,14 @@ impl LlmTokenizer {
         max_tokens: Option<usize>,
     ) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
         let path = file_path.as_ref();
+
+        if is_binary_file(path)? {
+            println!("Detected pre-tokenized binary dataset: {:?}", path);
+            let (tokens, vocab_sz) = load_tokens_from_binary(path, max_tokens)?;
+            println!("Loaded {} pre-tokenized tokens (Vocab size in header: {}).", tokens.len(), vocab_sz);
+            return Ok(tokens);
+        }
+
         let file = File::open(path)?;
         let total_bytes = file.metadata()?.len();
 
@@ -380,3 +388,148 @@ pub fn train_custom_tokenizer(
     println!("Successfully trained custom tokenizer -> saved to '{}'", output_json_path);
     Ok(())
 }
+
+const BINARY_MAGIC: &[u8; 4] = b"KNKB";
+
+pub fn is_binary_file<P: AsRef<Path>>(path: P) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let path = path.as_ref();
+    if let Some(ext) = path.extension() {
+        if ext == "bin" {
+            return Ok(true);
+        }
+    }
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_ok() {
+        if &magic == BINARY_MAGIC {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn save_tokens_to_binary<P: AsRef<Path>>(
+    path: P,
+    tokens: &[u32],
+    vocab_size: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut file = std::io::BufWriter::new(File::create(path)?);
+    file.write_all(BINARY_MAGIC)?;
+    file.write_all(&1u32.to_le_bytes())?;
+    file.write_all(&vocab_size.to_le_bytes())?;
+    file.write_all(&(tokens.len() as u64).to_le_bytes())?;
+
+    for chunk in tokens.chunks(1024) {
+        let mut bytes = Vec::with_capacity(chunk.len() * 4);
+        for &t in chunk {
+            bytes.extend_from_slice(&t.to_le_bytes());
+        }
+        file.write_all(&bytes)?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+pub fn load_tokens_from_binary<P: AsRef<Path>>(
+    path: P,
+    max_tokens: Option<usize>,
+) -> Result<(Vec<u32>, u32), Box<dyn std::error::Error + Send + Sync>> {
+    let mut file = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if &magic != BINARY_MAGIC {
+        return Err("Invalid binary dataset header: magic bytes mismatch".into());
+    }
+
+    let mut ver_buf = [0u8; 4];
+    file.read_exact(&mut ver_buf)?;
+    let version = u32::from_le_bytes(ver_buf);
+    if version != 1 {
+        return Err(format!("Unsupported binary dataset version: {}", version).into());
+    }
+
+    let mut vocab_buf = [0u8; 4];
+    file.read_exact(&mut vocab_buf)?;
+    let vocab_size = u32::from_le_bytes(vocab_buf);
+
+    let mut count_buf = [0u8; 8];
+    file.read_exact(&mut count_buf)?;
+    let total_tokens = u64::from_le_bytes(count_buf) as usize;
+
+    let target_tokens = match max_tokens {
+        Some(limit) if limit > 0 => total_tokens.min(limit),
+        _ => total_tokens,
+    };
+
+    let mut tokens = Vec::with_capacity(target_tokens);
+    let mut buf = [0u8; 4 * 1024];
+
+    while tokens.len() < target_tokens {
+        let needed_tokens = target_tokens - tokens.len();
+        let needed_bytes = (needed_tokens * 4).min(buf.len());
+        let read_bytes = file.read(&mut buf[..needed_bytes])?;
+        if read_bytes == 0 {
+            break;
+        }
+        for chunk in buf[..read_bytes].chunks_exact(4) {
+            tokens.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+    }
+
+    Ok((tokens, vocab_size))
+}
+
+pub fn prepare_binary_dataset<P1: AsRef<Path>, P2: AsRef<Path>>(
+    input_path: P1,
+    output_path: P2,
+    tokenizer: &LlmTokenizer,
+    max_tokens: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("Preparing pre-tokenized binary dataset from {:?} to {:?}...", input_path.as_ref(), output_path.as_ref());
+    let tokens = tokenizer.encode_file_streaming(input_path, max_tokens)?;
+    let vocab_size = tokenizer.vocab_size() as u32;
+    save_tokens_to_binary(output_path.as_ref(), &tokens, vocab_size)?;
+    println!("Saved binary dataset with {} tokens (vocab_size: {}) to {:?}", tokens.len(), vocab_size, output_path.as_ref());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_binary_dataset_roundtrip() {
+        let path = std::env::temp_dir().join("test_kuro_bin_roundtrip.bin");
+
+        let original_tokens = vec![1, 100, 500, 1000, 7999, 42];
+        let original_vocab_size = 8000;
+
+        save_tokens_to_binary(&path, &original_tokens, original_vocab_size).unwrap();
+
+        assert!(is_binary_file(&path).unwrap());
+
+        let (loaded_tokens, loaded_vocab) = load_tokens_from_binary(&path, None).unwrap();
+        assert_eq!(loaded_tokens, original_tokens);
+        assert_eq!(loaded_vocab, original_vocab_size);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_binary_dataset_max_tokens_limit() {
+        let path = std::env::temp_dir().join("test_kuro_bin_limit.bin");
+
+        let original_tokens: Vec<u32> = (0..100).collect();
+        save_tokens_to_binary(&path, &original_tokens, 1000).unwrap();
+
+        let (loaded_tokens, _) = load_tokens_from_binary(&path, Some(30)).unwrap();
+        assert_eq!(loaded_tokens.len(), 30);
+        assert_eq!(loaded_tokens, (0..30).collect::<Vec<u32>>());
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+

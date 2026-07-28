@@ -2,6 +2,7 @@ use crate::data::LlmTokenizer;
 use crate::model::{KvCache, Llm};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
+use std::time::Instant;
 
 pub struct XorshiftRng {
     state: u64,
@@ -213,6 +214,8 @@ pub fn generate<B: Backend>(
         }
     }
 
+    let gen_start = Instant::now();
+
     // 2. Decode Phase: process 1 new token per step using KV Cache (O(1) decoding)
     for _ in 1..max_new_tokens {
         let last_token = tokens.last().copied().unwrap_or(0) as i32;
@@ -252,6 +255,62 @@ pub fn generate<B: Backend>(
         }
     }
 
+    let elapsed = gen_start.elapsed().as_secs_f64();
+    let generated_count = tokens.len().saturating_sub(initial_prompt_len);
+    let speed = if elapsed > 0.0 { generated_count as f64 / elapsed } else { 0.0 };
+
     let decoded_text = tokenizer.decode(&tokens)?;
+    println!(
+        "\n[Generation Complete: {} tokens generated in {:.2}s ({:.1} tokens/sec)]",
+        generated_count, elapsed, speed
+    );
     Ok(decoded_text)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xorshift_rng() {
+        let mut rng = XorshiftRng::new(42);
+        let v1 = rng.next_f32();
+        let v2 = rng.next_f32();
+        assert!(v1 >= 0.0 && v1 <= 1.0);
+        assert!(v2 >= 0.0 && v2 <= 1.0);
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn test_sample_logits_repetition_penalty() {
+        let mut logits = vec![1.0f32, 2.0, 3.0, 4.0];
+        let tokens = vec![3u32]; // Token 3 was seen
+        let mut rng = XorshiftRng::new(123);
+
+        // Without penalty, token 3 has highest logit (4.0)
+        // With penalty 2.0, token 3's logit becomes 4.0 / 2.0 = 2.0
+        let _token = sample_logits(
+            &mut logits,
+            &tokens,
+            1.0,
+            0,
+            1.0,
+            0.0,
+            2.0, // repetition penalty
+            &mut rng,
+        );
+
+        assert_eq!(logits[3], 2.0); // 4.0 / 2.0
+    }
+
+    #[test]
+    fn test_sample_logits_temperature_zero() {
+        let mut logits = vec![1.0f32, 5.0, 2.0];
+        let tokens = vec![];
+        let mut rng = XorshiftRng::new(1);
+
+        let token = sample_logits(&mut logits, &tokens, 0.001, 1, 1.0, 0.0, 1.0, &mut rng);
+        assert_eq!(token, 1); // highest score index is 1
+    }
+}
+

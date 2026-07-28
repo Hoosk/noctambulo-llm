@@ -48,7 +48,7 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | Flag | Descripción | Valor por Defecto |
 |:---|:---|:---|
 | `--dataset <repo>` | Repositorio(s) de Hugging Face (ej. `roneneldan/TinyStories`) | `[]` |
-| `--file <path>` | Archivo de texto local para entrenar | `None` |
+| `--file <path>` | Archivo de texto plano local o binario (`.bin`) para entrenar | `None` |
 | `--dataset-file <filename>` | Nombre de archivo dentro del repo de HF | `TinyStories-train.txt` |
 | `--batch-size <n>` | Tamaño de lote (Batch size) | `128` |
 | `--epochs <n>` | Número de épocas de entrenamiento | `3` |
@@ -62,6 +62,11 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--lr <float>` | Tasa de aprendizaje (Learning rate) | `0.0003` |
 | `--dropout <float>` | Probabilidad de dropout | `0.1` |
 | `--attn-softcap <float>` | Capping de atención (`0.0` desactivado, `50.0` Gemma 4) | `0.0` |
+| `--val-split <float>` | Ratio reservado para validación y cálculo de perplejidad ($PPL$) | `0.1` |
+| `--grad-accum <n>` | Pasos de acumulación de gradientes antes del paso de AdamW | `1` |
+| `--save-dir <path>` | Directorio para guardado automático de checkpoints por época | `None` |
+| `--resume <path>` | Ruta a checkpoint o pesos previos para reanudar entrenamiento | `None` |
+| `--seq-warmup-steps <n>` | Pasos iniciales para **Progressive Sequence Scaling** (de $N/4$ a $N$) | `0` |
 
 #### Ejemplos de Entrenamientos Personalizados
 
@@ -72,8 +77,31 @@ cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 10000
 # Entrenar sobre TODO el dataset sin límite de tokens
 cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 0
 
+# Configurar entrenamiento con Sequence Length Warmup (Progressive Scaling), Acumulación y Checkpointing
+cargo run --release -- train --file corpus.txt --seq-warmup-steps 1000 --grad-accum 4 --val-split 0.1 --save-dir checkpoints
+
 # Configurar un modelo más grande con GQA y Softcapping
 cargo run --release -- train --dataset roneneldan/TinyStories --n-embd 512 --n-head 8 --n-kv-head 2 --n-layer 8 --attn-softcap 50.0
+```
+
+---
+
+### 2. Pre-tokenizar Dataset Binario (`prepare-dataset`)
+
+Pre-tokeniza un corpus o dataset de Hugging Face a un archivo binario `.bin` ultracompacto para carga instantánea con `mmap`:
+
+```bash
+cargo run --release -- prepare-dataset --file corpus.txt --output datasets/corpus.bin
+```
+
+---
+
+### 3. Evaluar Modelo y Perplejidad (`eval`)
+
+Evalúa la pérdida de entropía cruzada y la Perplejidad ($PPL = e^{\text{loss}}$) de un modelo entrenado:
+
+```bash
+cargo run --release -- eval --model-dir model_output --file datasets/corpus.bin
 ```
 
 ---
