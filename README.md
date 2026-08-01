@@ -106,7 +106,7 @@ cargo run --release -- eval --model-dir model_output --file datasets/corpus.bin
 
 ---
 
-### 2. Entrenar Tokenizador Custom (`train-tokenizer`)
+### 4. Entrenar Tokenizador Custom (`train-tokenizer`)
 
 Entrena un tokenizador BPE Byte-Level desde cero sobre un corpus específico:
 
@@ -125,12 +125,12 @@ cargo run --release -- train-tokenizer --dataset roneneldan/TinyStories --vocab-
 
 ---
 
-### 3. Generar Texto / Inferencia (`generate`)
+### 5. Generar Texto / Inferencia (`generate`)
 
 Genera texto autorregresivo a partir de una frase semilla usando el modelo entrenado, con muestreo Top-K, Top-P, Min-P y Repetition Penalty:
 
 ```bash
-cargo run --release -- generate "Once upon a time" --temp 0.7 --top-k 40 --top-p 0.9 --min-p 0.05 --max-tokens 50
+cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p 0.9 --min-p 0.1 --max-tokens 50
 ```
 
 #### Opciones del Generador (CLI Flags)
@@ -138,17 +138,17 @@ cargo run --release -- generate "Once upon a time" --temp 0.7 --top-k 40 --top-p
 | Flag / Argumento | Descripción | Valor por Defecto |
 |:---|:---|:---|
 | `<prompt>` | Frase semilla (prompt) para iniciar la generación (Posicional) | *Requerido* |
-| `--temp <float>` | Temperatura de muestreo para controlar la creatividad/aleatoriedad | `0.7` |
-| `--top-k <n>` | Límite superior de tokens candidatos a evaluar (Muestreo Top-K) | `40` |
+| `--temp <float>` | Temperatura de muestreo para controlar la creatividad/aleatoriedad | `0.9` |
+| `--top-k <n>` | Límite superior de tokens candidatos a evaluar (Muestreo Top-K) | `60` |
 | `--top-p <float>` | Umbral acumulado de probabilidad para muestreo Nucleus (Top-P) | `0.9` |
-| `--min-p <float>` | Umbral de probabilidad relativa Min-P | `0.05` |
-| `--rep-penalty <float>` | Factor de penalización por repetición de tokens | `1.1` |
+| `--min-p <float>` | Umbral de probabilidad relativa Min-P | `0.1` |
+| `--rep-penalty <float>` | Factor de penalización por repetición de tokens | `1.6` |
 | `--max-tokens <n>` | Cantidad máxima de nuevos tokens a generar | `50` |
 | `--seed <n>` | Semilla del generador pseudoaleatorio para reproducibilidad | `None` |
 
 ---
 
-### 4. Inspeccionar Estadísticas del Modelo (`stats`)
+### 6. Inspeccionar Estadísticas del Modelo (`stats`)
 
 Muestra el número total de parámetros, huella de memoria FP32, FLOPs por token y compresión GQA:
 
@@ -158,7 +158,7 @@ cargo run --release -- stats
 
 ---
 
-### 5. Exportar a Formato GGUF (`export`)
+### 7. Exportar a Formato GGUF (`export`)
 
 Exporta los pesos del modelo guardados en `model_output` directamente a un binario **GGUF v3**:
 

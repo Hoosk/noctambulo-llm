@@ -112,6 +112,9 @@ struct EvalArgs {
     /// Context window size override
     #[arg(long)]
     n_ctx: Option<usize>,
+    /// Evaluation batch size (default 16, lower if OOM on small GPUs)
+    #[arg(long, default_value_t = 16)]
+    eval_batch_size: usize,
 }
 
 #[derive(Args)]
@@ -182,20 +185,20 @@ struct TrainArgs {
 struct GenerateArgs {
     /// Prompt text for completion
     prompt: String,
-    /// Sampling temperature
-    #[arg(long, default_value_t = 0.7)]
+    /// Sampling temperature (0.9 works best for the trained SLM)
+    #[arg(long, default_value_t = 0.9)]
     temp: f32,
     /// Top-K sampling
-    #[arg(long, default_value_t = 40)]
+    #[arg(long, default_value_t = 60)]
     top_k: usize,
     /// Top-P (nucleus) sampling
     #[arg(long, default_value_t = 0.9)]
     top_p: f32,
-    /// Min-P sampling threshold (0.05 = standard 2026 value)
-    #[arg(long, default_value_t = 0.05)]
+    /// Min-P sampling threshold (0.1 prevents token loops in trained SLMs)
+    #[arg(long, default_value_t = 0.1)]
     min_p: f32,
-    /// Repetition penalty
-    #[arg(long, default_value_t = 1.1)]
+    /// Repetition penalty (1.6 prevents token loops in trained SLMs)
+    #[arg(long, default_value_t = 1.6)]
     rep_penalty: f32,
     /// Maximum new tokens to generate
     #[arg(long, default_value_t = 50)]
@@ -404,11 +407,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
             };
 
-            run_eval::<Autodiff<Wgpu>>(
+            run_eval::<Wgpu>(
                 Path::new(&args.model_dir),
                 &dataset_path,
                 &tokenizer,
                 args.n_ctx,
+                args.eval_batch_size,
                 &device,
             )?;
         }

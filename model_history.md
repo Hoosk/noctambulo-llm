@@ -74,7 +74,7 @@ Para un modelo pequeño de **~7M a 30M de parametros**, intentar entrenarlo sobr
 
 ### Cambios Aplicados
 - **Paso de ventana sin solapamiento (`step = n_ctx`)**: Eliminacion del solapamiento artificial que duplicaba las secuencias.
-- **Limite Optimo de Tokens (`--max-tokens 50000000`)**: Seleccion de 50 millones de tokens, el volumen matematicamente ideal para saturar un modelo de este tamaño.
+- **Volumen optimo segun Chinchilla (`--max-tokens 50000000`)**: Para el modelo de ~5M de parametros, la ley de Chinchilla recomienda ≈20 tokens por parametro durante el entrenamiento; 50M de tokens (× 3 epocas) es el volumen matematicamente ideal para saturar un modelo de este tamaño. El **default actual** del CLI es mas conservador (`10M`) para permitir iteraciones rapidas; ajustar segun el tiempo disponible.
 - **Parametrizacion Completa por CLI**: Implementacion de flags en `src/main.rs` para controlar `--batch-size`, `--epochs`, `--max-tokens`, `--step`, `--n-ctx`, `--n-embd`, `--n-head`, `--n-layer` y `--lr`.
 
 ---

@@ -9,11 +9,11 @@ El subcomando `generate` permite realizar inferencia autorregresiva de texto a p
 | Flag / Argumento | Tipo | Valor por Defecto | Descripción Detallada |
 | :--- | :--- | :--- | :--- |
 | `<prompt>` *(Posicional)* | `String` | **Requerido** | Texto semilla de entrada a partir del cual el modelo continuará la generación de texto. |
-| `--temp <float>` | `f32` | `0.7` | Temperatura de muestreo ($T$). Escala los logits antes del softmax. Valores mayores aumentan la diversidad/creatividad, mientras que valores cercanos a `0.0` hacen el resultado determinista. |
-| `--top-k <n>` | `usize` | `40` | Muestreo Top-K. Restringe la selección a únicamente los $K$ tokens con mayor probabilidad desestimando el resto. |
+| `--temp <float>` | `f32` | `0.9` | Temperatura de muestreo ($T$). Escala los logits antes del softmax. Valores mayores aumentan la diversidad/creatividad, mientras que valores cercanos a `0.0` hacen el resultado determinista. |
+| `--top-k <n>` | `usize` | `60` | Muestreo Top-K. Restringe la selección a únicamente los $K$ tokens con mayor probabilidad desestimando el resto. |
 | `--top-p <float>` | `f32` | `0.9` | Muestreo Nucleus (Top-P). Conserva el conjunto mínimo de tokens cuya suma de probabilidades acumuladas alcanza o supera el umbral $p$. |
-| `--min-p <float>` | `f32` | `0.05` | Umbral Min-P. Excluye cualquier token cuya probabilidad sea inferior a $\text{min\_p} \times P_{\max}$, eliminando la "cola ruidosa" de distribuciones planas. |
-| `--rep-penalty <float>` | `f32` | `1.1` | Penalización por repetición. Aplica un factor divisor sobre los logits de los tokens que ya han sido generados previamente en la secuencia. `1.0` la desactiva. |
+| `--min-p <float>` | `f32` | `0.1` | Umbral Min-P. Excluye cualquier token cuya probabilidad sea inferior a $\text{min\_p} \times P_{\max}$, eliminando la "cola ruidosa" de distribuciones planas. |
+| `--rep-penalty <float>` | `f32` | `1.6` | Penalización por repetición. Aplica un factor divisor sobre los logits de los tokens que ya han sido generados previamente en la secuencia. `1.0` la desactiva. |
 | `--max-tokens <n>` | `usize` | `50` | Número máximo de nuevos tokens a generar de manera autorregresiva. |
 | `--seed <n>` | `Option<u64>` | `None` *(Tiempo de sistema)* | Semilla aleatoria para el generador `XorshiftRng`. Permite reproducir exactamente la misma salida de texto. |
 
@@ -36,7 +36,7 @@ graph LR
 ### 1. Penalización por Repetición (Repetition Penalty)
 Para cada token $i$ que ya está presente en el contexto o en el texto generado previamente, su logit $z_i$ se ajusta según:
 $$z_i \leftarrow \begin{cases} z_i / \text{rep\_penalty} & \text{si } z_i > 0 \\ z_i \times \text{rep\_penalty} & \text{si } z_i \le 0 \end{cases}$$
-Un valor como `1.1` o `1.2` desincentiva suavemente los bucles de repetición infinita.
+Un valor como `1.5` o `1.6` desincentiva fuertemente los bucles de repetición infinita (esencial en SLMs entrenados con mucho texto repetitivo).
 
 ### 2. Escala de Temperatura (Temperature Scaling)
 Los logits modificados se dividen por la temperatura $T$:
@@ -69,15 +69,18 @@ let r = rng.next_f32();
 
 ## ⚙️ Perfiles de Generación Recomendados
 
+> [!NOTE]
+> Los modelos pequeños (SLM) como Kuro-Neko asignan probabilidades muy concentradas a los tokens más frecuentes. Con temperaturas bajas o penalizaciones débiles el modelo puede caer en bucles de repetición. Para SLMs se recomienda `temp >= 0.8` y `rep_penalty >= 1.5`.
+
 ### 🎨 Perfil Creativo (Escritura de historias, poesía, ideas)
 Maximiza la variabilidad y el vocabulario sin perder coherencia gramatical:
 ```bash
 cargo run --release -- generate "In a distant galaxy" \
   --temp 0.9 \
-  --top-k 50 \
-  --top-p 0.95 \
-  --min-p 0.02 \
-  --rep-penalty 1.05 \
+  --top-k 60 \
+  --top-p 0.90 \
+  --min-p 0.10 \
+  --rep-penalty 1.60 \
   --max-tokens 100
 ```
 
@@ -85,23 +88,23 @@ cargo run --release -- generate "In a distant galaxy" \
 Respuestas concisas y directas enfocadas en el token con mayor probabilidad:
 ```bash
 cargo run --release -- generate "The function of RMSNorm is" \
-  --temp 0.2 \
-  --top-k 10 \
-  --top-p 0.80 \
-  --min-p 0.10 \
-  --rep-penalty 1.20 \
+  --temp 0.5 \
+  --top-k 30 \
+  --top-p 0.85 \
+  --min-p 0.15 \
+  --rep-penalty 1.80 \
   --max-tokens 50
 ```
 
 ### ⚖️ Perfil Balanceado (Uso General)
-Equilibrio óptimo entre diversidad y precisión:
+Equilibrio óptimo entre diversidad y precisión (defaults del CLI):
 ```bash
 cargo run --release -- generate "Once upon a time" \
-  --temp 0.7 \
-  --top-k 40 \
+  --temp 0.9 \
+  --top-k 60 \
   --top-p 0.90 \
-  --min-p 0.05 \
-  --rep-penalty 1.10 \
+  --min-p 0.10 \
+  --rep-penalty 1.60 \
   --max-tokens 60
 ```
 

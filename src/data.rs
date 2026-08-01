@@ -67,6 +67,8 @@ impl LlmTokenizer {
             return Ok(tokens);
         }
 
+        let eos_id = self.end_of_text_id();
+
         let file = File::open(path)?;
         let total_bytes = file.metadata()?.len();
 
@@ -127,6 +129,9 @@ impl LlmTokenizer {
                     Ok(encodings) => {
                         for enc in encodings {
                             all_tokens.extend(enc.get_ids());
+                            if let Some(eos) = eos_id {
+                                all_tokens.push(eos);
+                            }
                         }
                     }
                     Err(e) => {
@@ -176,6 +181,9 @@ impl LlmTokenizer {
                 Ok(encodings) => {
                     for enc in encodings {
                         all_tokens.extend(enc.get_ids());
+                        if let Some(eos) = eos_id {
+                            all_tokens.push(eos);
+                        }
                     }
                 }
                 Err(e) => {

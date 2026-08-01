@@ -13,7 +13,8 @@ corpus.txt
 /checkpoints/
 
 
-# Archivos del sistema y configuraciones locales
+# System and local configuration
 .DS_Store
 Thumbs.db
 /.agents/
+custom_tokenizer.json

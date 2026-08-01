@@ -43,7 +43,7 @@ Lograr que nuestro motor escrito en Rust (**Kuro-Neko**) exportase su arquitectu
 
 ### 3. Mapeo de Vocabulario Simplificado
 - **Causa Tecnica**:
-  Dado que nuestro tokenizador BPE en Rust utiliza un modelo BPE limpio, podemos delegar el procesamiento a `llama.cpp` declarando el modelo de tokenización como `"llama"`, lo que evita la necesidad de serializar tablas complejas de merges y scores en metadatos binarios explícitos, garantizando compatibilidad directa y libre de fallos de carga.
+  Nuestro tokenizador BPE entrenado en Rust (`tokenizers` crate) produce un vocabulario byte-level compatible con el modelo `gpt2` de `llama.cpp` (pre-tokenizador byte-level, decoder byte-level, normalizador NFKC). Declaramos el modelo de tokenización como `"gpt2"` con pre-tokenizer `"gpt-2"`, lo que evita la necesidad de serializar manualmente merges y scores en metadatos GGUF y garantiza compatibilidad directa y libre de fallos de carga con `llama-cli` y LM Studio.
 
 ---
 

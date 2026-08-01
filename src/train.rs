@@ -198,12 +198,11 @@ pub fn train<B: AutodiffBackend>(
         };
         println!("Resuming model weights from {:?}...", rec_file);
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        if let Ok(record) = recorder.load(rec_file, device) {
-            model = model.load_record(record);
-            println!("Successfully loaded checkpoint weights!");
-        } else {
-            println!("Warning: Failed to load checkpoint from {:?}. Proceeding with fresh weights.", res_path);
-        }
+        let record = recorder
+            .load(rec_file.clone(), device)
+            .map_err(|e| format!("Failed to load checkpoint from {:?}: {:?}", res_path, e))?;
+        model = model.load_record(record);
+        println!("Successfully loaded checkpoint weights!");
     }
 
     let mut optim = AdamWConfig::new()
@@ -236,6 +235,7 @@ pub fn train<B: AutodiffBackend>(
     let mut shuffle_rng = XorshiftRng::new(42);
     let mut last_loss = 0.0f32;
     let mut last_avg_loss = 0.0f32;
+    let mut best_val_loss: Option<f32> = None;
     let training_start = Instant::now();
 
     for epoch in 1..=epochs {
@@ -358,6 +358,23 @@ pub fn train<B: AutodiffBackend>(
         if val_dataset.len() > 0 {
             let (val_loss, val_ppl) = evaluate_dataset(&model.valid(), &val_dataset, effective_batch_size, device);
             println!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl);
+
+            let is_best = match best_val_loss {
+                None => true,
+                Some(prev) => val_loss < prev,
+            };
+            if is_best {
+                best_val_loss = Some(val_loss);
+                if let Some(s_dir) = save_dir {
+                    let best_path = s_dir.join("checkpoint_best");
+                    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+                    if let Err(e) = recorder.record(model.clone().into_record(), best_path.clone()) {
+                        println!("Warning: Failed to save best checkpoint at {:?}: {:?}", best_path, e);
+                    } else {
+                        println!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin"));
+                    }
+                }
+            }
         }
 
         if let Some(s_dir) = save_dir {
@@ -454,11 +471,12 @@ pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
     (avg_loss, perplexity)
 }
 
-pub fn run_eval<B: AutodiffBackend>(
+pub fn run_eval<B: burn::tensor::backend::Backend>(
     model_dir: &Path,
     dataset_path: &Path,
     tokenizer: &LlmTokenizer,
     n_ctx: Option<usize>,
+    eval_batch_size: usize,
     device: &B::Device,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = model_dir.join("config.json");
@@ -489,10 +507,10 @@ pub fn run_eval<B: AutodiffBackend>(
     };
 
     let dataset = TextDataset::from_file(dataset_path, tokenizer, config.n_ctx, None, None)?;
-    println!("Evaluating model on dataset {:?} ({} samples, {} tokens)...", dataset_path, dataset.len(), dataset.tokens.len());
+    println!("Evaluating model on dataset {:?} ({} samples, {} tokens) [batch={}]...", dataset_path, dataset.len(), dataset.tokens.len(), eval_batch_size);
 
     let start_time = Instant::now();
-    let (loss, ppl) = evaluate_dataset::<B>(&model, &dataset, 32, device);
+    let (loss, ppl) = evaluate_dataset::<B>(&model, &dataset, eval_batch_size, device);
     let elapsed = start_time.elapsed().as_secs_f64();
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");

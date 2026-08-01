@@ -168,11 +168,14 @@ pub fn generate<B: Backend>(
 
     if tokens.len() > model.n_ctx {
         eprintln!(
-            "Warning: prompt length ({}) exceeds model context window ({}). Truncating prompt.",
+            "Warning: prompt length ({}) exceeds model context window ({}). Keeping the most recent {} tokens.",
             tokens.len(),
+            model.n_ctx,
             model.n_ctx
         );
-        tokens.truncate(model.n_ctx);
+        let keep = model.n_ctx;
+        let drop = tokens.len() - keep;
+        tokens.drain(0..drop);
     }
 
     let initial_prompt_len = tokens.len();
