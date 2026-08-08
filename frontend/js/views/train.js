@@ -86,6 +86,12 @@ export default class TrainView {
       onclick: () => this.stop(),
     }, "Detener");
 
+    const pauseBtn = el("button", {
+      id: "train-pause",
+      class: "flex-1 py-2 rounded-lg bg-amber-700 hover:bg-amber-600 text-white font-medium transition disabled:opacity-40",
+      onclick: () => this.pause(),
+    }, "Pausar");
+
     const msg = el("p", { id: "train-msg", class: "text-sm text-slate-400 mt-3" }, "");
 
     const card = el("div", { class: "rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
@@ -108,7 +114,7 @@ export default class TrainView {
         textField("Save dir", "train-saveDir", "checkpoints_web"),
         textField("Output dir", "train-outputDir", "model_output"),
       ]),
-      el("div", { class: "flex gap-3 mt-5" }, [startBtn, stopBtn]),
+      el("div", { class: "flex gap-3 mt-5" }, [startBtn, pauseBtn, stopBtn]),
       msg,
     ]);
 
@@ -211,12 +217,37 @@ export default class TrainView {
     }
   }
 
+  async pause() {
+    const msg = document.getElementById("train-msg");
+    try {
+      await api.post("/api/train/pause", {});
+      msg.textContent = "Pausando…";
+      msg.className = "text-sm text-amber-300 mt-3";
+    } catch (e) {
+      msg.textContent = `Error: ${e.message}`;
+      msg.className = "text-sm text-rose-400 mt-3";
+    }
+  }
+
+  async resume() {
+    const msg = document.getElementById("train-msg");
+    try {
+      await api.post("/api/train/resume", {});
+      msg.textContent = "Reanudando…";
+      msg.className = "text-sm text-emerald-300 mt-3";
+    } catch (e) {
+      msg.textContent = `Error: ${e.message}`;
+      msg.className = "text-sm text-rose-400 mt-3";
+    }
+  }
+
   // ------------------------------------------------------------ live sync
   sync() {
     const job = getJob();
     const badge = document.getElementById("train-status-badge");
     const startBtn = document.getElementById("train-start");
     const stopBtn = document.getElementById("train-stop");
+    const pauseBtn = document.getElementById("train-pause");
 
     if (badge) {
       const map = {
@@ -225,12 +256,24 @@ export default class TrainView {
         [JobState.STOPPED]: ["bg-amber-900 text-amber-300", "detenido"],
         [JobState.ERROR]: ["bg-rose-900 text-rose-300", "error"],
       };
+      const running = job.status === JobState.RUNNING;
       const [cls, label] = map[job.status] || ["bg-slate-800 text-slate-400", "idle"];
       badge.className = `text-xs px-2 py-0.5 rounded-full ${cls}`;
-      badge.textContent = label;
+      badge.textContent = job.paused && running ? "pausado" : label;
     }
     if (startBtn) startBtn.disabled = job.status === JobState.RUNNING;
     if (stopBtn) stopBtn.disabled = job.status !== JobState.RUNNING;
+    if (pauseBtn) {
+      const running = job.status === JobState.RUNNING;
+      pauseBtn.disabled = !running;
+      pauseBtn.textContent = job.paused ? "Reanudar" : "Pausar";
+      pauseBtn.className = `flex-1 py-2 rounded-lg font-medium transition disabled:opacity-40 ${
+        job.paused
+          ? "bg-emerald-700 hover:bg-emerald-600 text-white"
+          : "bg-amber-700 hover:bg-amber-600 text-white"
+      }`;
+      pauseBtn.onclick = job.paused ? () => this.resume() : () => this.pause();
+    }
 
     const pb = document.getElementById("train-progress");
     if (pb) pb.style.width = `${job.pct || 0}%`;

@@ -280,7 +280,7 @@ pub fn train<B: AutodiffBackend>(
     let result = train_with_events::<B>(
         dataset_path, raw_text, model_config, tokenizer, epochs, batch_size, lr,
         custom_step, max_tokens, val_split, grad_accum_steps, seq_warmup_steps,
-        save_dir, resume_path, device, output_dir, &tx, &cancel_thread,
+        save_dir, resume_path, device, output_dir, &tx, &cancel_thread, None,
     );
 
     drop(tx);
@@ -308,6 +308,7 @@ pub fn train_with_events<B: AutodiffBackend>(
     output_dir: &str,
     tx: &Sender<TrainingEvent>,
     cancel: &Arc<AtomicBool>,
+    pause: Option<&Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_dataset = if let Some(path) = dataset_path {
         TextDataset::from_file(path, tokenizer, model_config.n_ctx, custom_step, max_tokens)?
@@ -416,6 +417,22 @@ pub fn train_with_events<B: AutodiffBackend>(
                 });
                 return Ok(());
             }
+
+            // Pause: block the loop until resumed (or cancelled).
+            if let Some(pause_flag) = pause {
+                while pause_flag.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = tx.send(TrainingEvent::Stopped {
+                            reason: "User requested stop while paused".to_string(),
+                            epoch,
+                            batch: batch_idx,
+                        });
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+
             global_step += 1;
 
             // Cosine Learning Rate Schedule with Warmup
@@ -750,6 +767,34 @@ mod tests {
         let loss = 2.302585f32; // ln(10)
         let ppl = loss.exp();
         assert!((ppl - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_progress_event_json_keys() {
+        let ev = TrainingEvent::Progress {
+            step: 1,
+            epoch: 1,
+            epochs: 3,
+            batch: 10,
+            num_batches: 100,
+            pct: 10.0,
+            loss: 6.5,
+            avg_loss: 7.0,
+            lr: 0.00005,
+            batches_per_sec: 12.3,
+            elapsed_secs: 30.0,
+            eta_secs: 270.0,
+            current_n_ctx: 256,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        println!("PROGRESS_JSON={json}");
+        assert!(json.contains("\"loss\""));
+        assert!(json.contains("\"avg_loss\""));
+        assert!(json.contains("\"num_batches\""));
+        assert!(json.contains("\"batches_per_sec\""));
+        assert!(json.contains("\"elapsed_secs\""));
+        assert!(json.contains("\"eta_secs\""));
+        assert!(json.contains("\"current_n_ctx\""));
     }
 
     #[test]

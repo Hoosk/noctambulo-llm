@@ -2,7 +2,7 @@
 
 import { getToken, setToken } from "./core/api.js";
 import { on } from "./core/events.js";
-import { initJobStore } from "./core/store.js";
+import { initJobStore, pollStatus } from "./core/store.js";
 import * as sse from "./core/sse.js";
 
 import TrainView from "./views/train.js";
@@ -136,6 +136,9 @@ function bootstrap() {
       .then((r) => updateBadge(r.ok))
       .catch(() => updateBadge(false));
   }, 10000);
+
+  // Polling fallback so metrics update even if the SSE stream is dropped.
+  setInterval(pollStatus, 2000);
 
   sse.connect();
   switchView("train");

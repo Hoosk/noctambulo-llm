@@ -27,8 +27,92 @@ export default class DatasetsView {
 
     this.root.append(this.downloadCard());
     this.root.append(el("div", { class: "h-6" }));
+    this.root.append(this.searchCard());
 
     await this.loadList();
+  }
+
+  // ------------------------------------------------------------- search HF
+  searchCard() {
+    const searchInput = el("input", {
+      type: "text",
+      placeholder: "Buscar datasets en Hugging Face (ej. cosmopedia, stories, code)...",
+      class: inputCls,
+    });
+    const msg = el("p", { class: "text-sm text-slate-400 mt-3" }, "");
+    const results = el("div", { class: "mt-3 space-y-2" });
+
+    const search = async () => {
+      const q = searchInput.value.trim();
+      if (!q) return;
+      clear(results);
+      msg.textContent = "Buscando…";
+      msg.className = "text-sm text-violet-300 mt-3";
+      try {
+        const hits = await api.get(`/api/datasets/search?q=${encodeURIComponent(q)}`);
+        msg.textContent = "";
+        if (hits.length === 0) {
+          results.append(el("p", { class: "text-sm text-slate-500" }, "Sin resultados."));
+          return;
+        }
+        for (const h of hits) {
+          results.append(this.searchRow(h));
+        }
+      } catch (e) {
+        msg.textContent = `Error: ${e.message}`;
+        msg.className = "text-sm text-rose-400 mt-3";
+      }
+    };
+
+    searchInput.addEventListener("keydown", (e) => e.key === "Enter" && search());
+
+    return el("div", { class: "rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
+      el("div", { class: "flex items-center justify-between mb-2" }, [
+        el("h3", { class: "text-sm font-medium text-slate-300" }, "Buscar en Hugging Face"),
+      ]),
+      el("div", { class: "flex gap-3" }, [
+        el("div", { class: "flex-1" }, [searchInput]),
+        el("button", {
+          class: "px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-sm font-medium transition self-start",
+          onclick: search,
+        }, "🔍 Buscar"),
+      ]),
+      msg,
+      results,
+    ]);
+  }
+
+  searchRow(h) {
+    const lang = h.tags && h.tags.length
+      ? el("span", { class: "text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300" }, h.tags[0].replace("language:", ""))
+      : null;
+
+    const dl = async () => {
+      try {
+        await api.post("/api/datasets/download", { repoId: h.id });
+        this.loadList();
+      } catch (e) {
+        alert(`Error descargando: ${e.message}`);
+      }
+    };
+
+    return el("div", {
+      class: "rounded-xl bg-slate-950 border border-slate-800 px-4 py-3 flex items-center gap-3",
+    }, [
+      el("div", { class: "flex-1 min-w-0" }, [
+        el("div", { class: "flex items-center gap-2" }, [
+          el("span", { class: "text-sm text-slate-200 font-mono truncate" }, h.id),
+          lang,
+        ]),
+        el("div", { class: "text-xs text-slate-500 mt-0.5" }, [
+          `${h.downloads.toLocaleString("es-ES")} descargas · ${h.likes.toLocaleString("es-ES")} likes`,
+        ]),
+      ]),
+      el("button", {
+        class: "px-3 py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium transition shrink-0",
+        onclick: dl,
+      }, "⬇ Descargar"),
+    ]);
   }
 
   // ------------------------------------------------------------- download

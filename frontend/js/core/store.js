@@ -12,6 +12,7 @@ export const JobState = {
 
 const store = {
   status: JobState.IDLE,
+  paused: false,
   epoch: 0,
   epochs: 0,
   batch: 0,
@@ -99,4 +100,40 @@ export function handleTrainingEvent(ev) {
 // Wire SSE events into the store once.
 export function initJobStore() {
   on("training:event", handleTrainingEvent);
+}
+
+// ---- Polling fallback -----------------------------------------------------
+// The SSE stream is the primary channel, but browsers/proxies can silently drop
+// it. Polling /api/train/status guarantees the UI keeps updating metrics even
+// if SSE dies. Only new events (by jobId + event count) are applied.
+
+let lastPolledEvent = "";
+
+export function pollStatus() {
+  fetch("/api/train/status", { headers: { "X-API-Token": getTokenHeader() } })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((s) => {
+      if (!s) return;
+
+      // Reflect paused state even if no new event arrived.
+      if (s.paused !== store.paused) {
+        set({ paused: s.paused, message: s.paused ? "Entrenamiento pausado" : "Entrenamiento reanudado" });
+      }
+
+      const ev = s.last_event;
+      if (!ev) return;
+
+      const evJson = JSON.stringify(ev);
+      if (evJson === lastPolledEvent) return;
+      lastPolledEvent = evJson;
+
+      handleTrainingEvent(ev);
+    })
+    .catch(() => {
+      /* ignore transient errors */
+    });
+}
+
+function getTokenHeader() {
+  return localStorage.getItem("kuro_neko_token") || "";
 }

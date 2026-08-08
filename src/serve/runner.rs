@@ -30,9 +30,11 @@ pub struct TrainParams {
     pub output_dir: String,
 }
 
-/// Shared handle for the currently running job, used to request a graceful stop.
+/// Shared handle for the currently running job, used to request a graceful stop
+/// or pause/resume.
 pub struct JobHandle {
     pub cancel: Arc<AtomicBool>,
+    pub paused: Arc<AtomicBool>,
     #[allow(dead_code)]
     pub job_id: String,
 }
@@ -55,6 +57,21 @@ impl JobRegistry {
         if let Some(h) = self.inner.lock().unwrap().as_ref() {
             h.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        if let Some(h) = self.inner.lock().unwrap().as_ref() {
+            h.paused.store(paused, Ordering::Relaxed);
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|h| h.paused.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     pub fn clear(&self) {
@@ -84,7 +101,12 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
 
     let job_id = format!("job-{}", start_unix());
     let cancel = Arc::new(AtomicBool::new(false));
-    registry.start(JobHandle { cancel: cancel.clone(), job_id: job_id.clone() });
+    let paused = Arc::new(AtomicBool::new(false));
+    registry.start(JobHandle {
+        cancel: cancel.clone(),
+        paused: paused.clone(),
+        job_id: job_id.clone(),
+    });
 
     let (tx, rx) = mpsc::channel::<TrainingEvent>();
 
@@ -113,6 +135,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
     let worker_state = state.clone();
     let worker_tokenizer = load_tokenizer()?;
     let worker_cancel = cancel.clone();
+    let worker_pause = paused.clone();
 
     let worker = std::thread::spawn(move || {
         let config = crate::config::ModelConfig::new(
@@ -146,6 +169,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
             &params.output_dir,
             &tx,
             &worker_cancel,
+            Some(&worker_pause),
         );
 
         if let Err(e) = result {

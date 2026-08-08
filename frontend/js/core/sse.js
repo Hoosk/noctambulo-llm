@@ -6,9 +6,20 @@ import { getToken, ApiError } from "./api.js";
 import { emit } from "./events.js";
 
 let controller = null;
+let retryTimer = null;
+let retryDelay = 2000;
 
 export function isConnected() {
   return controller !== null;
+}
+
+function scheduleReconnect() {
+  if (retryTimer || controller) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connect();
+  }, retryDelay);
+  retryDelay = Math.min(retryDelay * 2, 15000);
 }
 
 export function connect() {
@@ -63,6 +74,7 @@ export function connect() {
     } catch (e) {
       if (e.name !== "AbortError") {
         emit("sse:error", e);
+        scheduleReconnect();
       }
     } finally {
       if (controller === ctrl) {
@@ -79,4 +91,9 @@ export function disconnect() {
     controller = null;
     emit("sse:status", { connected: false });
   }
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  retryDelay = 2000;
 }

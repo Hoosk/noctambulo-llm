@@ -24,6 +24,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/devices", get(devices))
         .route("/api/datasets", get(datasets))
         .route("/api/datasets/download", post(dataset_download))
+        .route("/api/datasets/search", get(dataset_search))
         .route("/api/datasets/rename", post(dataset_rename))
         .route("/api/datasets/combine", post(dataset_combine))
         .route("/api/datasets/info/{name}", get(dataset_info))
@@ -32,6 +33,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/train", post(train))
         .route("/api/train/status", get(train_status))
         .route("/api/train/stop", post(train_stop))
+        .route("/api/train/pause", post(train_pause))
+        .route("/api/train/resume", post(train_resume))
         .route("/api/train/stream", get(train_stream))
         .route("/api/download/{path}", get(download))
         .route("/api/generate", post(generate_text))
@@ -322,6 +325,107 @@ async fn dataset_download(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetSearchRequest {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize { 15 }
+
+#[derive(Serialize)]
+struct DatasetHit {
+    id: String,
+    downloads: u64,
+    likes: u64,
+    last_modified: String,
+    tags: Vec<String>,
+}
+
+#[allow(clippy::unused_async)]
+async fn dataset_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<DatasetSearchRequest>,
+) -> Result<Json<Vec<DatasetHit>>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let q = params.q.trim().to_string();
+    if q.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let limit = params.limit.clamp(1, 50);
+    let url = format!(
+        "https://huggingface.co/api/datasets?search={}&limit={}",
+        urlencode(&q),
+        limit
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<DatasetHit>, String>>();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<Vec<DatasetHit>, String> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let resp = client
+                .get(&url)
+                .header("User-Agent", "kuro-neko-llm/0.1")
+                .send()
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("HF API status {}", resp.status()));
+            }
+            let raw: Vec<serde_json::Value> = resp.json().map_err(|e| e.to_string())?;
+            let mut hits = Vec::new();
+            for item in raw.into_iter().take(limit) {
+                hits.push(DatasetHit {
+                    id: item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    downloads: item.get("downloads").and_then(|v| v.as_u64()).unwrap_or(0),
+                    likes: item.get("likes").and_then(|v| v.as_u64()).unwrap_or(0),
+                    last_modified: item
+                        .get("lastModified")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    tags: item
+                        .get("tags")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                                .filter(|t| t.starts_with("language:"))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+            Ok(hits)
+        })();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(25)) {
+        Ok(Ok(hits)) => Ok(Json(hits)),
+        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e }))).into_response()),
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "error": "search timed out" }))).into_response()),
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DatasetRenameRequest {
@@ -653,6 +757,7 @@ fn path_buf_from(s: String) -> std::path::PathBuf {
 struct StatusResponse {
     running: bool,
     stopping: bool,
+    paused: bool,
     job_id: String,
     message: Option<String>,
     last_event: Option<TrainingEvent>,
@@ -665,6 +770,7 @@ async fn train_status(State(state): State<AppState>, headers: HeaderMap) -> Resu
     Ok(Json(StatusResponse {
         running: job.running,
         stopping: job.stopping,
+        paused: state.registry.is_paused(),
         job_id: job.job_id,
         message: job.message,
         last_event: job.last_event,
@@ -680,6 +786,20 @@ async fn train_stop(State(state): State<AppState>, headers: HeaderMap) -> Result
     }
     state.registry.request_stop();
     Ok(Json(serde_json::json!({ "status": "stopping" })))
+}
+
+#[allow(clippy::unused_async)]
+async fn train_pause(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    state.registry.set_paused(true);
+    Ok(Json(serde_json::json!({ "status": "paused" })))
+}
+
+#[allow(clippy::unused_async)]
+async fn train_resume(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    state.registry.set_paused(false);
+    Ok(Json(serde_json::json!({ "status": "resumed" })))
 }
 
 fn event_stream(state: Arc<ServerState>) -> impl Stream<Item = Result<Event, axum::Error>> + Send + 'static {
