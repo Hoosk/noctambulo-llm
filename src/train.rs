@@ -9,6 +9,9 @@ use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{Int, Tensor, TensorData};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -119,6 +122,69 @@ impl TextDataset {
     }
 }
 
+/// Event emitted by the training loop, consumed either by the CLI (prints) or
+/// by the web server (SSE / live metrics).
+#[derive(Debug, Clone)]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub enum TrainingEvent {
+    Started {
+        epochs: usize,
+        total_steps: usize,
+        num_batches: usize,
+        batch_size: usize,
+        lr: f64,
+        n_ctx: usize,
+        start_time_unix: u64,
+    },
+    Progress {
+        step: usize,
+        epoch: usize,
+        epochs: usize,
+        batch: usize,
+        num_batches: usize,
+        pct: f64,
+        loss: f32,
+        avg_loss: f32,
+        lr: f64,
+        batches_per_sec: f64,
+        elapsed_secs: f64,
+        eta_secs: f64,
+        current_n_ctx: usize,
+    },
+    Val {
+        loss: f32,
+        ppl: f32,
+        epoch: usize,
+    },
+    Checkpoint {
+        path: String,
+        kind: &'static str,
+        epoch: usize,
+        batch: usize,
+    },
+    Preview {
+        text: String,
+        epoch: usize,
+    },
+    EpochComplete {
+        epoch: usize,
+        epochs: usize,
+        avg_loss: f32,
+        elapsed_secs: f32,
+    },
+    Done {
+        final_loss: f32,
+        total_time_secs: f64,
+        weights_path: String,
+        config_path: String,
+    },
+    Stopped {
+        reason: String,
+        epoch: usize,
+        batch: usize,
+    },
+}
+
 fn shuffle_indices(indices: &mut [usize], rng: &mut XorshiftRng) {
     let len = indices.len();
     for i in (1..len).rev() {
@@ -166,6 +232,82 @@ pub fn train<B: AutodiffBackend>(
     resume_path: Option<&Path>,
     device: &B::Device,
     output_dir: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_thread = cancel.clone();
+    let handle = std::thread::spawn(move || {
+        for event in rx {
+            match &event {
+                TrainingEvent::Progress { loss, avg_loss, lr, pct, batch, num_batches, epoch, epochs, batches_per_sec, elapsed_secs, eta_secs, .. } => {
+                    let elapsed_min = *elapsed_secs as u64 / 60;
+                    let elapsed_s = *elapsed_secs as u64 % 60;
+                    let eta_min = *eta_secs as u64 / 60;
+                    let eta_s = *eta_secs as u64 % 60;
+                    tui::print_training_progress(
+                        *epoch, *epochs, *pct, *batch, *num_batches, *batches_per_sec, *lr,
+                        *loss, *avg_loss, elapsed_min, elapsed_s, eta_min, eta_s,
+                    );
+                }
+                TrainingEvent::Val { loss, ppl, .. } => {
+                    println!("\n   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", loss, ppl);
+                }
+                TrainingEvent::Checkpoint { path, kind, .. } => {
+                    if *kind == "best" {
+                        println!("   ★ New best val_loss → {:?}", path);
+                    } else {
+                        println!("Saved checkpoint: {:?}", path);
+                    }
+                }
+                TrainingEvent::Preview { text, .. } => {
+                    println!("  ✨ \"{}\"", text);
+                }
+                TrainingEvent::EpochComplete { epoch, epochs, avg_loss, elapsed_secs } => {
+                    tui::print_epoch_complete(*epoch, *epochs, *avg_loss, *elapsed_secs, None);
+                }
+                TrainingEvent::Done { weights_path, config_path, .. } => {
+                    tui::print_training_complete(Path::new(config_path), Path::new(weights_path));
+                }
+                TrainingEvent::Started { .. } => {}
+                TrainingEvent::Stopped { reason, .. } => {
+                    println!("\n  ⏹ Training stopped: {}", reason);
+                }
+            }
+            let _ = event;
+        }
+    });
+
+    let result = train_with_events::<B>(
+        dataset_path, raw_text, model_config, tokenizer, epochs, batch_size, lr,
+        custom_step, max_tokens, val_split, grad_accum_steps, seq_warmup_steps,
+        save_dir, resume_path, device, output_dir, &tx, &cancel_thread,
+    );
+
+    drop(tx);
+    let _ = handle.join();
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn train_with_events<B: AutodiffBackend>(
+    dataset_path: Option<&Path>,
+    raw_text: Option<&str>,
+    model_config: ModelConfig,
+    tokenizer: &LlmTokenizer,
+    epochs: usize,
+    batch_size: usize,
+    lr: f64,
+    custom_step: Option<usize>,
+    max_tokens: Option<usize>,
+    val_split: f32,
+    grad_accum_steps: usize,
+    seq_warmup_steps: usize,
+    save_dir: Option<&Path>,
+    resume_path: Option<&Path>,
+    device: &B::Device,
+    output_dir: &str,
+    tx: &Sender<TrainingEvent>,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_dataset = if let Some(path) = dataset_path {
         TextDataset::from_file(path, tokenizer, model_config.n_ctx, custom_step, max_tokens)?
@@ -231,6 +373,19 @@ pub fn train<B: AutodiffBackend>(
         lr,
     );
 
+    let _ = tx.send(TrainingEvent::Started {
+        epochs,
+        total_steps,
+        num_batches,
+        batch_size: effective_batch_size,
+        lr,
+        n_ctx: model_config.n_ctx,
+        start_time_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
+
     let mut global_step = 0usize;
     let mut shuffle_rng = XorshiftRng::new(42);
     let mut last_loss = 0.0f32;
@@ -253,6 +408,14 @@ pub fn train<B: AutodiffBackend>(
         shuffle_indices(&mut sample_indices, &mut shuffle_rng);
 
         for batch_idx in 0..num_batches {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(TrainingEvent::Stopped {
+                    reason: "User requested stop".to_string(),
+                    epoch,
+                    batch: batch_idx,
+                });
+                return Ok(());
+            }
             global_step += 1;
 
             // Cosine Learning Rate Schedule with Warmup
@@ -348,6 +511,22 @@ pub fn train<B: AutodiffBackend>(
                     eta_min,
                     eta_s,
                 );
+
+                let _ = tx.send(TrainingEvent::Progress {
+                    step: global_step,
+                    epoch,
+                    epochs,
+                    batch: batch_idx + 1,
+                    num_batches,
+                    pct,
+                    loss: last_loss,
+                    avg_loss: last_avg_loss,
+                    lr: current_lr,
+                    batches_per_sec,
+                    elapsed_secs: total_elapsed,
+                    eta_secs: eta_secs as f64,
+                    current_n_ctx,
+                });
             }
         }
         println!();
@@ -358,6 +537,7 @@ pub fn train<B: AutodiffBackend>(
         if val_dataset.len() > 0 {
             let (val_loss, val_ppl) = evaluate_dataset(&model.valid(), &val_dataset, effective_batch_size, device);
             println!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl);
+            let _ = tx.send(TrainingEvent::Val { loss: val_loss, ppl: val_ppl, epoch });
 
             let is_best = match best_val_loss {
                 None => true,
@@ -372,6 +552,12 @@ pub fn train<B: AutodiffBackend>(
                         println!("Warning: Failed to save best checkpoint at {:?}: {:?}", best_path, e);
                     } else {
                         println!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin"));
+                        let _ = tx.send(TrainingEvent::Checkpoint {
+                            path: best_path.with_extension("bin").to_string_lossy().to_string(),
+                            kind: "best",
+                            epoch,
+                            batch: 0,
+                        });
                     }
                 }
             }
@@ -385,6 +571,12 @@ pub fn train<B: AutodiffBackend>(
                 println!("Warning: Failed to save checkpoint at {:?}: {:?}", ckpt_path, e);
             } else {
                 println!("Saved checkpoint: {:?}", ckpt_path.with_extension("bin"));
+                let _ = tx.send(TrainingEvent::Checkpoint {
+                    path: ckpt_path.with_extension("bin").to_string_lossy().to_string(),
+                    kind: "epoch",
+                    epoch,
+                    batch: 0,
+                });
             }
         }
 
@@ -402,6 +594,10 @@ pub fn train<B: AutodiffBackend>(
             device,
         ).ok();
 
+        if let Some(text) = &preview {
+            let _ = tx.send(TrainingEvent::Preview { text: text.clone(), epoch });
+        }
+
         tui::print_epoch_complete(
             epoch,
             epochs,
@@ -409,6 +605,12 @@ pub fn train<B: AutodiffBackend>(
             elapsed,
             preview.as_deref(),
         );
+        let _ = tx.send(TrainingEvent::EpochComplete {
+            epoch,
+            epochs,
+            avg_loss: final_epoch_avg,
+            elapsed_secs: elapsed,
+        });
     }
 
     std::fs::create_dir_all(output_dir)?;
@@ -422,7 +624,12 @@ pub fn train<B: AutodiffBackend>(
         .record(model.into_record(), weights_path.clone())
         .map_err(|e| format!("Failed to save model record: {:?}", e))?;
 
-    tui::print_training_complete(&config_path, &weights_path.with_extension("bin"));
+    let _ = tx.send(TrainingEvent::Done {
+        final_loss: last_avg_loss,
+        total_time_secs: training_start.elapsed().as_secs_f64(),
+        weights_path: weights_path.with_extension("bin").to_string_lossy().to_string(),
+        config_path: config_path.to_string_lossy().to_string(),
+    });
 
     Ok(())
 }
