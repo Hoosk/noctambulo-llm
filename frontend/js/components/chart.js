@@ -1,4 +1,6 @@
 // Lightweight wrapper around Chart.js for the loss curve.
+// Chart.js must be initialized only after the canvas is attached to the DOM,
+// otherwise it measures a wrong (huge) container and breaks the layout.
 
 import { el } from "../core/dom.js";
 
@@ -6,14 +8,21 @@ export default class LossChart {
   constructor() {
     this.history = []; // {step, loss}
     this.chart = null;
-    this.container = null;
+    this.canvas = null;
   }
 
+  // Creates the DOM node. Call attach() once it is in the document.
   build() {
-    this.container = el("div", { class: "relative h-64" });
-    this.container.innerHTML = `<canvas></canvas>`;
-    const canvas = this.container.querySelector("canvas");
-    const ctx = canvas.getContext("2d");
+    const container = el("div", { class: "relative h-64 w-full overflow-hidden" });
+    container.innerHTML = `<canvas></canvas>`;
+    this.canvas = container.querySelector("canvas");
+    return container;
+  }
+
+  // Initialize Chart.js now that the canvas is mounted. Idempotent.
+  attach() {
+    if (this.chart || !this.canvas) return;
+    const ctx = this.canvas.getContext("2d");
 
     this.chart = new Chart(ctx, {
       type: "line",
@@ -21,7 +30,7 @@ export default class LossChart {
         datasets: [
           {
             label: "Loss",
-            data: [],
+            data: this.history,
             borderColor: "#8b5cf6",
             backgroundColor: "rgba(139,92,246,0.08)",
             fill: true,
@@ -34,6 +43,7 @@ export default class LossChart {
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        animation: false,
         interaction: { mode: "index", intersect: false },
         plugins: {
           legend: { display: false },
@@ -59,16 +69,15 @@ export default class LossChart {
         },
       },
     });
-
-    return this.container;
   }
 
   addPoint(step, loss) {
     this.history.push({ step, loss });
     if (this.history.length > 1000) this.history.shift();
-    if (!this.chart) return;
-    this.chart.data.datasets[0].data = this.history;
-    this.chart.update("none");
+    if (this.chart) {
+      this.chart.data.datasets[0].data = this.history;
+      this.chart.update("none");
+    }
   }
 
   reset() {
@@ -77,5 +86,13 @@ export default class LossChart {
       this.chart.data.datasets[0].data = [];
       this.chart.update("none");
     }
+  }
+
+  destroy() {
+    if (this.chart) {
+      this.chart.destroy();
+      this.chart = null;
+    }
+    this.canvas = null;
   }
 }

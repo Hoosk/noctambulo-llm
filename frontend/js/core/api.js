@@ -61,6 +61,9 @@ export const api = {
   post(path, body) {
     return request(path, { method: "POST", json: true, body: JSON.stringify(body) });
   },
+  delete(path) {
+    return request(path, { method: "DELETE" });
+  },
   async downloadUrl(path) {
     const res = await fetch(`/api/download/${encodeURIComponent(path)}`, {
       headers: buildHeaders(false),

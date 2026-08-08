@@ -10,6 +10,7 @@ import GenerateView from "./views/generate.js";
 import ExportView from "./views/export.js";
 import ModelsView from "./views/models.js";
 import DevicesView from "./views/devices.js";
+import DatasetsView from "./views/datasets.js";
 
 const VIEWS = {
   train: TrainView,
@@ -17,6 +18,7 @@ const VIEWS = {
   export: ExportView,
   models: ModelsView,
   devices: DevicesView,
+  datasets: DatasetsView,
 };
 
 function renderTokenGate() {
@@ -77,6 +79,7 @@ function mountLayout() {
         <span id="conn-badge" class="ml-1 text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">conectando…</span>
         <nav class="ml-auto flex gap-1">
           <button data-view="train" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Entrenar</button>
+          <button data-view="datasets" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Datasets</button>
           <button data-view="generate" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Generar</button>
           <button data-view="export" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Exportar</button>
           <button data-view="models" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Modelos</button>
@@ -104,27 +107,37 @@ function switchView(name) {
   viewInstances[name].render();
 }
 
+function updateBadge(connected) {
+  const badge = document.getElementById("conn-badge");
+  if (!badge) return;
+  if (connected) {
+    badge.textContent = "en línea";
+    badge.className = "ml-1 text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300";
+  } else {
+    badge.textContent = "desconectado";
+    badge.className = "ml-1 text-xs px-2 py-0.5 rounded-full bg-rose-900 text-rose-300";
+  }
+}
+
 function bootstrap() {
   mountLayout();
   initJobStore();
-  sse.connect();
+
+  // Register BEFORE connecting so the initial status is not missed.
+  on("sse:status", ({ connected }) => updateBadge(connected));
 
   document.querySelectorAll(".view-btn").forEach((b) => {
     b.addEventListener("click", () => switchView(b.dataset.view));
   });
 
-  // Connection badge: track SSE status.
-  on("sse:status", ({ connected }) => {
-    const badge = document.getElementById("conn-badge");
-    if (connected) {
-      badge.textContent = "en línea";
-      badge.className = "ml-1 text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300";
-    } else {
-      badge.textContent = "desconectado";
-      badge.className = "ml-1 text-xs px-2 py-0.5 rounded-full bg-rose-900 text-rose-300";
-    }
-  });
+  // Background heartbeat: confirm the API is reachable regardless of SSE state.
+  setInterval(() => {
+    fetch("/api/devices", { headers: { "X-API-Token": getToken() } })
+      .then((r) => updateBadge(r.ok))
+      .catch(() => updateBadge(false));
+  }, 10000);
 
+  sse.connect();
   switchView("train");
 }
 

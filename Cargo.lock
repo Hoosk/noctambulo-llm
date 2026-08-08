@@ -4504,6 +4504,7 @@ dependencies = [
  "axum 0.7.9",
  "burn",
  "clap",
+ "futures",
  "futures-core",
  "futures-util",
  "hf-hub",
@@ -4513,6 +4514,7 @@ dependencies = [
  "tokenizers 0.23.1",
  "tokio",
  "tower-http 0.5.2",
+ "wgpu",
 ]
 
 [[package]]

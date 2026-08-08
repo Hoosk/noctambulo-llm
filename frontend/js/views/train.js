@@ -18,6 +18,7 @@ export default class TrainView {
 
   async render() {
     clear(this.root);
+    this.chart.destroy();
     const [datasets, devices] = await Promise.allSettled([
       api.get("/api/datasets"),
       api.get("/api/devices"),
@@ -33,6 +34,8 @@ export default class TrainView {
       ]),
     );
 
+    // Chart.js must init after the canvas is in the DOM.
+    this.chart.attach();
     this.sync();
   }
 
@@ -40,15 +43,17 @@ export default class TrainView {
   buildForm(datasets, devices) {
     const dsSel = el("select", { id: "train-dataset", class: inputCls });
     if (datasets.length === 0) {
-      dsSel.append(el("option", {}, "sin datasets"));
+      dsSel.append(el("option", { value: "" }, "sin datasets"));
     } else {
-      for (const d of datasets) dsSel.append(el("option", { value: d }, d));
+      for (const d of datasets) dsSel.append(el("option", { value: d.name }, d.name));
     }
+    this.fields["train-dataset"] = dsSel;
 
     const devSel = el("select", { id: "train-device", class: inputCls });
     for (const d of devices) {
       devSel.append(el("option", { value: d.name, selected: d.name === "DefaultDevice" || null }, d.name));
     }
+    this.fields["train-device"] = devSel;
 
     const field = (label, id, val, opts = {}) => {
       const input = el("input", {
@@ -139,24 +144,44 @@ export default class TrainView {
   // --------------------------------------------------------------- actions
   async start() {
     if (this.busy) return;
-    const body = {
-      file: this.fields["train-dataset"].value,
-      device: this.fields["train-device"].value,
-      epochs: Number(this.fields["train-epochs"].value),
-      batchSize: Number(this.fields["train-batch"].value),
-      lr: Number(this.fields["train-lr"].value),
-      maxTokens: Number(this.fields["train-maxTokens"].value) || null,
-      nCtx: Number(this.fields["train-nCtx"].value),
-      nEmbd: Number(this.fields["train-nEmbd"].value),
-      nHead: Number(this.fields["train-nHead"].value),
-      nLayer: Number(this.fields["train-nLayer"].value),
-      valSplit: Number(this.fields["train-valSplit"].value),
-      gradAccum: Number(this.fields["train-gradAccum"].value),
-      saveDir: this.fields["train-saveDir"].value,
-      outputDir: this.fields["train-outputDir"].value,
+    const msg = document.getElementById("train-msg");
+
+    const read = (id) => {
+      const field = this.fields[id];
+      if (!field) throw new Error(`Campo de configuración ausente: ${id}`);
+      return field;
     };
 
-    const msg = document.getElementById("train-msg");
+    let body;
+    try {
+      body = {
+        file: read("train-dataset").value,
+        device: read("train-device").value,
+        epochs: Number(read("train-epochs").value),
+        batchSize: Number(read("train-batch").value),
+        lr: Number(read("train-lr").value),
+        maxTokens: Number(read("train-maxTokens").value) || null,
+        nCtx: Number(read("train-nCtx").value),
+        nEmbd: Number(read("train-nEmbd").value),
+        nHead: Number(read("train-nHead").value),
+        nLayer: Number(read("train-nLayer").value),
+        valSplit: Number(read("train-valSplit").value),
+        gradAccum: Number(read("train-gradAccum").value),
+        saveDir: read("train-saveDir").value,
+        outputDir: read("train-outputDir").value,
+      };
+    } catch (e) {
+      msg.textContent = `Error de configuración: ${e.message}`;
+      msg.className = "text-sm text-rose-400 mt-3";
+      return;
+    }
+
+    if (!body.file || body.file === "sin datasets") {
+      msg.textContent = "Selecciona un dataset para entrenar.";
+      msg.className = "text-sm text-rose-400 mt-3";
+      return;
+    }
+
     this.busy = true;
     msg.textContent = "Iniciando…";
     msg.className = "text-sm text-violet-300 mt-3";

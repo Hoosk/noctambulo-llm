@@ -1,6 +1,6 @@
+use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
-
 use axum::{
     Router,
     extract::{Path as AxumPath, State},
@@ -23,6 +23,11 @@ pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/api/devices", get(devices))
         .route("/api/datasets", get(datasets))
+        .route("/api/datasets/download", post(dataset_download))
+        .route("/api/datasets/rename", post(dataset_rename))
+        .route("/api/datasets/combine", post(dataset_combine))
+        .route("/api/datasets/info/{name}", get(dataset_info))
+        .route("/api/datasets/delete/{name}", axum::routing::delete(dataset_delete))
         .route("/api/models", get(models))
         .route("/api/train", post(train))
         .route("/api/train/status", get(train_status))
@@ -80,6 +85,67 @@ fn query_token(query: Option<&str>) -> Option<String> {
 #[derive(Serialize)]
 struct DeviceInfo {
     name: String,
+    backend: String,
+    device_type: String,
+    vendor: u32,
+    device: u32,
+    driver: String,
+    vram_bytes: Option<u64>,
+    selectable: bool,
+}
+
+fn enum_adapter_specs() -> Vec<DeviceInfo> {
+    use wgpu::Backends;
+
+    let instance = wgpu::Instance::default();
+
+    let adapters = futures::executor::block_on(instance.enumerate_adapters(Backends::all()));
+    if adapters.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for a in adapters {
+        let info = a.get_info();
+        let backend_name = match info.backend {
+            wgpu::Backend::Vulkan => "Vulkan",
+            wgpu::Backend::Metal => "Metal",
+            wgpu::Backend::Dx12 => "DX12",
+            wgpu::Backend::Gl => "OpenGL",
+            wgpu::Backend::BrowserWebGpu => "WebGPU",
+            _ => "Other",
+        };
+        let type_name = match info.device_type {
+            wgpu::DeviceType::DiscreteGpu => "Discrete GPU",
+            wgpu::DeviceType::IntegratedGpu => "Integrated GPU",
+            wgpu::DeviceType::VirtualGpu => "Virtual GPU",
+            wgpu::DeviceType::Cpu => "CPU",
+            _ => "Other",
+        };
+
+        let mut vram_bytes = None;
+        if let Ok((device, _queue)) = futures::executor::block_on(
+            a.request_device(&wgpu::DeviceDescriptor::default()),
+        ) {
+            let limits = device.limits();
+            let max_buf = limits.max_buffer_size;
+            if max_buf > 0 {
+                vram_bytes = Some(max_buf);
+            }
+        }
+
+        out.push(DeviceInfo {
+            name: info.name.clone(),
+            backend: backend_name.into(),
+            device_type: type_name.into(),
+            vendor: info.vendor,
+            device: info.device,
+            driver: info.driver.clone(),
+            vram_bytes,
+            selectable: true,
+        });
+    }
+    out
 }
 
 #[allow(clippy::unused_async)]
@@ -88,47 +154,310 @@ async fn devices(
     headers: HeaderMap,
 ) -> Result<Json<Vec<DeviceInfo>>, Response> {
     check_token(&state.server, &headers, None)?;
-    Ok(Json(vec![
-        DeviceInfo { name: "DefaultDevice".into() },
-        DeviceInfo { name: "DiscreteGpu(0)".into() },
-        DeviceInfo { name: "DiscreteGpu(1)".into() },
-        DeviceInfo { name: "IntegratedGpu(0)".into() },
-        DeviceInfo { name: "Cpu".into() },
-    ]))
+
+    // WGPU adapter enumeration can be slow/blocking; run it off the async core.
+    // Guard against panics from missing GPU drivers so the server stays up.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<DeviceInfo>>();
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(enum_adapter_specs));
+        let _ = tx.send(result.unwrap_or_default());
+    });
+    let specs = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
+
+    if specs.is_empty() {
+        // Fallback: expose the selectors we know the runner supports.
+        return Ok(Json(vec![
+            DeviceInfo {
+                name: "DefaultDevice".into(),
+                backend: "wgpu".into(),
+                device_type: "Auto".into(),
+                vendor: 0,
+                device: 0,
+                driver: String::new(),
+                vram_bytes: None,
+                selectable: true,
+            },
+            DeviceInfo {
+                name: "DiscreteGpu(0)".into(),
+                backend: "wgpu".into(),
+                device_type: "Discrete GPU".into(),
+                vendor: 0,
+                device: 0,
+                driver: String::new(),
+                vram_bytes: None,
+                selectable: true,
+            },
+            DeviceInfo {
+                name: "Cpu".into(),
+                backend: "wgpu".into(),
+                device_type: "CPU".into(),
+                vendor: 0,
+                device: 0,
+                driver: String::new(),
+                vram_bytes: None,
+                selectable: true,
+            },
+        ]));
+    }
+
+    Ok(Json(specs))
 }
 
 // ---------------------------------------------------------------------------
 // Datasets / models listing
 // ---------------------------------------------------------------------------
 
-fn list_entries(dir: &Path, exts: &[&str], relative: bool) -> Vec<String> {
+#[derive(Serialize)]
+struct DatasetInfo {
+    name: String,
+    size_bytes: u64,
+    modified_unix: u64,
+    ext: String,
+}
+
+fn list_dataset_infos(dir: &Path) -> Vec<DatasetInfo> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_file()
-                && exts.iter().any(|x| {
-                    p.extension()
-                        .map(|e| e.to_string_lossy().eq_ignore_ascii_case(x))
-                        .unwrap_or(false)
-                })
-            {
-                if relative {
-                    out.push(e.file_name().to_string_lossy().to_string());
-                } else {
-                    out.push(p.to_string_lossy().to_string());
-                }
+            if !p.is_file() {
+                continue;
             }
+            let ext = p.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if ext != "txt" && ext != "bin" {
+                continue;
+            }
+            let meta = match p.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            out.push(DatasetInfo {
+                name: e.file_name().to_string_lossy().to_string(),
+                size_bytes: meta.len(),
+                modified_unix: modified,
+                ext,
+            });
         }
     }
-    out.sort();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
+/// Resolve a user-supplied dataset name to a safe path inside the datasets dir.
+/// Only a bare file name (no path separators / traversal) is accepted.
+fn resolve_dataset(dir: &Path, name: &str) -> Result<std::path::PathBuf, Response> {
+    let file_name = Path::new(name).file_name().and_then(|n| n.to_str());
+    let file_name = match file_name {
+        Some(n) if !n.is_empty() && n == name => n,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid dataset path" })),
+            )
+                .into_response())
+        }
+    };
+
+    let cand = dir.join(file_name);
+    if !cand.is_file() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("dataset not found: {name}") })),
+        )
+            .into_response());
+    }
+    Ok(cand)
+}
+
 #[allow(clippy::unused_async)]
-async fn datasets(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<String>>, Response> {
+async fn datasets(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<DatasetInfo>>, Response> {
     check_token(&state.server, &headers, None)?;
-    Ok(Json(list_entries(&state.server.datasets_dir, &["txt", "bin"], true)))
+    Ok(Json(list_dataset_infos(&state.server.datasets_dir)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetDownloadRequest {
+    repo_id: String,
+    #[serde(default = "default_download_filename")]
+    filename: String,
+}
+
+fn default_download_filename() -> String { "TinyStories-train.txt".into() }
+
+#[allow(clippy::unused_async)]
+async fn dataset_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DatasetDownloadRequest>,
+) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let repo_id = req.repo_id.trim().to_string();
+    if repo_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "repoId is required" }))).into_response());
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(
+            crate::data::download_dataset_from_hf(&repo_id, &req.filename)
+                .map_err(|e| e.to_string()),
+        );
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(300)) {
+        Ok(Ok(path)) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "path": path.to_string_lossy(),
+            "name": path.file_name().unwrap_or_default().to_string_lossy(),
+        }))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "error": "download timed out" }))).into_response()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetRenameRequest {
+    from: String,
+    to: String,
+}
+
+#[allow(clippy::unused_async)]
+async fn dataset_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DatasetRenameRequest>,
+) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let from = resolve_dataset(&state.server.datasets_dir, &req.from)?;
+
+    let to_name = Path::new(&req.to).file_name().and_then(|n| n.to_str());
+    let to_name = match to_name {
+        Some(n) if !n.is_empty() && n == req.to => n,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid target name" })),
+            )
+                .into_response())
+        }
+    };
+    let to = state.server.datasets_dir.join(to_name);
+    if to.exists() {
+        return Err((StatusCode::CONFLICT, Json(serde_json::json!({ "error": "target already exists" }))).into_response());
+    }
+    std::fs::rename(&from, &to).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+    })?;
+    Ok(Json(serde_json::json!({ "status": "ok", "from": req.from, "to": req.to })))
+}
+
+#[allow(clippy::unused_async)]
+async fn dataset_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let path = resolve_dataset(&state.server.datasets_dir, &name)?;
+    std::fs::remove_file(&path).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+    })?;
+    Ok(Json(serde_json::json!({ "status": "ok", "deleted": name })))
+}
+
+#[allow(clippy::unused_async)]
+async fn dataset_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let path = resolve_dataset(&state.server.datasets_dir, &name)?;
+
+    let size_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+    let ext = path.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+
+    let mut info = serde_json::json!({
+        "name": name,
+        "size_bytes": size_bytes,
+        "ext": ext,
+    });
+
+    // Cheap text stats: line count (for .txt) without loading fully.
+    if ext == "txt" {
+        if let Ok(f) = std::fs::File::open(&path) {
+            let reader = std::io::BufReader::new(f);
+            let lines = reader.lines().count();
+            info["lines"] = serde_json::json!(lines);
+        }
+    }
+
+    Ok(Json(info))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetCombineRequest {
+    sources: Vec<CombineSource>,
+    #[serde(default)]
+    max_chars: Option<usize>,
+    #[serde(default = "default_combine_output")]
+    output: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CombineSource {
+    path: String,
+    weight: f32,
+}
+
+fn default_combine_output() -> String { "weighted_mix_web.txt".into() }
+
+#[allow(clippy::unused_async)]
+async fn dataset_combine(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DatasetCombineRequest>,
+) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    if req.sources.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "sources is required" }))).into_response());
+    }
+
+    let mut sources = Vec::new();
+    for s in &req.sources {
+        let p = resolve_dataset(&state.server.datasets_dir, &s.path)?;
+        sources.push((p, s.weight));
+    }
+
+    let output_path = state.server.datasets_dir.join(&req.output);
+    let max_chars = req.max_chars.unwrap_or(usize::MAX);
+    let output_clone = output_path.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    std::thread::spawn(move || {
+        let result = crate::data::combine_and_mix_weighted(&sources, &output_clone, max_chars)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(600)) {
+        Ok(Ok(())) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "output": output_path.to_string_lossy(),
+        }))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "error": "combine timed out" }))).into_response()),
+    }
 }
 
 #[derive(Serialize)]

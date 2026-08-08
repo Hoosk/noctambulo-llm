@@ -2,6 +2,7 @@
 
 import { api } from "../core/api.js";
 import { clear, el } from "../core/dom.js";
+import { getActiveModel } from "./models.js";
 
 export default class GenerateView {
   constructor(root) {
@@ -24,8 +25,10 @@ export default class GenerateView {
     }
 
     const modelSel = el("select", { class: "w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white" });
+    const active = getActiveModel();
     for (const m of this.models) {
-      modelSel.append(el("option", { value: m.dir, selected: m.default || null }, `${m.name} · ${m.params_m.toFixed(1)}M`));
+      const selected = m.dir === active || (!active && m.default) || null;
+      modelSel.append(el("option", { value: m.dir, selected }, `${m.name} · ${m.params_m.toFixed(1)}M`));
     }
 
     const prompt = el("textarea", {
