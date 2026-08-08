@@ -1,4 +1,4 @@
-use hf_hub::api::sync::Api;
+use hf_hub::{split_id, HFClientSync};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,9 +32,14 @@ impl LlmTokenizer {
         }
 
         println!("Downloading tokenizer config for '{}' from Hugging Face Hub...", repo_id);
-        let api = Api::new().map_err(|e| format!("HF Api error: {}", e))?;
-        let repo = api.model(repo_id.to_string());
-        let tokenizer_path = repo.get("tokenizer.json").map_err(|e| format!("HF get error: {}", e))?;
+        let client = HFClientSync::new().map_err(|e| format!("HF Api error: {}", e))?;
+        let (owner, name) = split_id(repo_id);
+        let tokenizer_path = client
+            .model(owner, name)
+            .download_file()
+            .filename("tokenizer.json")
+            .send()
+            .map_err(|e| format!("HF get error: {}", e))?;
 
         if let Err(e) = std::fs::copy(&tokenizer_path, &local_path) {
             println!("Warning: Could not cache tokenizer locally: {}", e);
@@ -250,7 +255,7 @@ pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf
 
     // 1. Check local cache first for any candidate
     for cand in &candidates {
-        let dataset_name = format!("dataset_{}_{}", repo_id.replace("/", "_"), cand);
+        let dataset_name = format!("dataset_{}_{}", repo_id.replace("/", "_"), cand.replace("/", "_"));
         let root_cache = PathBuf::from(&dataset_name);
         if root_cache.exists() {
             println!("Using existing cached dataset file: {:?}", root_cache);
@@ -266,18 +271,19 @@ pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf
     }
 
     // 2. Download from HF Hub trying candidates in order
-    let api = Api::new().map_err(|e| format!("HF Api error: {}", e))?;
-    let repo = api.dataset(repo_id.to_string());
+    let client = HFClientSync::new().map_err(|e| format!("HF Api error: {}", e))?;
+    let (owner, name) = split_id(repo_id);
+    let repo = client.dataset(owner, name);
     let datasets_dir = PathBuf::from("datasets");
     std::fs::create_dir_all(&datasets_dir)?;
 
     let mut last_err = None;
-    for cand in &candidates {
-        let dataset_name = format!("dataset_{}_{}", repo_id.replace("/", "_"), cand);
+    for cand in candidates {
+        let dataset_name = format!("dataset_{}_{}", repo_id.replace("/", "_"), cand.replace("/", "_"));
         let local_cache = datasets_dir.join(&dataset_name);
 
         println!("Downloading dataset '{}' ({}) from Hugging Face Hub...", repo_id, cand);
-        match repo.get(cand) {
+        match repo.download_file().filename(cand).send() {
             Ok(downloaded_file) => {
                 std::fs::copy(&downloaded_file, &local_cache)?;
                 println!("Saved dataset locally to {:?}", local_cache);
@@ -290,6 +296,78 @@ pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf
     }
 
     Err(format!("Failed to download dataset from HF repo '{}': {:?}", repo_id, last_err.unwrap()).into())
+}
+
+/// Extrae documentos de texto de un archivo Parquet (columna `text` con fallbacks
+/// a `content`/`body`) y los escribe a un `.txt` destino, un documento por línea.
+/// Devuelve el número de documentos escritos.
+pub fn extract_parquet_text_column(
+    parquet_path: &Path,
+    output_txt_path: &Path,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    use arrow::array::{Array, LargeStringArray, StringArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    println!("Extracting text column from Parquet {:?}...", parquet_path);
+
+    let file = File::open(parquet_path)
+        .map_err(|e| format!("Failed to open parquet file {:?}: {}", parquet_path, e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("Failed to parse parquet {:?}: {}", parquet_path, e))?;
+
+    let schema = builder.schema().clone();
+    let mut text_col: Option<String> = None;
+    for candidate in ["text", "content", "body", "raw"] {
+        if schema.fields().iter().any(|f| f.name() == candidate) {
+            text_col = Some(candidate.to_string());
+            break;
+        }
+    }
+    let text_col = match text_col {
+        Some(col) => col,
+        None => {
+            let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+            return Err(format!(
+                "No text column found in parquet {:?}. Columns available: {:?}",
+                parquet_path, names
+            )
+            .into());
+        }
+    };
+
+    let mut reader = builder.build()
+        .map_err(|e| format!("Failed to build parquet reader: {}", e))?;
+
+    let out_file = File::create(output_txt_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(2 * 1024 * 1024, out_file);
+    let mut docs = 0u64;
+
+    for batch_res in &mut reader {
+        let batch = batch_res.map_err(|e| format!("Parquet read error: {}", e))?;
+        let col = batch.column_by_name(&text_col);
+        let Some(col) = col else { continue; };
+        let data = col.as_any().downcast_ref::<StringArray>()
+            .map(|a| a.iter().collect::<Vec<Option<&str>>>())
+            .or_else(|| {
+                col.as_any().downcast_ref::<LargeStringArray>()
+                    .map(|a| a.iter().collect::<Vec<Option<&str>>>())
+            });
+        let Some(data) = data else { continue; };
+        for val in data {
+            if let Some(text) = val {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    writer.write_all(trimmed.as_bytes())?;
+                    writer.write_all(b"\n")?;
+                    docs += 1;
+                }
+            }
+        }
+    }
+
+    writer.flush()?;
+    println!("Parquet extraction done: {} documents written to {:?}.", docs, output_txt_path);
+    Ok(docs)
 }
 
 pub fn combine_and_mix_datasets(
@@ -350,6 +428,126 @@ pub fn combine_and_mix_datasets(
 
     writer.flush()?;
     println!("Combined dataset ready: {} lines written to {:?}.", total_lines, output_path);
+    Ok(output_path.to_path_buf())
+}
+
+/// Mezcla ponderada de datasets (uno por línea) respetando las proporciones
+/// `weights` y un presupuesto máximo de caracteres `max_chars`.
+/// Selección probabilística por peso en cada paso (sin sesgo de orden).
+pub fn combine_and_mix_weighted(
+    sources: &[(PathBuf, f32)],
+    output_path: &Path,
+    max_chars: usize,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let total_weight: f32 = sources.iter().map(|(_, w)| w.max(0.0)).sum();
+    if total_weight <= 0.0 {
+        return Err("Total weight must be > 0".into());
+    }
+
+    println!(
+        "Combining {} datasets with weights {:?} (max {} chars) into {:?}...",
+        sources.len(),
+        sources.iter().map(|(_, w)| w).collect::<Vec<_>>(),
+        max_chars,
+        output_path
+    );
+
+    let mut readers: Vec<BufReader<File>> = Vec::new();
+    for (src, _) in sources {
+        let file = File::open(src).map_err(|e| format!("Failed to open dataset file {:?}: {}", src, e))?;
+        readers.push(BufReader::with_capacity(1024 * 1024, file));
+    }
+
+    let out_file = File::create(output_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(2 * 1024 * 1024, out_file);
+
+    let mut written_chars = 0usize;
+    let mut total_lines = 0u64;
+    let mut line_buf = String::new();
+    let mut last_pct = -1i32;
+
+    // Fuentes activas: (índice, peso). Se re-normaliza al agotar una fuente.
+    let mut active: Vec<(usize, f32)> =
+        sources.iter().enumerate().map(|(i, (_, w))| (i, w.max(0.0))).collect();
+
+    // PRNG simple (xorshift64*)
+    let mut state: u64 = 0x9E3779B97F4A7C15 ^ std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0xDEADBEEF);
+
+    while !active.is_empty() && written_chars < max_chars {
+        // Sortear una fuente activa proporcionalmente a su peso
+        let total: f32 = active.iter().map(|(_, w)| w).sum();
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let r = state.wrapping_mul(0x2545F4914F6CDD1D) >> 33;
+        let r = (r as f32 / (1u64 << 32) as f32) * total;
+        let mut acc = 0.0f32;
+        let mut pick = 0usize;
+        for (pos, (_, w)) in active.iter().enumerate() {
+            acc += *w;
+            if r < acc {
+                pick = pos;
+                break;
+            }
+        }
+        let idx = active[pick].0;
+
+        line_buf.clear();
+        match readers[idx].read_line(&mut line_buf) {
+            Ok(0) => {
+                active.remove(pick);
+            }
+            Ok(_) => {
+                let trimmed = line_buf.trim();
+                if !trimmed.is_empty() {
+                    let bytes = trimmed.as_bytes();
+                    if written_chars + bytes.len() > max_chars {
+                        active.remove(pick);
+                        continue;
+                    }
+                    writer.write_all(bytes)?;
+                    writer.write_all(b"\n")?;
+                    written_chars += bytes.len() + 1;
+                    total_lines += 1;
+
+                    let pct = if max_chars == usize::MAX {
+                        0
+                    } else {
+                        (written_chars * 100 / max_chars) as i32
+                    };
+                    if pct != last_pct && (pct % 2 == 0 || pct == 100) {
+                        last_pct = pct;
+                        print!(
+                            "\r  Progress: {:>3}%  ({} lines, {:.1} MB written, {} active sources)",
+                            pct,
+                            total_lines,
+                            written_chars as f64 / 1_048_576.0,
+                            active.len()
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Warning: error reading from dataset {:?}: {}", sources[idx].0, e);
+                active.remove(pick);
+            }
+        }
+    }
+
+    writer.flush()?;
+    println!();
+    println!(
+        "Weighted mix ready: {} lines / {} chars written to {:?}.",
+        total_lines, written_chars, output_path
+    );
     Ok(output_path.to_path_buf())
 }
 

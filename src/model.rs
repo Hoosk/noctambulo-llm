@@ -148,7 +148,7 @@ impl<B: Backend> CausalSelfAttention<B> {
         }
 
         let device = scores.device();
-        let causal_mask = Tensor::<B, 2, burn::tensor::Bool>::triu_mask([seq_len, seq_len], 1, &device)
+        let causal_mask = Tensor::<B, 2, burn::tensor::Bool>::tril_mask([seq_len, seq_len], 0, &device)
             .unsqueeze_dim::<3>(0)
             .unsqueeze_dim::<4>(0);
 
@@ -482,6 +482,43 @@ mod tests {
 
         let logits = model.forward(input);
         assert_eq!(logits.dims(), [1, 4, 100]);
+    }
+
+    #[test]
+    fn test_causal_mask_isolates_position_zero() {
+        let device = WgpuDevice::default();
+        let config = ModelConfig::new(100, 64, 4, Some(2), 2, 32, 0.0, 0.0);
+        let model: Llm<Wgpu> = config.init_model(&device);
+
+        let input_a = TensorData::new(vec![7i32, 11, 13, 17], [1, 4]);
+        let input_b = TensorData::new(vec![7i32, 99, 13, 17], [1, 4]);
+        let ta = Tensor::<Wgpu, 2, Int>::from_data(input_a, &device);
+        let tb = Tensor::<Wgpu, 2, Int>::from_data(input_b, &device);
+
+        let la = model.forward(ta);
+        let lb = model.forward(tb);
+
+        let da = la.into_data().to_vec::<f32>().unwrap_or_default();
+        let db = lb.into_data().to_vec::<f32>().unwrap_or_default();
+
+        let v = 100;
+        let pos0_a = &da[0..v];
+        let pos0_b = &db[0..v];
+
+        let max_diff = pos0_a
+            .iter()
+            .zip(pos0_b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        let changed_pos1 = pos0_a
+            .iter()
+            .zip(pos0_b.iter())
+            .filter(|(a, b)| ((*a) - (*b)).abs() > 1e-5)
+            .count();
+
+        eprintln!("[CAUSALITY TEST] max_diff pos0 = {max_diff:.6}, changed_pos1 = {changed_pos1}/{v}");
+        assert!(max_diff < 1e-4, "Position 0 logits changed when token at position 1 changed (max_diff={max_diff}). Causal mask broken!");
     }
 }
 

@@ -8,7 +8,7 @@ mod tui;
 
 use clap::{Args, Parser, Subcommand};
 use config::ModelConfig;
-use data::{combine_and_mix_datasets, download_dataset_from_hf, prepare_binary_dataset, train_custom_tokenizer, LlmTokenizer};
+use data::{combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf, extract_parquet_text_column, prepare_binary_dataset, train_custom_tokenizer, LlmTokenizer};
 use export::export_to_gguf;
 use generate::generate;
 use model::Llm;
@@ -46,6 +46,8 @@ struct Cli {
 enum Commands {
     /// Train a custom BPE tokenizer on corpus or datasets
     TrainTokenizer(TrainTokenizerArgs),
+    /// Download a dataset file from Hugging Face Hub (Parquet auto-extracts text)
+    Download(DownloadArgs),
     /// Pre-tokenize corpus or HF dataset to compact binary dataset format (.bin)
     PrepareDataset(PrepareDatasetArgs),
     /// Train the causal transformer model
@@ -65,15 +67,38 @@ struct TrainTokenizerArgs {
     /// HF dataset repo ID(s) (comma-separated, e.g. roneneldan/TinyStories)
     #[arg(long, value_delimiter = ',')]
     dataset: Vec<String>,
-    /// Local dataset file path
-    #[arg(long)]
-    file: Option<String>,
+    /// Local dataset file path(s) (comma-separated, order matches --weights)
+    #[arg(long, value_delimiter = ',')]
+    file: Vec<String>,
     /// Target file name inside HF dataset repo
     #[arg(long, default_value = "TinyStories-train.txt")]
     dataset_file: String,
     /// Vocabulary size
     #[arg(long, default_value_t = 8000)]
     vocab_size: usize,
+    /// Mix weights per source (comma-separated, same order as --file).
+    /// When set, sources are mixed probabilistically by these proportions.
+    #[arg(long, value_delimiter = ',')]
+    weights: Vec<f32>,
+    /// Max characters of mixed corpus to train tokenizer on (0 = all available)
+    #[arg(long, default_value_t = 0)]
+    max_chars: usize,
+}
+
+#[derive(Args)]
+struct DownloadArgs {
+    /// HF dataset repo ID (e.g. HuggingFaceTB/cosmopedia-100k)
+    #[arg(long)]
+    repo: String,
+    /// File name inside the repo (e.g. data/train-00000-of-00001.parquet)
+    #[arg(long)]
+    file: String,
+    /// Output directory for the downloaded file (default: datasets/)
+    #[arg(long, default_value = "datasets")]
+    out_dir: String,
+    /// Extract text column to .txt when the file is Parquet (default: true)
+    #[arg(long, default_value_t = true)]
+    extract_text: bool,
 }
 
 #[derive(Args)]
@@ -81,9 +106,9 @@ struct PrepareDatasetArgs {
     /// HF dataset repo ID(s) (comma-separated, e.g. roneneldan/TinyStories)
     #[arg(long, value_delimiter = ',')]
     dataset: Vec<String>,
-    /// Local dataset file path
-    #[arg(long)]
-    file: Option<String>,
+    /// Local dataset file path(s) (comma-separated, order matches --weights)
+    #[arg(long, value_delimiter = ',')]
+    file: Vec<String>,
     /// Target file name inside HF dataset repo
     #[arg(long, default_value = "TinyStories-train.txt")]
     dataset_file: String,
@@ -93,6 +118,13 @@ struct PrepareDatasetArgs {
     /// Max dataset tokens to tokenize (0 = all)
     #[arg(long, default_value_t = 0)]
     max_tokens: usize,
+    /// Mix weights per source (comma-separated, same order as --dataset/--file).
+    /// When set, sources are mixed probabilistically by these proportions.
+    #[arg(long, value_delimiter = ',')]
+    weights: Vec<f32>,
+    /// Max characters to write for weighted mixing (0 = all available)
+    #[arg(long, default_value_t = 0)]
+    max_chars: usize,
 }
 
 #[derive(Args)]
@@ -231,8 +263,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     sources.push(downloaded);
                 }
             }
-            if let Some(file_path) = args.file {
-                sources.push(PathBuf::from(file_path));
+            if !args.file.is_empty() {
+                for f in &args.file {
+                    let f = f.trim();
+                    if !f.is_empty() {
+                        sources.push(PathBuf::from(f));
+                    }
+                }
             }
 
             let corpus_path = if sources.is_empty() {
@@ -241,6 +278,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::fs::write(default_file, DEFAULT_CORPUS)?;
                 }
                 default_file.to_string_lossy().to_string()
+            } else if !args.weights.is_empty() {
+                if args.weights.len() != sources.len() {
+                    return Err(format!(
+                        "Weights count ({}) must match sources count ({})",
+                        args.weights.len(),
+                        sources.len()
+                    )
+                    .into());
+                }
+                let weighted: Vec<(PathBuf, f32)> =
+                    sources.iter().cloned().zip(args.weights.iter().copied()).collect();
+                let max_chars = if args.max_chars == 0 { usize::MAX } else { args.max_chars };
+                combine_and_mix_weighted(&weighted, Path::new("datasets/weighted_mix.txt"), max_chars)?
+                    .to_string_lossy()
+                    .to_string()
             } else if sources.len() == 1 {
                 sources[0].to_string_lossy().to_string()
             } else {
@@ -252,6 +304,29 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             train_custom_tokenizer(&corpus_path, custom_tokenizer_file, args.vocab_size)?;
             println!("Tokenizer successfully trained and saved to '{}'.", custom_tokenizer_file);
         }
+        Commands::Download(args) => {
+            let downloaded = download_dataset_from_hf(&args.repo, &args.file)?;
+            let out_dir = PathBuf::from(&args.out_dir);
+            std::fs::create_dir_all(&out_dir)?;
+
+            let file_name = downloaded
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| args.file.clone());
+            let saved = out_dir.join(&file_name);
+
+            if saved != downloaded {
+                std::fs::copy(&downloaded, &saved)?;
+            }
+
+            if args.extract_text && file_name.ends_with(".parquet") {
+                let txt_path = out_dir.join(format!("{}_text.txt", file_name.trim_end_matches(".parquet")));
+                extract_parquet_text_column(&saved, &txt_path)?;
+                println!("Extracted text written to {:?}", txt_path);
+            } else {
+                println!("Dataset file saved to {:?}", saved);
+            }
+        }
         Commands::PrepareDataset(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();
             for repo in &args.dataset {
@@ -261,8 +336,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     sources.push(downloaded);
                 }
             }
-            if let Some(file_path) = args.file {
-                sources.push(PathBuf::from(file_path));
+            if !args.file.is_empty() {
+                for f in &args.file {
+                    let f = f.trim();
+                    if !f.is_empty() {
+                        sources.push(PathBuf::from(f));
+                    }
+                }
             }
 
             let corpus_path = if sources.is_empty() {
@@ -271,6 +351,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::fs::write(default_file, DEFAULT_CORPUS)?;
                 }
                 default_file.to_path_buf()
+            } else if !args.weights.is_empty() {
+                if args.weights.len() != sources.len() {
+                    return Err(format!(
+                        "Weights count ({}) must match sources count ({})",
+                        args.weights.len(),
+                        sources.len()
+                    )
+                    .into());
+                }
+                if Path::new(&args.output) == Path::new("datasets/weighted_mix.txt") {
+                    return Err(
+                        "--output cannot be datasets/weighted_mix.txt: it is the intermediate \
+                         text mix path and would be overwritten by the binary dataset."
+                            .into(),
+                    );
+                }
+                let weighted: Vec<(PathBuf, f32)> =
+                    sources.iter().cloned().zip(args.weights.iter().copied()).collect();
+                let max_chars = if args.max_chars == 0 { usize::MAX } else { args.max_chars };
+                combine_and_mix_weighted(&weighted, Path::new("datasets/weighted_mix.txt"), max_chars)?
             } else if sources.len() == 1 {
                 sources[0].clone()
             } else {
