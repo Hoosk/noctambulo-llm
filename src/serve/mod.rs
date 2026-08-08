@@ -5,10 +5,12 @@ pub mod api;
 pub mod runner;
 pub mod state;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 
 pub use state::ServerState;
 
@@ -24,8 +26,13 @@ pub async fn run(
     let cors = CorsLayer::new().allow_origin(Any);
 
     let router_state = state.clone();
+    let frontend_dir = frontend_dir();
     let app = Router::new()
         .merge(api::router(router_state))
+        .fallback_service(
+            ServeDir::new(&frontend_dir)
+                .not_found_service(ServeFile::new(frontend_dir.join("index.html"))),
+        )
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -40,4 +47,14 @@ pub async fn run(
     println!("   Modelos:  {:?}", state.models_dir);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Locate the frontend directory (checked-out repo or compiled asset).
+fn frontend_dir() -> PathBuf {
+    let candidate = PathBuf::from("frontend");
+    if candidate.join("index.html").exists() {
+        candidate
+    } else {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/frontend"))
+    }
 }
