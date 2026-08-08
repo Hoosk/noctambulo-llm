@@ -3,6 +3,7 @@ mod data;
 mod export;
 mod generate;
 mod model;
+mod serve;
 mod train;
 mod tui;
 
@@ -60,6 +61,24 @@ enum Commands {
     Export(ExportArgs),
     /// Print model parameter count, VRAM footprint, and FLOPs statistics
     Stats,
+    /// Serve a web UI to control training/generate/export from the browser
+    Serve(ServeArgs),
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// Address and port to bind (e.g. 0.0.0.0:8080 for remote access)
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    bind: String,
+    /// API token required in the X-API-Token header (auto-generated if omitted)
+    #[arg(long)]
+    token: Option<String>,
+    /// Directory containing datasets to list/train on
+    #[arg(long, default_value = "datasets")]
+    datasets_dir: String,
+    /// Directory containing model outputs and checkpoints
+    #[arg(long, default_value = ".")]
+    models_dir: String,
 }
 
 #[derive(Args)]
@@ -643,7 +662,37 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  GQA Cache Saving : {:.1}% KV-cache VRAM reduction", (1.0 - (n_kv_head as f64 / n_head as f64)) * 100.0);
             println!("===============================================================================");
         }
+        Commands::Serve(args) => {
+            let bind: std::net::SocketAddr = args.bind.parse().map_err(|e| format!("Invalid --bind '{}': {}", args.bind, e))?;
+            let token = args.token.or_else(|| {
+                let t = format!("{:x}", rand_like_token());
+                Some(t)
+            });
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(serve::run(
+                bind,
+                token,
+                std::path::PathBuf::from(&args.datasets_dir),
+                std::path::PathBuf::from(&args.models_dir),
+            ))?;
+        }
     }
 
     Ok(())
+}
+
+/// Generate a simple pseudo-random hex token from time + process id (no extra deps).
+fn rand_like_token() -> u128 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id() as u128;
+    let addr = &nanos as *const _ as u128;
+    let mut acc = nanos ^ (pid << 32) ^ (addr << 64);
+    // xorshift-style scramble
+    acc ^= acc << 13;
+    acc ^= acc >> 7;
+    acc ^= acc << 17;
+    acc.wrapping_mul(0x9E3779B97F4A7C15)
 }

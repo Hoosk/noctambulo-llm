@@ -124,7 +124,7 @@ impl TextDataset {
 
 /// Event emitted by the training loop, consumed either by the CLI (prints) or
 /// by the web server (SSE / live metrics).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub enum TrainingEvent {
     Started {
