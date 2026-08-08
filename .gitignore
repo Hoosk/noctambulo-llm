@@ -1,20 +1,50 @@
 # Rust / Cargo
 /target/
+**/*.rs.bk
+*.perf
+flamegraph.svg
+heaptrack.*
 
 # Datasets pesados y archivos de datos locales
 datasets/
-dataset_roneneldan_TinyStories_TinyStories-train.txt
-corpus.txt
+dataset_*.txt
+uploads/
 
+# Salidas y checkpoints del modelo (cualquier variante)
+model_output*/
+exported/
+checkpoints*/
+*.bin
 
-# Salidas y checkpoints del modelo
-/model_output/
-/exported/
-/checkpoints/
+# Tokenizers y artefactos de entrenamiento
+custom_tokenizer*.json
+*.log
+sessions/
 
+# Configuración sensible (tokens del servidor serve)
+.env
+.env.local
+.env.*.local
+!.env.example
 
-# System and local configuration
+# Frontend (defensivo, aunque usemos CDN)
+frontend/node_modules/
+frontend/dist/
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# Opencode / agentes
+.opencode/
+.agents/
+
+# OS y módulos del sistema
 .DS_Store
 Thumbs.db
-/.agents/
-custom_tokenizer.json
+*.core
+.gdbinit
