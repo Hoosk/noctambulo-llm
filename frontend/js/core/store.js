@@ -1,0 +1,102 @@
+// Global store for the training job state (fed by SSE events).
+
+import { emit, on } from "./events.js";
+
+export const JobState = {
+  IDLE: "idle",
+  RUNNING: "running",
+  DONE: "done",
+  STOPPED: "stopped",
+  ERROR: "error",
+};
+
+const store = {
+  status: JobState.IDLE,
+  epoch: 0,
+  epochs: 0,
+  batch: 0,
+  numBatches: 0,
+  step: 0,
+  pct: 0,
+  loss: null,
+  avgLoss: null,
+  lr: null,
+  batchesPerSec: null,
+  elapsedSecs: 0,
+  etaSecs: null,
+  nCtx: 0,
+  valPpl: null,
+  valLoss: null,
+  preview: "",
+  jobId: "",
+  message: "",
+};
+
+export function getJob() {
+  return store;
+}
+
+function set(patch) {
+  Object.assign(store, patch);
+  emit("job:changed", store);
+}
+
+// Translate a raw TrainingEvent into store mutations.
+export function handleTrainingEvent(ev) {
+  const key = Object.keys(ev)[0];
+  const v = ev[key];
+  switch (key) {
+    case "Started":
+      set({
+        status: JobState.RUNNING,
+        epochs: v.epochs,
+        step: 0,
+        loss: null,
+        avgLoss: null,
+        valPpl: null,
+        preview: "",
+        message: "Entrenamiento iniciado",
+      });
+      break;
+    case "Progress":
+      set({
+        status: JobState.RUNNING,
+        epoch: v.epoch,
+        epochs: v.epochs,
+        batch: v.batch,
+        numBatches: v.num_batches,
+        step: v.step,
+        pct: v.pct,
+        loss: v.loss,
+        avgLoss: v.avg_loss,
+        lr: v.lr,
+        batchesPerSec: v.batches_per_sec,
+        elapsedSecs: v.elapsed_secs,
+        etaSecs: v.eta_secs,
+        nCtx: v.current_n_ctx,
+      });
+      break;
+    case "Val":
+      set({ valPpl: v.ppl, valLoss: v.loss });
+      break;
+    case "Preview":
+      set({ preview: v.text });
+      break;
+    case "Done":
+      set({ status: JobState.DONE, message: "Entrenamiento completado" });
+      break;
+    case "Stopped":
+      set({ status: JobState.STOPPED, message: v.reason || "Detenido" });
+      break;
+    case "Checkpoint":
+      set({ message: `Checkpoint ${v.kind} guardado` });
+      break;
+    default:
+      break;
+  }
+}
+
+// Wire SSE events into the store once.
+export function initJobStore() {
+  on("training:event", handleTrainingEvent);
+}

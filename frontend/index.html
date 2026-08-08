@@ -4,148 +4,22 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Kuro-Neko · Control de Entrenamiento</title>
-  <link rel="stylesheet" href="/style.css" />
+  <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
 </head>
-<body>
-  <header>
-    <h1>🐈‍⬛ Kuro-Neko</h1>
-    <div id="conn-status" class="status-dot"></div>
-    <nav>
-      <button class="tab-btn active" data-tab="train">Train</button>
-      <button class="tab-btn" data-tab="generate">Generate</button>
-      <button class="tab-btn" data-tab="export">Export</button>
-      <button class="tab-btn" data-tab="devices">Devices</button>
-    </nav>
-  </header>
-
-  <main>
-    <!-- ============ TAB TRAIN ============ -->
-    <section id="tab-train" class="tab active">
-      <div class="grid">
-        <!-- Config form -->
-        <div class="card">
-          <h2>Configuración</h2>
-          <form id="train-form">
-            <label>Dataset
-              <select id="dataset" name="file"></select>
-            </label>
-            <label>Device
-              <select id="device"></select>
-            </label>
-            <div class="row">
-              <label>Epochs <input type="number" id="epochs" value="1" min="1" /></label>
-              <label>Batch <input type="number" id="batchSize" value="32" min="1" /></label>
-            </div>
-            <div class="row">
-              <label>LR <input type="number" id="lr" value="0.00005" step="0.00001" /></label>
-              <label>Max tokens <input type="number" id="maxTokens" value="10000000" min="0" /></label>
-            </div>
-            <div class="row">
-              <label>n_ctx <input type="number" id="nCtx" value="256" min="16" /></label>
-              <label>n_embd <input type="number" id="nEmbd" value="256" min="16" /></label>
-            </div>
-            <div class="row">
-              <label>n_head <input type="number" id="nHead" value="4" min="1" /></label>
-              <label>n_layer <input type="number" id="nLayer" value="4" min="1" /></label>
-            </div>
-            <div class="row">
-              <label>Val split <input type="number" id="valSplit" value="0.02" step="0.01" min="0" max="0.9" /></label>
-              <label>Grad accum <input type="number" id="gradAccum" value="1" min="1" /></label>
-            </div>
-            <div class="row">
-              <label>Save dir <input type="text" id="saveDir" value="checkpoints_web" /></label>
-              <label>Output dir <input type="text" id="outputDir" value="model_output" /></label>
-            </div>
-            <div class="actions">
-              <button type="submit" id="start-btn" class="primary">▶ Iniciar</button>
-              <button type="button" id="stop-btn" class="danger" disabled>⏹ Parar</button>
-            </div>
-          </form>
-          <p id="train-msg" class="msg"></p>
-        </div>
-
-        <!-- Live metrics -->
-        <div class="card">
-          <h2>Métricas</h2>
-          <canvas id="loss-chart" height="220"></canvas>
-          <table class="metrics">
-            <tbody>
-              <tr><td>Estado</td><td id="m-state">—</td></tr>
-              <tr><td>Epoch / Batch</td><td id="m-epoch">—</td></tr>
-              <tr><td>Loss</td><td id="m-loss">—</td></tr>
-              <tr><td>Avg Loss</td><td id="m-avg">—</td></tr>
-              <tr><td>LR</td><td id="m-lr">—</td></tr>
-              <tr><td>PPL val</td><td id="m-ppl">—</td></tr>
-              <tr><td>Tokens/s</td><td id="m-tps">—</td></tr>
-              <tr><td>ETA</td><td id="m-eta">—</td></tr>
-            </tbody>
-          </table>
-          <h3>Preview</h3>
-          <pre id="m-preview">—</pre>
-        </div>
-      </div>
-    </section>
-
-    <!-- ============ TAB GENERATE ============ -->
-    <section id="tab-generate" class="tab">
-      <div class="card">
-        <h2>Generar texto</h2>
-        <label>Modelo
-          <select id="gen-model"></select>
-        </label>
-        <label>Prompt
-          <textarea id="gen-prompt" rows="3" placeholder="Once upon a time..."></textarea>
-        </label>
-        <div class="row">
-          <label>Max tokens <input type="number" id="gen-maxTokens" value="60" min="1" /></label>
-          <label>Temp <input type="number" id="gen-temp" value="0.8" step="0.05" min="0" max="2" /></label>
-        </div>
-        <div class="row">
-          <label>Top-K <input type="number" id="gen-topk" value="40" min="1" /></label>
-          <label>Top-P <input type="number" id="gen-topp" value="0.9" step="0.05" min="0" max="1" /></label>
-        </div>
-        <div class="row">
-          <label>Min-P <input type="number" id="gen-minp" value="0.05" step="0.01" min="0" max="1" /></label>
-          <label>Repetition <input type="number" id="gen-rep" value="1.2" step="0.05" min="1" /></label>
-        </div>
-        <div class="actions">
-          <button type="button" id="gen-btn" class="primary">▶ Generar</button>
-        </div>
-        <p id="gen-msg" class="msg"></p>
-        <h3>Resultado</h3>
-        <pre id="gen-result">—</pre>
-      </div>
-    </section>
-
-    <!-- ============ TAB EXPORT ============ -->
-    <section id="tab-export" class="tab">
-      <div class="card">
-        <h2>Exportar a GGUF</h2>
-        <label>Modelo
-          <select id="exp-model"></select>
-        </label>
-        <label>Nombre del GGUF
-          <input type="text" id="exp-name" value="kuro-neko" />
-        </label>
-        <div class="actions">
-          <button type="button" id="exp-btn" class="primary">📦 Exportar</button>
-        </div>
-        <p id="exp-msg" class="msg"></p>
-        <h3>Resultado</h3>
-        <pre id="exp-result">—</pre>
-      </div>
-    </section>
-
-    <!-- ============ TAB DEVICES ============ -->
-    <section id="tab-devices" class="tab">
-      <div class="card">
-        <h2>Dispositivos WGPU</h2>
-        <ul id="devices-list"></ul>
-      </div>
-    </section>
-  </main>
-
-  <script src="/app.js"></script>
+<body class="bg-slate-950">
+  <div id="app"></div>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>

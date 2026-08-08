@@ -43,13 +43,14 @@ struct AppState {
     registry: Arc<JobRegistry>,
 }
 
-fn check_token(server: &ServerState, headers: &HeaderMap) -> Result<(), Response> {
+fn check_token(server: &ServerState, headers: &HeaderMap, query: Option<&str>) -> Result<(), Response> {
     let expected = server.token.read().unwrap().clone();
     if let Some(expected) = expected {
         let provided = headers
             .get("x-api-token")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| query_token(query).unwrap_or_default());
         if provided != expected {
             return Err((
                 StatusCode::UNAUTHORIZED,
@@ -59,6 +60,17 @@ fn check_token(server: &ServerState, headers: &HeaderMap) -> Result<(), Response
         }
     }
     Ok(())
+}
+
+fn query_token(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if parts.next() == Some("token") {
+            return parts.next().map(|v| v.to_string());
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +87,7 @@ async fn devices(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<DeviceInfo>>, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
     Ok(Json(vec![
         DeviceInfo { name: "DefaultDevice".into() },
         DeviceInfo { name: "DiscreteGpu(0)".into() },
@@ -115,26 +127,77 @@ fn list_entries(dir: &Path, exts: &[&str], relative: bool) -> Vec<String> {
 
 #[allow(clippy::unused_async)]
 async fn datasets(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<String>>, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
     Ok(Json(list_entries(&state.server.datasets_dir, &["txt", "bin"], true)))
 }
 
+#[derive(Serialize)]
+struct ModelInfo {
+    dir: String,
+    name: String,
+    n_embd: usize,
+    n_head: usize,
+    n_layer: usize,
+    n_ctx: usize,
+    vocab: usize,
+    params_m: f64,
+    size_mb: f64,
+    default: bool,
+}
+
+fn model_meta(dir: &Path) -> Option<ModelInfo> {
+    let config_path = dir.join("config.json");
+    let weights_path = dir.join("model_weights.bin");
+    if !config_path.is_file() || !weights_path.is_file() {
+        return None;
+    }
+    let cfg: crate::config::ModelConfig = serde_json::from_str(&std::fs::read_to_string(config_path).ok()?).ok()?;
+    let size_mb = weights_path.metadata().ok()?.len() as f64 / (1024.0 * 1024.0);
+
+    let n_embd = cfg.n_embd;
+    let n_head = cfg.n_head;
+    let n_kv_head = cfg.get_n_kv_head();
+    let head_dim = n_embd / n_head;
+    let kv_dim = n_kv_head * head_dim;
+    let hidden = ((8 * n_embd) / 3).div_ceil(256) * 256;
+    let embed = cfg.vocab_size * n_embd;
+    let q = n_embd * n_embd + n_embd;
+    let k = n_embd * kv_dim + kv_dim;
+    let v = n_embd * kv_dim + kv_dim;
+    let o = n_embd * n_embd;
+    let block = n_embd + q + k + v + o + n_embd + n_embd * hidden + n_embd * hidden + hidden * n_embd;
+    let params = embed + cfg.n_layer * block + n_embd;
+
+    Some(ModelInfo {
+        dir: dir.to_string_lossy().to_string(),
+        name: dir.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        n_embd,
+        n_head,
+        n_layer: cfg.n_layer,
+        n_ctx: cfg.n_ctx,
+        vocab: cfg.vocab_size,
+        params_m: params as f64 / 1_000_000.0,
+        size_mb,
+        default: dir.file_name().unwrap_or_default() == "model_output",
+    })
+}
+
 #[allow(clippy::unused_async)]
-async fn models(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<String>>, Response> {
-    check_token(&state.server, &headers)?;
-    let mut out = list_entries(&state.server.models_dir, &["json"], false);
+async fn models(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<ModelInfo>>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let mut out: Vec<ModelInfo> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&state.server.models_dir) {
         for e in rd.flatten() {
-            if e.path().is_dir() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.starts_with("model_output") || name.starts_with("checkpoint") {
-                    out.push(format!("{}/config.json", e.path().to_string_lossy()));
-                }
+            let dir = e.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Some(info) = model_meta(&dir) {
+                out.push(info);
             }
         }
     }
-    out.sort();
-    out.dedup();
+    out.sort_by(|a, b| b.default.cmp(&a.default).then(a.name.cmp(&b.name)));
     Ok(Json(out))
 }
 
@@ -200,7 +263,7 @@ async fn train(
     headers: HeaderMap,
     Json(req): Json<TrainRequest>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
 
     let file_path = {
         let p = Path::new(&req.file);
@@ -268,7 +331,7 @@ struct StatusResponse {
 
 #[allow(clippy::unused_async)]
 async fn train_status(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<StatusResponse>, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
     let job = state.server.job.read().unwrap().clone();
     Ok(Json(StatusResponse {
         running: job.running,
@@ -281,7 +344,7 @@ async fn train_status(State(state): State<AppState>, headers: HeaderMap) -> Resu
 
 #[allow(clippy::unused_async)]
 async fn train_stop(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
     {
         let mut job = state.server.job.write().unwrap();
         job.stopping = true;
@@ -304,7 +367,7 @@ async fn train_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
     Ok(Sse::new(event_stream(state.server.clone()))
         .keep_alive(KeepAlive::default())
         .into_response())
@@ -319,8 +382,9 @@ async fn download(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(path): AxumPath<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, query.get("token").map(|s| s.as_str()))?;
     let p = Path::new(&path);
     if !p.exists() {
         return Err((StatusCode::NOT_FOUND, "not found").into_response());
@@ -373,7 +437,7 @@ async fn generate_text(
     headers: HeaderMap,
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
 
     let model_dir = if req.model_dir.is_empty() {
         state.server.models_dir.join("model_output")
@@ -475,7 +539,7 @@ async fn export_model(
     headers: HeaderMap,
     Json(req): Json<ExportRequest>,
 ) -> Result<Json<serde_json::Value>, Response> {
-    check_token(&state.server, &headers)?;
+    check_token(&state.server, &headers, None)?;
 
     let model_dir = if req.model_dir.is_empty() {
         state.server.models_dir.join("model_output")
