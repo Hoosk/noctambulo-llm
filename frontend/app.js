@@ -252,8 +252,78 @@
   }
 
   initChart();
+  // ---------- Generate & Export ----------
+  async function loadModels() {
+    try {
+      const models = await api("/api/models");
+      const opts = models
+        .filter((m) => m.includes("config.json") && (m.includes("model_output") || m.startsWith(".")))
+        .map((m) => {
+          const dir = m.replace(/\/config\.json$/, "").replace(/^\.\//, "");
+          return `<option value="${dir}">${dir}</option>`;
+        })
+        .join("");
+      document.getElementById("gen-model").innerHTML = opts;
+      document.getElementById("exp-model").innerHTML = opts;
+    } catch (e) {
+      console.error("load models", e);
+    }
+  }
+
+  async function doGenerate() {
+    const msg = document.getElementById("gen-msg");
+    const result = document.getElementById("gen-result");
+    const body = {
+      modelDir: document.getElementById("gen-model").value,
+      prompt: document.getElementById("gen-prompt").value,
+      maxTokens: Number(document.getElementById("gen-maxTokens").value),
+      temperature: Number(document.getElementById("gen-temp").value),
+      topK: Number(document.getElementById("gen-topk").value),
+      topP: Number(document.getElementById("gen-topp").value),
+      minP: Number(document.getElementById("gen-minp").value),
+      repetitionPenalty: Number(document.getElementById("gen-rep").value),
+    };
+    try {
+      msg.textContent = "Generando...";
+      msg.className = "msg ok";
+      const r = await api("/api/generate", { method: "POST", headers: headers(true), body: JSON.stringify(body) });
+      result.textContent = r.text;
+      msg.textContent = "OK";
+      msg.className = "msg ok";
+    } catch (e) {
+      msg.textContent = "Error: " + e.message;
+      msg.className = "msg err";
+    }
+  }
+
+  async function doExport() {
+    const msg = document.getElementById("exp-msg");
+    const result = document.getElementById("exp-result");
+    const body = {
+      modelDir: document.getElementById("exp-model").value,
+      modelName: document.getElementById("exp-name").value || "kuro-neko",
+    };
+    try {
+      msg.textContent = "Exportando...";
+      msg.className = "msg ok";
+      const r = await api("/api/export", { method: "POST", headers: headers(true), body: JSON.stringify(body) });
+      result.textContent = r.gguf;
+      msg.textContent = "Listo. Descarga: " + r.gguf;
+      msg.className = "msg ok";
+    } catch (e) {
+      msg.textContent = "Error: " + e.message;
+      msg.className = "msg err";
+    }
+  }
+
+  // ---------- Init ----------
+  initChart();
   loadOptions();
+  loadModels();
   connectSSE();
   pollStatus();
   ping();
+
+  document.getElementById("gen-btn").addEventListener("click", doGenerate);
+  document.getElementById("exp-btn").addEventListener("click", doExport);
 })();

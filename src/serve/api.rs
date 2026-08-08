@@ -29,6 +29,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/train/stop", post(train_stop))
         .route("/api/train/stream", get(train_stream))
         .route("/api/download/{path}", get(download))
+        .route("/api/generate", post(generate_text))
+        .route("/api/export", post(export_model))
         .with_state(AppState {
             server: state,
             registry,
@@ -333,4 +335,192 @@ async fn download(
         bytes,
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Generate
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerateRequest {
+    model_dir: String,
+    prompt: String,
+    #[serde(default = "default_max_new_tokens")]
+    max_tokens: usize,
+    #[serde(default = "default_temp")]
+    temperature: f32,
+    #[serde(default = "default_topk")]
+    top_k: usize,
+    #[serde(default = "default_topp")]
+    top_p: f32,
+    #[serde(default = "default_minp")]
+    min_p: f32,
+    #[serde(default = "default_rep")]
+    repetition_penalty: f32,
+}
+
+fn default_max_new_tokens() -> usize { 60 }
+fn default_temp() -> f32 { 0.8 }
+fn default_topk() -> usize { 40 }
+fn default_topp() -> f32 { 0.9 }
+fn default_minp() -> f32 { 0.05 }
+fn default_rep() -> f32 { 1.2 }
+
+#[allow(clippy::unused_async)]
+async fn generate_text(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<GenerateRequest>,
+) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers)?;
+
+    let model_dir = if req.model_dir.is_empty() {
+        state.server.models_dir.join("model_output")
+    } else {
+        Path::new(&req.model_dir).to_path_buf()
+    };
+
+    let state_models = state.server.models_dir.clone();
+    let model_dir = if model_dir.is_absolute() {
+        model_dir
+    } else if model_dir.exists() {
+        model_dir
+    } else {
+        state_models.join(model_dir)
+    };
+
+    let prompt = req.prompt;
+    let max_tokens = req.max_tokens;
+    let temperature = req.temperature;
+    let top_k = req.top_k;
+    let top_p = req.top_p;
+    let min_p = req.min_p;
+    let rep = req.repetition_penalty;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    std::thread::spawn(move || {
+        let result = run_generate(model_dir, &prompt, max_tokens, temperature, top_k, top_p, min_p, rep);
+        let _ = tx.send(result);
+    });
+
+    match rx.recv() {
+        Ok(Ok(text)) => Ok(Json(serde_json::json!({ "text": text }))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "generate thread died" }))).into_response()),
+    }
+}
+
+fn run_generate(
+    model_dir: std::path::PathBuf,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    rep: f32,
+) -> Result<String, String> {
+    use burn::backend::Wgpu;
+    use burn::module::Module;
+    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+    let config_path = model_dir.join("config.json");
+    let weights_path = model_dir.join("model_weights");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
+    let config: crate::config::ModelConfig =
+        serde_json::from_str(&config_str).map_err(|e| format!("bad config: {e}"))?;
+
+    let tokenizer_path = "custom_tokenizer.json";
+    let tokenizer = crate::data::LlmTokenizer::from_file(tokenizer_path)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+
+    let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
+    let model: crate::model::Llm<Wgpu> = config.init_model(&device);
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let record = recorder
+        .load(weights_path.clone(), &device)
+        .map_err(|e| format!("failed to load weights: {e:?}"))?;
+    let model = model.load_record(record);
+
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(42);
+
+    crate::generate::generate(
+        &model, &tokenizer, prompt, max_tokens, temperature, top_k, top_p, min_p, rep, seed, &device,
+    )
+    .map_err(|e| format!("generate error: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportRequest {
+    model_dir: String,
+    #[serde(default = "default_model_name")]
+    model_name: String,
+}
+
+fn default_model_name() -> String { "kuro-neko".into() }
+
+#[allow(clippy::unused_async)]
+async fn export_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ExportRequest>,
+) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers)?;
+
+    let model_dir = if req.model_dir.is_empty() {
+        state.server.models_dir.join("model_output")
+    } else {
+        Path::new(&req.model_dir).to_path_buf()
+    };
+    let model_dir = if model_dir.is_absolute() || model_dir.exists() {
+        model_dir
+    } else {
+        state.server.models_dir.join(model_dir)
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let name = req.model_name;
+    std::thread::spawn(move || {
+        let _ = tx.send(run_export(model_dir, &name));
+    });
+
+    match rx.recv() {
+        Ok(Ok(path)) => Ok(Json(serde_json::json!({ "gguf": path }))),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "export thread died" }))).into_response()),
+    }
+}
+
+fn run_export(model_dir: std::path::PathBuf, model_name: &str) -> Result<String, String> {
+    use burn::backend::Wgpu;
+    use burn::module::Module;
+    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+    let config_path = model_dir.join("config.json");
+    let weights_path = model_dir.join("model_weights");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
+    let config: crate::config::ModelConfig =
+        serde_json::from_str(&config_str).map_err(|e| format!("bad config: {e}"))?;
+
+    let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
+    let model: crate::model::Llm<Wgpu> = config.init_model(&device);
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let record = recorder
+        .load(weights_path.clone(), &device)
+        .map_err(|e| format!("failed to load weights: {e:?}"))?;
+    let model = model.load_record(record);
+
+    crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported")
+        .map_err(|e| format!("export error: {e}"))
 }

@@ -13,6 +13,8 @@
     <div id="conn-status" class="status-dot"></div>
     <nav>
       <button class="tab-btn active" data-tab="train">Train</button>
+      <button class="tab-btn" data-tab="generate">Generate</button>
+      <button class="tab-btn" data-tab="export">Export</button>
       <button class="tab-btn" data-tab="devices">Devices</button>
     </nav>
   </header>
@@ -82,6 +84,56 @@
           <h3>Preview</h3>
           <pre id="m-preview">—</pre>
         </div>
+      </div>
+    </section>
+
+    <!-- ============ TAB GENERATE ============ -->
+    <section id="tab-generate" class="tab">
+      <div class="card">
+        <h2>Generar texto</h2>
+        <label>Modelo
+          <select id="gen-model"></select>
+        </label>
+        <label>Prompt
+          <textarea id="gen-prompt" rows="3" placeholder="Once upon a time..."></textarea>
+        </label>
+        <div class="row">
+          <label>Max tokens <input type="number" id="gen-maxTokens" value="60" min="1" /></label>
+          <label>Temp <input type="number" id="gen-temp" value="0.8" step="0.05" min="0" max="2" /></label>
+        </div>
+        <div class="row">
+          <label>Top-K <input type="number" id="gen-topk" value="40" min="1" /></label>
+          <label>Top-P <input type="number" id="gen-topp" value="0.9" step="0.05" min="0" max="1" /></label>
+        </div>
+        <div class="row">
+          <label>Min-P <input type="number" id="gen-minp" value="0.05" step="0.01" min="0" max="1" /></label>
+          <label>Repetition <input type="number" id="gen-rep" value="1.2" step="0.05" min="1" /></label>
+        </div>
+        <div class="actions">
+          <button type="button" id="gen-btn" class="primary">▶ Generar</button>
+        </div>
+        <p id="gen-msg" class="msg"></p>
+        <h3>Resultado</h3>
+        <pre id="gen-result">—</pre>
+      </div>
+    </section>
+
+    <!-- ============ TAB EXPORT ============ -->
+    <section id="tab-export" class="tab">
+      <div class="card">
+        <h2>Exportar a GGUF</h2>
+        <label>Modelo
+          <select id="exp-model"></select>
+        </label>
+        <label>Nombre del GGUF
+          <input type="text" id="exp-name" value="kuro-neko" />
+        </label>
+        <div class="actions">
+          <button type="button" id="exp-btn" class="primary">📦 Exportar</button>
+        </div>
+        <p id="exp-msg" class="msg"></p>
+        <h3>Resultado</h3>
+        <pre id="exp-result">—</pre>
       </div>
     </section>
 

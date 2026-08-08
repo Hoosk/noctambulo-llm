@@ -60,12 +60,14 @@ main { padding: 24px; max-width: 1200px; margin: 0 auto; }
 .card h3 { font-size: 14px; margin: 16px 0 8px; }
 
 form label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 10px; }
-form input, form select {
+form input, form select, form textarea {
   width: 100%; margin-top: 4px;
   background: #12151d; color: var(--text);
   border: 1px solid var(--border); border-radius: 6px;
   padding: 8px; font-size: 13px;
+  font-family: inherit;
 }
+form textarea { resize: vertical; }
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
 .actions { display: flex; gap: 10px; margin-top: 12px; }
