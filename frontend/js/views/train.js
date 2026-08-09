@@ -125,6 +125,19 @@ export default class TrainView {
 
     const msg = el("p", { id: "train-msg", class: "text-sm text-slate-400 mt-3" }, "");
 
+    const resumeCheckbox = el("input", {
+      id: "train-resume",
+      type: "checkbox",
+      class: "accent-violet-500",
+      onchange: (e) => this.toggleResume(e.target.checked),
+    });
+
+    const resumeSelect = el("select", {
+      id: "train-resume-cp",
+      class: `${inputCls} mt-2 disabled:opacity-40 disabled:cursor-not-allowed`,
+      disabled: true,
+    }, el("option", { value: "" }, "— selecciona checkpoint —"));
+
     const card = el("div", { class: "min-w-0 rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
       el("h3", { class: "text-sm font-medium text-slate-300 mb-4" }, "Configuración"),
       el("label", { class: "block text-xs text-slate-400 mb-3" }, ["Dataset", dsSel]),
@@ -145,11 +158,64 @@ export default class TrainView {
         textField("Save dir", "train-saveDir", "checkpoints_web"),
         textField("Output dir", "train-outputDir", "model_output"),
       ]),
+      el("div", { class: "mt-3" }, [
+        el("label", { class: "flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none" }, [
+          resumeCheckbox,
+          "Reanudar desde checkpoint",
+        ]),
+        resumeSelect,
+      ]),
       el("div", { class: "flex gap-3 mt-5" }, [startBtn, pauseBtn, stopBtn]),
       msg,
     ]);
 
+    this.fields["train-resume"] = resumeCheckbox;
+    this.fields["train-resume-cp"] = resumeSelect;
+
+    const saveDirField = this.fields["train-saveDir"];
+    if (saveDirField) {
+      saveDirField.addEventListener("change", () => {
+        if (this.fields["train-resume"]?.checked) {
+          this.refreshCheckpoints();
+        }
+      });
+    }
+
     return card;
+  }
+
+  // Enable/disable the checkpoint selector and load the file list from the
+  // "Save dir" field when the user ticks "Reanudar desde checkpoint".
+  async toggleResume(enabled) {
+    const select = this.fields["train-resume-cp"];
+    if (!select) return;
+    select.disabled = !enabled;
+    if (enabled) {
+      await this.refreshCheckpoints();
+    }
+  }
+
+  async refreshCheckpoints() {
+    const select = this.fields["train-resume-cp"];
+    const saveDir = this.fields["train-saveDir"]?.value || "checkpoints_web";
+    if (!select) return;
+    select.innerHTML = "";
+    select.append(el("option", { value: "" }, "— selecciona checkpoint —"));
+    try {
+      const cps = await api.getCheckpoints(saveDir);
+      if (!cps || cps.length === 0) {
+        select.append(el("option", { value: "" }, "sin checkpoints en " + saveDir));
+        select.disabled = true;
+        return;
+      }
+      for (const cp of cps) {
+        select.append(el("option", { value: cp.path }, `${cp.name} · ${fmtBytes(cp.size_bytes)}`));
+      }
+      select.disabled = false;
+    } catch (e) {
+      select.append(el("option", { value: "" }, `error: ${e.message}`));
+      select.disabled = true;
+    }
   }
 
   // --------------------------------------------------------------- metrics
@@ -195,6 +261,8 @@ export default class TrainView {
 
     let body;
     try {
+      const resumeOn = this.fields["train-resume"]?.checked;
+      const resumePath = this.fields["train-resume-cp"]?.value || "";
       body = {
         file: read("train-dataset").value,
         device: read("train-device").value,
@@ -210,6 +278,7 @@ export default class TrainView {
         gradAccum: Number(read("train-gradAccum").value),
         saveDir: read("train-saveDir").value,
         outputDir: read("train-outputDir").value,
+        resume: resumeOn && resumePath ? resumePath : undefined,
       };
     } catch (e) {
       msg.textContent = `Error de configuración: ${e.message}`;

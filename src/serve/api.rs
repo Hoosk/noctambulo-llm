@@ -30,6 +30,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/datasets/info/{name}", get(dataset_info))
         .route("/api/datasets/delete/{name}", axum::routing::delete(dataset_delete))
         .route("/api/models", get(models))
+        .route("/api/checkpoints", get(checkpoints))
         .route("/api/train", post(train))
         .route("/api/train/status", get(train_status))
         .route("/api/train/logs", get(train_logs))
@@ -632,6 +633,58 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> Result<Jso
         }
     }
     out.sort_by(|a, b| b.default.cmp(&a.default).then(a.name.cmp(&b.name)));
+    Ok(Json(out))
+}
+
+#[derive(Serialize)]
+struct CheckpointInfo {
+    name: String,
+    path: String,
+    size_bytes: u64,
+    modified_unix: u64,
+}
+
+/// List `.bin` checkpoint files inside a user-provided directory (default
+/// `checkpoints_web`). Path is resolved against the server working directory.
+#[allow(clippy::unused_async)]
+async fn checkpoints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<CheckpointInfo>>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let dir = query.get("dir").map(String::as_str).unwrap_or("checkpoints_web");
+    let dir = Path::new(dir);
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext = p.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if ext != "bin" {
+                continue;
+            }
+            let meta = match p.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            out.push(CheckpointInfo {
+                name: e.file_name().to_string_lossy().to_string(),
+                path: p.to_string_lossy().to_string(),
+                size_bytes: meta.len(),
+                modified_unix: modified,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.modified_unix.cmp(&a.modified_unix));
     Ok(Json(out))
 }
 

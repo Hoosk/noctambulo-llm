@@ -61,6 +61,9 @@ export const api = {
   getLogs(since = 0) {
     return request(`/api/train/logs?since=${since}`);
   },
+  getCheckpoints(dir = "checkpoints_web") {
+    return request(`/api/checkpoints?dir=${encodeURIComponent(dir)}`);
+  },
   post(path, body) {
     return request(path, { method: "POST", json: true, body: JSON.stringify(body) });
   },
