@@ -73,17 +73,17 @@ function renderTokenGate() {
 function mountLayout() {
   document.getElementById("app").innerHTML = `
     <div class="min-h-screen bg-slate-950 text-slate-200 flex flex-col">
-      <header class="flex items-center gap-4 px-6 py-4 border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-20">
+      <header class="flex flex-wrap items-center gap-3 px-4 sm:px-6 py-3 border-b border-slate-800 bg-slate-900/60 backdrop-blur sticky top-0 z-20">
         <span class="text-2xl">🐈‍⬛</span>
         <h1 class="text-lg font-semibold text-white tracking-tight">Kuro-Neko</h1>
         <span id="conn-badge" class="ml-1 text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">conectando…</span>
-        <nav class="ml-auto flex gap-1">
-          <button data-view="train" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Entrenar</button>
-          <button data-view="datasets" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Datasets</button>
-          <button data-view="generate" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Generar</button>
-          <button data-view="export" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Exportar</button>
-          <button data-view="models" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Modelos</button>
-          <button data-view="devices" class="view-btn px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">GPU</button>
+        <nav class="order-3 flex w-full min-w-0 gap-1 overflow-x-auto pb-1 sm:order-none sm:ml-auto sm:w-auto sm:pb-0">
+          <button data-view="train" class="view-btn shrink-0 px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Entrenar</button>
+          <button data-view="datasets" class="view-btn shrink-0 px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Datasets</button>
+          <button data-view="generate" class="view-btn shrink-0 px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Generar</button>
+          <button data-view="export" class="view-btn shrink-0 px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Exportar</button>
+          <button data-view="models" class="view-btn shrink-0 px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">Modelos</button>
+          <button data-view="devices" class="view-btn shrink-0 px-3 py-1.5 rounded-lg text-sm text-slate-400 hover:text-white hover:bg-slate-800 transition">GPU</button>
         </nav>
       </header>
       <main id="view-root" class="flex-1 px-6 py-6 max-w-6xl w-full mx-auto"></main>

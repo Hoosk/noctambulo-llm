@@ -28,7 +28,7 @@ export default class TrainView {
     const right = this.buildMetrics();
 
     this.root.append(
-      el("div", { class: "grid grid-cols-1 lg:grid-cols-[380px_1fr] gap-6" }, [
+      el("div", { class: "grid min-w-0 grid-cols-1 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)] gap-6" }, [
         left,
         right,
       ]),
@@ -94,7 +94,7 @@ export default class TrainView {
 
     const msg = el("p", { id: "train-msg", class: "text-sm text-slate-400 mt-3" }, "");
 
-    const card = el("div", { class: "rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
+    const card = el("div", { class: "min-w-0 rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
       el("h3", { class: "text-sm font-medium text-slate-300 mb-4" }, "Configuración"),
       el("label", { class: "block text-xs text-slate-400 mb-3" }, ["Dataset", dsSel]),
       el("label", { class: "block text-xs text-slate-400 mb-4" }, ["Dispositivo", devSel]),
@@ -123,9 +123,9 @@ export default class TrainView {
 
   // --------------------------------------------------------------- metrics
   buildMetrics() {
-    const statCards = el("div", { id: "train-stats", class: "grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4" });
+    const statCards = el("div", { id: "train-stats", class: "grid min-w-0 grid-cols-2 sm:grid-cols-3 gap-3 mb-4" });
 
-    const card = el("div", { class: "rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
+    const card = el("div", { class: "min-w-0 rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
       el("div", { class: "flex items-center justify-between mb-4" }, [
         el("h3", { class: "text-sm font-medium text-slate-300" }, "Métricas en vivo"),
         el("span", { id: "train-status-badge", class: "text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400" }, "idle"),
@@ -189,11 +189,11 @@ export default class TrainView {
     }
 
     this.busy = true;
+    this.chart.reset();
     msg.textContent = "Iniciando…";
     msg.className = "text-sm text-violet-300 mt-3";
     try {
       const res = await api.post("/api/train", body);
-      this.chart.reset();
       msg.textContent = res.jobId ? `Entrenamiento iniciado (${res.jobId})` : "Entrenamiento iniciado";
       msg.className = "text-sm text-emerald-300 mt-3";
     } catch (e) {
@@ -248,6 +248,11 @@ export default class TrainView {
     const startBtn = document.getElementById("train-start");
     const stopBtn = document.getElementById("train-stop");
     const pauseBtn = document.getElementById("train-pause");
+
+    const epochsField = this.fields["train-epochs"];
+    if (epochsField && job.status === JobState.RUNNING && job.epochs > 0) {
+      epochsField.value = String(job.epochs);
+    }
 
     if (badge) {
       const map = {

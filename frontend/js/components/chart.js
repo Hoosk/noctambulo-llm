@@ -6,7 +6,7 @@ import { el } from "../core/dom.js";
 
 export default class LossChart {
   constructor() {
-    this.history = []; // {step, loss}
+    this.history = []; // {x: step, y: loss}
     this.chart = null;
     this.canvas = null;
   }
@@ -35,7 +35,8 @@ export default class LossChart {
             backgroundColor: "rgba(139,92,246,0.08)",
             fill: true,
             tension: 0.3,
-            pointRadius: 0,
+            pointRadius: 2,
+            pointHoverRadius: 4,
             borderWidth: 2,
           },
         ],
@@ -72,7 +73,13 @@ export default class LossChart {
   }
 
   addPoint(step, loss) {
-    this.history.push({ step, loss });
+    const point = { x: step, y: loss };
+    const previous = this.history[this.history.length - 1];
+    if (previous && previous.x === point.x) {
+      previous.y = point.y;
+    } else {
+      this.history.push(point);
+    }
     if (this.history.length > 1000) this.history.shift();
     if (this.chart) {
       this.chart.data.datasets[0].data = this.history;

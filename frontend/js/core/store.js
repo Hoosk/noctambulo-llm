@@ -51,10 +51,18 @@ export function handleTrainingEvent(ev) {
       set({
         status: JobState.RUNNING,
         epochs: v.epochs,
+        epoch: 0,
+        batch: 0,
+        numBatches: v.num_batches,
+        pct: 0,
         step: 0,
         loss: null,
         avgLoss: null,
+        batchesPerSec: null,
+        elapsedSecs: 0,
+        etaSecs: null,
         valPpl: null,
+        valLoss: null,
         preview: "",
         message: "Entrenamiento iniciado",
       });
@@ -68,8 +76,8 @@ export function handleTrainingEvent(ev) {
         numBatches: v.num_batches,
         step: v.step,
         pct: v.pct,
-        loss: v.loss,
-        avgLoss: v.avg_loss,
+        loss: metricOrNull(v.loss),
+        avgLoss: metricOrNull(v.avg_loss),
         lr: v.lr,
         batchesPerSec: v.batches_per_sec,
         elapsedSecs: v.elapsed_secs,
@@ -95,6 +103,12 @@ export function handleTrainingEvent(ev) {
     default:
       break;
   }
+}
+
+// The trainer reports progress between loss-sync intervals. During that
+// window its provisional loss is zero, which is not a real metric.
+function metricOrNull(value) {
+  return Number.isFinite(value) && value > 0 ? value : null;
 }
 
 // Wire SSE events into the store once.
