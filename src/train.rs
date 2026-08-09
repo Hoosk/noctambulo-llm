@@ -124,7 +124,7 @@ impl TextDataset {
 
 /// Event emitted by the training loop, consumed either by the CLI (prints) or
 /// by the web server (SSE / live metrics).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub enum TrainingEvent {
     Started {
@@ -158,7 +158,7 @@ pub enum TrainingEvent {
     },
     Checkpoint {
         path: String,
-        kind: &'static str,
+        kind: String,
         epoch: usize,
         batch: usize,
     },
@@ -270,7 +270,7 @@ pub fn train<B: AutodiffBackend>(
                     println!("\n   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", loss, ppl);
                 }
                 TrainingEvent::Checkpoint { path, kind, .. } => {
-                    if *kind == "best" {
+                    if kind == "best" {
                         println!("   ★ New best val_loss → {:?}", path);
                     } else {
                         println!("Saved checkpoint: {:?}", path);
@@ -589,7 +589,7 @@ pub fn train_with_events<B: AutodiffBackend>(
                         emit_log(tx, format!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin")));
                         let _ = tx.send(TrainingEvent::Checkpoint {
                             path: best_path.with_extension("bin").to_string_lossy().to_string(),
-                            kind: "best",
+                            kind: "best".into(),
                             epoch,
                             batch: 0,
                         });
@@ -608,7 +608,7 @@ pub fn train_with_events<B: AutodiffBackend>(
                 emit_log(tx, format!("Saved checkpoint: {:?}", ckpt_path.with_extension("bin")));
                 let _ = tx.send(TrainingEvent::Checkpoint {
                     path: ckpt_path.with_extension("bin").to_string_lossy().to_string(),
-                    kind: "epoch",
+                    kind: "epoch".into(),
                     epoch,
                     batch: 0,
                 });

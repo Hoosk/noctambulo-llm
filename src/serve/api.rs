@@ -762,6 +762,7 @@ struct StatusResponse {
     job_id: String,
     message: Option<String>,
     last_event: Option<TrainingEvent>,
+    loss_points: Vec<crate::serve::state::LossPoint>,
 }
 
 #[allow(clippy::unused_async)]
@@ -775,6 +776,7 @@ async fn train_status(State(state): State<AppState>, headers: HeaderMap) -> Resu
         job_id: job.job_id,
         message: job.message,
         last_event: job.last_event,
+        loss_points: state.server.loss_points_snapshot(),
     }))
 }
 

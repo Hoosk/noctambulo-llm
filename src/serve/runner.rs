@@ -135,17 +135,24 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
                     job.running = false;
                 }
             }
-            if let TrainingEvent::LogEvent { line, ts } = &event {
-                forwarder_state.push_log(line.clone(), *ts);
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{line}");
+            match &event {
+                TrainingEvent::LogEvent { line, ts } => {
+                    forwarder_state.push_log(line.clone(), *ts);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{line}");
+                    }
                 }
+                TrainingEvent::Progress { step, loss, .. } => {
+                    forwarder_state.push_loss_point(*step, *loss);
+                }
+                _ => {}
             }
+            forwarder_state.persist();
             let _ = forwarder_events.send(event);
         }
     });

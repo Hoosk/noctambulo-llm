@@ -31,6 +31,7 @@ const store = {
   preview: "",
   jobId: "",
   message: "",
+  lossPoints: [],
 };
 
 export function getJob() {
@@ -132,6 +133,12 @@ export function pollStatus() {
       // Reflect paused state even if no new event arrived.
       if (s.paused !== store.paused) {
         set({ paused: s.paused, message: s.paused ? "Entrenamiento pausado" : "Entrenamiento reanudado" });
+      }
+
+      // Chart backfill: after a reload/restart the server may hold loss
+      // history for the last job. Expose it so TrainView can repopulate.
+      if (Array.isArray(s.loss_points) && s.loss_points.length !== store.lossPoints.length) {
+        set({ lossPoints: s.loss_points });
       }
 
       const ev = s.last_event;

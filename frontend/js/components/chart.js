@@ -95,6 +95,18 @@ export default class LossChart {
     }
   }
 
+  // Repopulate the curve from persisted/backfilled points ({x, y}) without
+  // wiping it on reloads. Call before the first live addPoint.
+  setHistory(points) {
+    if (!Array.isArray(points) || points.length === 0) return;
+    this.history = points.slice();
+    if (this.history.length > 1000) this.history.splice(0, this.history.length - 1000);
+    if (this.chart) {
+      this.chart.data.datasets[0].data = this.history;
+      this.chart.update("none");
+    }
+  }
+
   destroy() {
     if (this.chart) {
       this.chart.destroy();

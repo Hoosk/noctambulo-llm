@@ -43,6 +43,10 @@ frontend/dist/
 .opencode/
 .agents/
 
+# Estado del servidor web
+.kuro/
+logs/
+
 # OS y módulos del sistema
 .DS_Store
 Thumbs.db

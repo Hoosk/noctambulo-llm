@@ -39,6 +39,10 @@ export default class TrainView {
 
     // Chart.js must init after the canvas is in the DOM.
     this.chart.attach();
+    const job = getJob();
+    if (job.lossPoints && job.lossPoints.length > 0) {
+      this.chart.setHistory(job.lossPoints);
+    }
     this.sync();
     this.startLogPolling();
   }
