@@ -14,6 +14,9 @@ export default class TrainView {
     this.busy = false;
 
     on("job:changed", () => this.sync());
+
+    this.logSince = 0;
+    this.logTimer = null;
   }
 
   async render() {
@@ -37,6 +40,30 @@ export default class TrainView {
     // Chart.js must init after the canvas is in the DOM.
     this.chart.attach();
     this.sync();
+    this.startLogPolling();
+  }
+
+  startLogPolling() {
+    if (this.logTimer) return;
+    this.logTimer = setInterval(() => this.tickLogs(), 1000);
+    this.tickLogs();
+  }
+
+  async tickLogs() {
+    const view = document.getElementById("train-log");
+    if (!view) return;
+    try {
+      const res = await api.getLogs(this.logSince);
+      if (res && res.lines && res.lines.length > 0) {
+        for (const l of res.lines) {
+          view.textContent += l.line + "\n";
+        }
+        this.logSince = res.total;
+        view.scrollTop = view.scrollHeight;
+      }
+    } catch {
+      /* ignore transient errors */
+    }
   }
 
   // ------------------------------------------------------------------ form
@@ -141,6 +168,10 @@ export default class TrainView {
       el("div", { class: "mt-5" }, [
         el("h4", { class: "text-xs font-medium text-slate-400 mb-2" }, "Preview"),
         el("pre", { id: "train-preview", class: "p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs whitespace-pre-wrap text-slate-300 min-h-16" }, "—"),
+      ]),
+      el("details", { class: "mt-5", open: true }, [
+        el("summary", { class: "text-xs font-medium text-slate-400 cursor-pointer select-none" }, "Logs del worker"),
+        el("pre", { id: "train-log", class: "mt-2 p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono whitespace-pre-wrap text-slate-400 h-40 overflow-y-auto" }, ""),
       ]),
     ]);
 

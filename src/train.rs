@@ -183,6 +183,23 @@ pub enum TrainingEvent {
         epoch: usize,
         batch: usize,
     },
+    LogEvent {
+        line: String,
+        ts: u64,
+    },
+}
+
+/// Print a diagnostic line to the CLI and forward it as a `LogEvent` so the
+/// web UI can show it live (SSE + `/api/train/logs`).
+fn emit_log(tx: &Sender<TrainingEvent>, line: impl std::fmt::Display) {
+    println!("{line}");
+    let _ = tx.send(TrainingEvent::LogEvent {
+        line: line.to_string(),
+        ts: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
 }
 
 fn shuffle_indices(indices: &mut [usize], rng: &mut XorshiftRng) {
@@ -272,6 +289,7 @@ pub fn train<B: AutodiffBackend>(
                 TrainingEvent::Stopped { reason, .. } => {
                     println!("\n  ⏹ Training stopped: {}", reason);
                 }
+                TrainingEvent::LogEvent { .. } => {}
             }
             let _ = event;
         }
@@ -324,7 +342,7 @@ pub fn train_with_events<B: AutodiffBackend>(
 
     let (train_dataset, val_dataset) = if val_split > 0.0 {
         let (tr, va) = full_dataset.split(val_split);
-        println!("Dataset split: {} training samples, {} validation samples ({:.1}% val).", tr.len(), va.len(), val_split * 100.0);
+        emit_log(tx, format!("Dataset split: {} training samples, {} validation samples ({:.1}% val).", tr.len(), va.len(), val_split * 100.0));
         (tr, va)
     } else {
         (full_dataset, TextDataset { tokens: vec![], n_ctx: model_config.n_ctx, step: custom_step.unwrap_or(model_config.n_ctx) })
@@ -339,13 +357,13 @@ pub fn train_with_events<B: AutodiffBackend>(
         } else {
             res_path.to_path_buf()
         };
-        println!("Resuming model weights from {:?}...", rec_file);
+        emit_log(tx, format!("Resuming model weights from {:?}...", rec_file));
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         let record = recorder
             .load(rec_file.clone(), device)
             .map_err(|e| format!("Failed to load checkpoint from {:?}: {:?}", res_path, e))?;
         model = model.load_record(record);
-        println!("Successfully loaded checkpoint weights!");
+        emit_log(tx, "Successfully loaded checkpoint weights!");
     }
 
     let mut optim = AdamWConfig::new()
@@ -361,7 +379,7 @@ pub fn train_with_events<B: AutodiffBackend>(
     let grad_accum = grad_accum_steps.max(1);
 
     if seq_warmup_steps > 0 {
-        println!("Sequence Length Warmup active: scaling context length over the first {} steps.", seq_warmup_steps);
+        emit_log(tx, format!("Sequence Length Warmup active: scaling context length over the first {} steps.", seq_warmup_steps));
     }
 
     tui::print_training_header(
@@ -553,7 +571,7 @@ pub fn train_with_events<B: AutodiffBackend>(
 
         if val_dataset.len() > 0 {
             let (val_loss, val_ppl) = evaluate_dataset(&model.valid(), &val_dataset, effective_batch_size, device);
-            println!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl);
+            emit_log(tx, format!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl));
             let _ = tx.send(TrainingEvent::Val { loss: val_loss, ppl: val_ppl, epoch });
 
             let is_best = match best_val_loss {
@@ -566,9 +584,9 @@ pub fn train_with_events<B: AutodiffBackend>(
                     let best_path = s_dir.join("checkpoint_best");
                     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
                     if let Err(e) = recorder.record(model.clone().into_record(), best_path.clone()) {
-                        println!("Warning: Failed to save best checkpoint at {:?}: {:?}", best_path, e);
+                        emit_log(tx, format!("Warning: Failed to save best checkpoint at {:?}: {:?}", best_path, e));
                     } else {
-                        println!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin"));
+                        emit_log(tx, format!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin")));
                         let _ = tx.send(TrainingEvent::Checkpoint {
                             path: best_path.with_extension("bin").to_string_lossy().to_string(),
                             kind: "best",
@@ -585,9 +603,9 @@ pub fn train_with_events<B: AutodiffBackend>(
             let ckpt_path = s_dir.join(format!("checkpoint_epoch_{}", epoch));
             let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
             if let Err(e) = recorder.record(model.clone().into_record(), ckpt_path.clone()) {
-                println!("Warning: Failed to save checkpoint at {:?}: {:?}", ckpt_path, e);
+                emit_log(tx, format!("Warning: Failed to save checkpoint at {:?}: {:?}", ckpt_path, e));
             } else {
-                println!("Saved checkpoint: {:?}", ckpt_path.with_extension("bin"));
+                emit_log(tx, format!("Saved checkpoint: {:?}", ckpt_path.with_extension("bin")));
                 let _ = tx.send(TrainingEvent::Checkpoint {
                     path: ckpt_path.with_extension("bin").to_string_lossy().to_string(),
                     kind: "epoch",
@@ -811,6 +829,19 @@ mod tests {
         assert!(ctx_mid > ctx_start && ctx_mid < ctx_end);
         assert_eq!(ctx_end, target_ctx);
         assert_eq!(ctx_after, target_ctx);
+    }
+
+    #[test]
+    fn test_log_event_serialization() {
+        let ev = TrainingEvent::LogEvent {
+            line: "Dataset split: 100 training samples".into(),
+            ts: 1700000000,
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"LogEvent\""));
+        assert!(json.contains("\"line\""));
+        assert!(json.contains("\"ts\""));
+        assert!(json.contains("Dataset split"));
     }
 }
 

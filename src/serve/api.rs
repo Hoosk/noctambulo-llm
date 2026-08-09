@@ -32,6 +32,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/models", get(models))
         .route("/api/train", post(train))
         .route("/api/train/status", get(train_status))
+        .route("/api/train/logs", get(train_logs))
         .route("/api/train/stop", post(train_stop))
         .route("/api/train/pause", post(train_pause))
         .route("/api/train/resume", post(train_resume))
@@ -775,6 +776,27 @@ async fn train_status(State(state): State<AppState>, headers: HeaderMap) -> Resu
         message: job.message,
         last_event: job.last_event,
     }))
+}
+
+#[derive(Serialize)]
+struct LogsResponse {
+    lines: Vec<crate::serve::state::LogLine>,
+    total: usize,
+}
+
+#[allow(clippy::unused_async)]
+async fn train_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<LogsResponse>, Response> {
+    check_token(&state.server, &headers, None)?;
+    let since = query
+        .get("since")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let (lines, total) = state.server.log_since(since);
+    Ok(Json(LogsResponse { lines, total }))
 }
 
 #[allow(clippy::unused_async)]

@@ -58,6 +58,9 @@ export const api = {
   get(path) {
     return request(path);
   },
+  getLogs(since = 0) {
+    return request(`/api/train/logs?since=${since}`);
+  },
   post(path, body) {
     return request(path, { method: "POST", json: true, body: JSON.stringify(body) });
   },

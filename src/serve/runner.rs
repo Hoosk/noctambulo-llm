@@ -118,14 +118,32 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
     let forwarder_events = state.events.clone();
     let job_id_fwd = job_id.clone();
     let forwarder = std::thread::spawn(move || {
+        let log_path = {
+            std::fs::create_dir_all("logs").ok();
+            PathBuf::from("logs").join(format!("train_{}.log", job_id_fwd))
+        };
         while let Ok(event) = rx.recv() {
             {
                 let mut job = forwarder_state.job.write().unwrap();
                 job.running = true;
                 job.job_id = job_id_fwd.clone();
                 job.last_event = Some(event.clone());
-                if matches!(event, TrainingEvent::Done { .. } | TrainingEvent::Stopped { .. }) {
+                if matches!(
+                    event,
+                    TrainingEvent::Done { .. } | TrainingEvent::Stopped { .. }
+                ) {
                     job.running = false;
+                }
+            }
+            if let TrainingEvent::LogEvent { line, ts } = &event {
+                forwarder_state.push_log(line.clone(), *ts);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "{line}");
                 }
             }
             let _ = forwarder_events.send(event);
