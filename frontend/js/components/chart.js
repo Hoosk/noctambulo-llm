@@ -80,7 +80,7 @@ export default class LossChart {
     } else {
       this.history.push(point);
     }
-    if (this.history.length > 1000) this.history.shift();
+    if (this.history.length > 2000) this.history.shift();
     if (this.chart) {
       this.chart.data.datasets[0].data = this.history;
       this.chart.update("none");
@@ -100,7 +100,7 @@ export default class LossChart {
   setHistory(points) {
     if (!Array.isArray(points) || points.length === 0) return;
     this.history = points.slice();
-    if (this.history.length > 1000) this.history.splice(0, this.history.length - 1000);
+    if (this.history.length > 2000) this.history.splice(0, this.history.length - 2000);
     if (this.chart) {
       this.chart.data.datasets[0].data = this.history;
       this.chart.update("none");

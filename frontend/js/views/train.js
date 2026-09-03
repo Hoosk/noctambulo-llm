@@ -16,7 +16,10 @@ export default class TrainView {
     on("job:changed", () => this.sync());
 
     this.logSince = 0;
+    this.logLines = [];
     this.logTimer = null;
+    this._logBusy = false;
+    this._epochsSynced = false;
   }
 
   async render() {
@@ -43,6 +46,11 @@ export default class TrainView {
     if (job.lossPoints && job.lossPoints.length > 0) {
       this.chart.setHistory(job.lossPoints);
     }
+
+    // Reset the log cursor so re-rendering the view re-fetches the server's
+    // kept lines instead of showing only the delta since the previous visit.
+    this.logSince = 0;
+    this.logLines = [];
     this.sync();
     this.startLogPolling();
   }
@@ -55,18 +63,26 @@ export default class TrainView {
 
   async tickLogs() {
     const view = document.getElementById("train-log");
-    if (!view) return;
+    if (!view || this._logBusy) return;
+    this._logBusy = true;
     try {
       const res = await api.getLogs(this.logSince);
-      if (res && res.lines && res.lines.length > 0) {
+      if (res && Array.isArray(res.lines) && res.lines.length > 0) {
         for (const l of res.lines) {
-          view.textContent += l.line + "\n";
+          this.logLines.push(l.line);
+        }
+        // Cap client-side lines so long sessions cannot grow the DOM forever.
+        if (this.logLines.length > 800) {
+          this.logLines.splice(0, this.logLines.length - 800);
         }
         this.logSince = res.total;
+        view.textContent = this.logLines.join("\n");
         view.scrollTop = view.scrollHeight;
       }
     } catch {
       /* ignore transient errors */
+    } finally {
+      this._logBusy = false;
     }
   }
 
@@ -161,7 +177,7 @@ export default class TrainView {
       el("div", { class: "mt-3" }, [
         el("label", { class: "flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none" }, [
           resumeCheckbox,
-          "Reanudar desde checkpoint",
+          "Reanudar pesos desde checkpoint (warm start)",
         ]),
         resumeSelect,
       ]),
@@ -292,6 +308,16 @@ export default class TrainView {
       return;
     }
 
+    // Resume checked but no checkpoint selected: fail loudly instead of
+    // silently training from scratch.
+    const resumeOn = this.fields["train-resume"]?.checked;
+    const resumePath = this.fields["train-resume-cp"]?.value || "";
+    if (resumeOn && !resumePath) {
+      msg.textContent = "Selecciona un checkpoint para reanudar o desactiva la casilla.";
+      msg.className = "text-sm text-rose-400 mt-3";
+      return;
+    }
+
     this.busy = true;
     this.chart.reset();
     msg.textContent = "Iniciando…";
@@ -300,6 +326,13 @@ export default class TrainView {
       const res = await api.post("/api/train", body);
       msg.textContent = res.jobId ? `Entrenamiento iniciado (${res.jobId})` : "Entrenamiento iniciado";
       msg.className = "text-sm text-emerald-300 mt-3";
+      // Reset the resume toggle so the next run does not silently reuse it.
+      if (this.fields["train-resume"]) this.fields["train-resume"].checked = false;
+      const cpSel = this.fields["train-resume-cp"];
+      if (cpSel) {
+        cpSel.value = "";
+        cpSel.disabled = true;
+      }
     } catch (e) {
       msg.textContent = `Error: ${e.message}`;
       msg.className = "text-sm text-rose-400 mt-3";
@@ -353,9 +386,16 @@ export default class TrainView {
     const stopBtn = document.getElementById("train-stop");
     const pauseBtn = document.getElementById("train-pause");
 
+    // Reflect the running job's epoch count in the form, but only once per run
+    // so the user can still edit it for the *next* run while one is active.
     const epochsField = this.fields["train-epochs"];
-    if (epochsField && job.status === JobState.RUNNING && job.epochs > 0) {
-      epochsField.value = String(job.epochs);
+    if (epochsField) {
+      if (job.status === JobState.RUNNING && job.epochs > 0 && !this._epochsSynced) {
+        epochsField.value = String(job.epochs);
+        this._epochsSynced = true;
+      } else if (job.status !== JobState.RUNNING) {
+        this._epochsSynced = false;
+      }
     }
 
     if (badge) {

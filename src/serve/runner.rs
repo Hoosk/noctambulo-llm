@@ -95,11 +95,22 @@ fn start_unix() -> u64 {
 /// Launch a training job. Runs in a dedicated OS thread because Burn/WGPU tensors
 /// are not `Send`. Events are forwarded to the SSE broadcast channel.
 pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params: TrainParams) -> Result<String, String> {
-    if state.job.read().unwrap().running {
-        return Err("A training job is already running.".into());
-    }
-
     let job_id = format!("job-{}", start_unix());
+
+    // Claim the single job slot synchronously (closes the double-launch race)
+    // and reset per-job state (loss curve, log buffer).
+    state.begin_job(&job_id)?;
+
+    // Load the tokenizer BEFORE spawning any thread so a failure leaves no
+    // orphaned registry handle or forwarder behind.
+    let worker_tokenizer = match load_tokenizer() {
+        Ok(t) => t,
+        Err(e) => {
+            state.abort_job(e.clone());
+            return Err(e);
+        }
+    };
+
     let cancel = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     registry.start(JobHandle {
@@ -133,6 +144,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
                     TrainingEvent::Done { .. } | TrainingEvent::Stopped { .. }
                 ) {
                     job.running = false;
+                    job.stopping = false;
                 }
             }
             match &event {
@@ -158,7 +170,6 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
     });
 
     let worker_state = state.clone();
-    let worker_tokenizer = load_tokenizer()?;
     let worker_cancel = cancel.clone();
     let worker_pause = paused.clone();
 

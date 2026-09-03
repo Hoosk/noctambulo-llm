@@ -506,11 +506,17 @@ pub fn train_with_events<B: AutodiffBackend>(
                     .copied()
                     .unwrap_or(0.0);
 
-                total_epoch_loss += interval_loss;
-                total_batches += accum_count;
+                // Non-finite loss (divergence / high LR) must not poison the
+                // running average or the persisted loss history.
+                if interval_loss.is_finite() {
+                    total_epoch_loss += interval_loss;
+                    total_batches += accum_count;
 
-                last_loss = interval_loss / (accum_count as f32);
-                last_avg_loss = total_epoch_loss / (total_batches as f32);
+                    last_loss = interval_loss / (accum_count as f32);
+                    last_avg_loss = total_epoch_loss / (total_batches as f32);
+                } else {
+                    emit_log(tx, "Warning: non-finite loss detected, keeping previous value.");
+                }
 
                 // Reset GPU loss accumulator for next interval
                 accum_loss_tensor = Tensor::<B, 1>::zeros([1], device);
@@ -571,28 +577,32 @@ pub fn train_with_events<B: AutodiffBackend>(
 
         if val_dataset.len() > 0 {
             let (val_loss, val_ppl) = evaluate_dataset(&model.valid(), &val_dataset, effective_batch_size, device);
-            emit_log(tx, format!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl));
-            let _ = tx.send(TrainingEvent::Val { loss: val_loss, ppl: val_ppl, epoch });
+            if !val_loss.is_finite() {
+                emit_log(tx, "Warning: validation loss is non-finite; skipping validation this epoch.");
+            } else {
+                emit_log(tx, format!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl));
+                let _ = tx.send(TrainingEvent::Val { loss: val_loss, ppl: val_ppl, epoch });
 
-            let is_best = match best_val_loss {
-                None => true,
-                Some(prev) => val_loss < prev,
-            };
-            if is_best {
-                best_val_loss = Some(val_loss);
-                if let Some(s_dir) = save_dir {
-                    let best_path = s_dir.join("checkpoint_best");
-                    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-                    if let Err(e) = recorder.record(model.clone().into_record(), best_path.clone()) {
-                        emit_log(tx, format!("Warning: Failed to save best checkpoint at {:?}: {:?}", best_path, e));
-                    } else {
-                        emit_log(tx, format!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin")));
-                        let _ = tx.send(TrainingEvent::Checkpoint {
-                            path: best_path.with_extension("bin").to_string_lossy().to_string(),
-                            kind: "best".into(),
-                            epoch,
-                            batch: 0,
-                        });
+                let is_best = match best_val_loss {
+                    None => true,
+                    Some(prev) => val_loss < prev,
+                };
+                if is_best {
+                    best_val_loss = Some(val_loss);
+                    if let Some(s_dir) = save_dir {
+                        let best_path = s_dir.join("checkpoint_best");
+                        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+                        if let Err(e) = recorder.record(model.clone().into_record(), best_path.clone()) {
+                            emit_log(tx, format!("Warning: Failed to save best checkpoint at {:?}: {:?}", best_path, e));
+                        } else {
+                            emit_log(tx, format!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin")));
+                            let _ = tx.send(TrainingEvent::Checkpoint {
+                                path: best_path.with_extension("bin").to_string_lossy().to_string(),
+                                kind: "best".into(),
+                                epoch,
+                                batch: 0,
+                            });
+                        }
                     }
                 }
             }

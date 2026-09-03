@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 pub use state::ServerState;
@@ -23,8 +22,6 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ServerState::new(token, datasets_dir, models_dir));
 
-    let cors = CorsLayer::new().allow_origin(Any);
-
     let router_state = state.clone();
     let frontend_dir = frontend_dir();
     let app = Router::new()
@@ -32,8 +29,7 @@ pub async fn run(
         .fallback_service(
             ServeDir::new(&frontend_dir)
                 .not_found_service(ServeFile::new(frontend_dir.join("index.html"))),
-        )
-        .layer(cors);
+        );
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("🐈‍⬛ Kuro-Neko serve listening on http://{bind}");

@@ -56,6 +56,7 @@ struct LogBuffer {
 
 const MAX_LOG_LINES: usize = 5000;
 const STATE_FILE: &str = ".kuro/state.json";
+const STATE_TMP: &str = ".kuro/state.json.tmp";
 
 impl ServerState {
     pub fn new(token: Option<String>, datasets_dir: PathBuf, models_dir: PathBuf) -> Self {
@@ -71,6 +72,35 @@ impl ServerState {
         };
         state.load_state();
         state
+    }
+
+    /// Atomically claim the single job slot for a new job and reset per-job
+    /// state (loss curve, log buffer, last event). The synchronous claim
+    /// closes the double-launch race window.
+    pub fn begin_job(&self, job_id: &str) -> Result<(), String> {
+        {
+            let mut job = self.job.write().unwrap();
+            if job.running {
+                return Err("A training job is already running.".into());
+            }
+            job.running = true;
+            job.stopping = false;
+            job.job_id = job_id.to_string();
+            job.last_event = None;
+            job.message = None;
+        }
+        self.loss_points.write().unwrap().clear();
+        // Clear kept log lines but keep `total` monotonic so clients holding an
+        // old cursor never re-receive the previous job's lines.
+        self.logs.write().unwrap().lines.clear();
+        Ok(())
+    }
+
+    /// Release the job slot after a failed launch (nothing was spawned).
+    pub fn abort_job(&self, message: String) {
+        let mut job = self.job.write().unwrap();
+        job.running = false;
+        job.message = Some(message);
     }
 
     /// Append a diagnostic line to the in-memory ring buffer.
@@ -94,22 +124,23 @@ impl ServerState {
         (lines, buf.total)
     }
 
-    /// Record a loss point (deduped by step) and persist.
+    /// Record a loss point (deduped by step). Provisional zeros and NaN/inf
+    /// values from the trainer are not real metrics, so they are dropped.
     pub fn push_loss_point(&self, x: usize, y: f32) {
-        {
-            let mut pts = self.loss_points.write().unwrap();
-            match pts.last_mut() {
-                Some(last) if last.x == x => last.y = y,
-                _ => {
-                    let overflow = pts.len().saturating_sub(1999);
-                    if overflow > 0 {
-                        pts.drain(0..overflow);
-                    }
-                    pts.push(LossPoint { x, y });
+        if !y.is_finite() || y <= 0.0 {
+            return;
+        }
+        let mut pts = self.loss_points.write().unwrap();
+        match pts.last_mut() {
+            Some(last) if last.x == x => last.y = y,
+            _ => {
+                let overflow = pts.len().saturating_sub(1999);
+                if overflow > 0 {
+                    pts.drain(0..overflow);
                 }
+                pts.push(LossPoint { x, y });
             }
         }
-        self.persist();
     }
 
     /// Snapshot of the loss history for chart backfill.
@@ -118,14 +149,18 @@ impl ServerState {
     }
 
     /// Persist job status + loss history to `.kuro/state.json`.
+    /// Written atomically (temp + rename) so a crash mid-write can never
+    /// leave a truncated file that would wipe the state on next load.
     pub fn persist(&self) {
         let state = PersistedState {
             job: self.job.read().unwrap().clone(),
             loss_points: self.loss_points_snapshot(),
         };
-        if let Ok(bytes) = serde_json::to_vec_pretty(&state) {
+        if let Ok(bytes) = serde_json::to_vec(&state) {
             if std::fs::create_dir_all(".kuro").is_ok() {
-                let _ = std::fs::write(STATE_FILE, bytes);
+                if std::fs::write(STATE_TMP, bytes).is_ok() {
+                    let _ = std::fs::rename(STATE_TMP, STATE_FILE);
+                }
             }
         }
     }
@@ -188,5 +223,73 @@ mod tests {
             Some(TrainingEvent::Progress { step, .. }) => assert_eq!(step, 5),
             _ => panic!("expected Progress event"),
         }
+    }
+
+    fn fresh_state() -> ServerState {
+        let st = ServerState::new(None, PathBuf::from("d"), PathBuf::from("m"));
+        // A real .kuro/state.json may exist in the working directory; tests
+        // must not depend on (or mutate) it.
+        st.loss_points.write().unwrap().clear();
+        st.logs.write().unwrap().lines.clear();
+        st.logs.write().unwrap().total = 0;
+        st
+    }
+
+    #[test]
+    fn test_log_since_incremental() {
+        let st = fresh_state();
+        for i in 0..10 {
+            st.push_log(format!("l{i}"), i as u64);
+        }
+        let (lines, total) = st.log_since(0);
+        assert_eq!((total, lines.len()), (10, 10));
+        assert_eq!(lines[0].line, "l0");
+
+        let (tail, _) = st.log_since(8);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].line, "l8");
+
+        let (none, _) = st.log_since(10);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn test_push_loss_point_filters_and_dedups() {
+        let st = fresh_state();
+        st.push_loss_point(1, 0.0); // provisional zero: dropped
+        st.push_loss_point(1, f32::NAN); // non-finite: dropped
+        st.push_loss_point(1, f32::INFINITY);
+        assert!(st.loss_points_snapshot().is_empty());
+
+        st.push_loss_point(1, 5.0);
+        st.push_loss_point(1, 4.5); // same step: overwrite, not append
+        let pts = st.loss_points_snapshot();
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].y, 4.5);
+
+        st.push_loss_point(2, 4.0);
+        assert_eq!(st.loss_points_snapshot().len(), 2);
+    }
+
+    #[test]
+    fn test_begin_job_claims_and_resets() {
+        let st = fresh_state();
+        st.push_loss_point(1, 1.0);
+        st.push_log("old-line".into(), 0);
+
+        st.begin_job("job-x").unwrap();
+        assert!(st.loss_points_snapshot().is_empty());
+        let (lines, total) = st.log_since(0);
+        assert!(lines.is_empty()); // lines cleared...
+        assert_eq!(total, 1); // ...but the cursor stays monotonic
+
+        assert!(st.begin_job("job-y").is_err()); // slot is occupied
+
+        st.abort_job("boom".into());
+        assert!(!st.job.read().unwrap().running);
+        st.begin_job("job-z").unwrap(); // released again
+        assert!(st.job.read().unwrap().running);
+        assert_eq!(st.job.read().unwrap().job_id, "job-z");
+        st.abort_job("cleanup".into());
     }
 }

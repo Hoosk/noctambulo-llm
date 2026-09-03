@@ -644,6 +644,16 @@ struct CheckpointInfo {
     modified_unix: u64,
 }
 
+/// Reject path traversal in user-supplied relative paths: no absolute paths,
+/// no `..`, no trailing separators. The server resolves them against its own
+/// working directory.
+fn is_safe_rel_path(p: &str) -> bool {
+    use std::path::Component;
+    !p.is_empty()
+        && !Path::new(p).is_absolute()
+        && Path::new(p).components().all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// List `.bin` checkpoint files inside a user-provided directory (default
 /// `checkpoints_web`). Path is resolved against the server working directory.
 #[allow(clippy::unused_async)]
@@ -654,6 +664,13 @@ async fn checkpoints(
 ) -> Result<Json<Vec<CheckpointInfo>>, Response> {
     check_token(&state.server, &headers, None)?;
     let dir = query.get("dir").map(String::as_str).unwrap_or("checkpoints_web");
+    if !is_safe_rel_path(dir) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid dir" })),
+        )
+            .into_response());
+    }
     let dir = Path::new(dir);
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -766,6 +783,27 @@ async fn train(
             Json(serde_json::json!({ "error": format!("dataset not found: {}", file_path.display()) })),
         )
             .into_response());
+    }
+
+    // Only relative, traversal-free paths are accepted for checkpoints and
+    // output directories, resolved against the server working directory.
+    if let Some(save_dir) = &req.save_dir {
+        if !is_safe_rel_path(save_dir) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid save_dir" })),
+            )
+                .into_response());
+        }
+    }
+    if let Some(resume) = &req.resume {
+        if !is_safe_rel_path(resume) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid resume path" })),
+            )
+                .into_response());
+        }
     }
 
     let params = TrainParams {

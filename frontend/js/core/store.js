@@ -141,8 +141,20 @@ export function pollStatus() {
         set({ lossPoints: s.loss_points });
       }
 
+      // A restarted server reports running=false while its persisted snapshot
+      // still holds the last event of a (dead) job. Never let a stale
+      // Progress/Started resurrect a ghost RUNNING state that would brick the
+      // UI (Start disabled forever, Stop a no-op). Drop back to idle instead.
+      if (!s.running && store.status === JobState.RUNNING) {
+        set({ status: JobState.IDLE, paused: false, message: "Job perdido (¿servidor reiniciado?)" });
+      }
+
       const ev = s.last_event;
       if (!ev) return;
+
+      // A Progress/Started from a dead job is stale; ignore it entirely.
+      const staleLive = !s.running && (ev["Progress"] || ev["Started"]);
+      if (staleLive) return;
 
       const evJson = JSON.stringify(ev);
       if (evJson === lastPolledEvent) return;

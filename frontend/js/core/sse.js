@@ -27,7 +27,6 @@ export function connect() {
 
   const ctrl = new AbortController();
   controller = ctrl;
-  emit("sse:status", { connected: true });
 
   (async () => {
     let buffer = "";
@@ -41,6 +40,11 @@ export function connect() {
         throw new ApiError(res.status, "SSE stream error");
       }
       if (!res.body) throw new Error("No response body");
+
+      // Only mark as connected once the stream actually opened, and reset the
+      // reconnect backoff after a successful (re)connect.
+      emit("sse:status", { connected: true });
+      retryDelay = 2000;
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
