@@ -38,7 +38,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/train/pause", post(train_pause))
         .route("/api/train/resume", post(train_resume))
         .route("/api/train/stream", get(train_stream))
-        .route("/api/download/{path}", get(download))
+        .route("/api/download/*rest", get(download))
         .route("/api/generate", post(generate_text))
         .route("/api/export", post(export_model))
         .with_state(AppState {
@@ -97,6 +97,8 @@ struct DeviceInfo {
     driver: String,
     vram_bytes: Option<u64>,
     selectable: bool,
+    /// Machine-readable selector consumed by the runner to build a `WgpuDevice`.
+    selector: String,
 }
 
 fn enum_adapter_specs() -> Vec<DeviceInfo> {
@@ -110,6 +112,9 @@ fn enum_adapter_specs() -> Vec<DeviceInfo> {
     }
 
     let mut out = Vec::new();
+    let mut discrete_idx = 0usize;
+    let mut integrated_idx = 0usize;
+    let mut virtual_idx = 0usize;
     for a in adapters {
         let info = a.get_info();
         let backend_name = match info.backend {
@@ -120,12 +125,24 @@ fn enum_adapter_specs() -> Vec<DeviceInfo> {
             wgpu::Backend::BrowserWebGpu => "WebGPU",
             _ => "Other",
         };
-        let type_name = match info.device_type {
-            wgpu::DeviceType::DiscreteGpu => "Discrete GPU",
-            wgpu::DeviceType::IntegratedGpu => "Integrated GPU",
-            wgpu::DeviceType::VirtualGpu => "Virtual GPU",
-            wgpu::DeviceType::Cpu => "CPU",
-            _ => "Other",
+        let (type_name, selector) = match info.device_type {
+            wgpu::DeviceType::DiscreteGpu => {
+                let sel = format!("DiscreteGpu({discrete_idx})");
+                discrete_idx += 1;
+                ("Discrete GPU".to_string(), sel)
+            }
+            wgpu::DeviceType::IntegratedGpu => {
+                let sel = format!("IntegratedGpu({integrated_idx})");
+                integrated_idx += 1;
+                ("Integrated GPU".to_string(), sel)
+            }
+            wgpu::DeviceType::VirtualGpu => {
+                let sel = format!("VirtualGpu({virtual_idx})");
+                virtual_idx += 1;
+                ("Virtual GPU".to_string(), sel)
+            }
+            wgpu::DeviceType::Cpu => ("CPU".to_string(), "Cpu".to_string()),
+            _ => ("Other".to_string(), "DefaultDevice".to_string()),
         };
 
         let mut vram_bytes = None;
@@ -142,12 +159,13 @@ fn enum_adapter_specs() -> Vec<DeviceInfo> {
         out.push(DeviceInfo {
             name: info.name.clone(),
             backend: backend_name.into(),
-            device_type: type_name.into(),
+            device_type: type_name,
             vendor: info.vendor,
             device: info.device,
             driver: info.driver.clone(),
             vram_bytes,
             selectable: true,
+            selector,
         });
     }
     out
@@ -181,6 +199,7 @@ async fn devices(
                 driver: String::new(),
                 vram_bytes: None,
                 selectable: true,
+                selector: "DefaultDevice".into(),
             },
             DeviceInfo {
                 name: "DiscreteGpu(0)".into(),
@@ -191,6 +210,7 @@ async fn devices(
                 driver: String::new(),
                 vram_bytes: None,
                 selectable: true,
+                selector: "DiscreteGpu(0)".into(),
             },
             DeviceInfo {
                 name: "Cpu".into(),
@@ -201,6 +221,7 @@ async fn devices(
                 driver: String::new(),
                 vram_bytes: None,
                 selectable: true,
+                selector: "Cpu".into(),
             },
         ]));
     }
@@ -747,7 +768,11 @@ struct TrainRequest {
     resume: Option<String>,
     #[serde(default = "default_output_dir")]
     output_dir: String,
+    #[serde(default = "default_device")]
+    device: String,
 }
+
+fn default_device() -> String { "DefaultDevice".into() }
 
 fn default_epochs() -> usize { 1 }
 fn default_batch() -> usize { 32 }
@@ -805,6 +830,13 @@ async fn train(
                 .into_response());
         }
     }
+    if !is_safe_rel_path(&req.output_dir) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid output_dir" })),
+        )
+            .into_response());
+    }
 
     let params = TrainParams {
         file: Some(file_path),
@@ -825,6 +857,7 @@ async fn train(
         save_dir: req.save_dir.map(path_buf_from),
         resume: req.resume.map(path_buf_from),
         output_dir: req.output_dir,
+        device: req.device,
     };
 
     match launch_job(&state.server, &state.registry, params) {
@@ -920,9 +953,17 @@ async fn train_resume(State(state): State<AppState>, headers: HeaderMap) -> Resu
 fn event_stream(state: Arc<ServerState>) -> impl Stream<Item = Result<Event, axum::Error>> + Send + 'static {
     let mut rx = state.events.subscribe();
     async_stream::stream! {
-        while let Ok(ev) = rx.recv().await {
-            let json = serde_json::to_string(&ev).unwrap_or_default();
-            yield Ok(Event::default().event("training").data(json));
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let json = serde_json::to_string(&ev).unwrap_or_default();
+                    yield Ok(Event::default().event("training").data(json));
+                }
+                // A slow consumer missed events: skip them and keep streaming
+                // instead of tearing the connection down.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     }
 }
@@ -949,9 +990,33 @@ async fn download(
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Response, Response> {
     check_token(&state.server, &headers, query.get("token").map(|s| s.as_str()))?;
+
+    // Only files under known output roots are served: the datasets dir, the
+    // models dir and the exported/ directory (GGUF). Absolute paths and
+    // traversal (`..`) are rejected outright.
+    if !is_safe_rel_path(&path) {
+        return Err((StatusCode::BAD_REQUEST, "invalid path").into_response());
+    }
     let p = Path::new(&path);
-    if !p.exists() {
-        return Err((StatusCode::NOT_FOUND, "not found").into_response());
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let allowed_roots = {
+        let mut roots = vec![state.server.datasets_dir.clone(), state.server.models_dir.clone()];
+        roots.push(cwd.join("exported"));
+        roots
+    };
+    let canonical = std::fs::canonicalize(p).map_err(|_| (StatusCode::NOT_FOUND, "not found").into_response())?;
+    let inside = allowed_roots.iter().any(|root| {
+        // Never treat the working directory itself as an allowed root, only
+        // its explicit children (exported/, datasets/, models_dir).
+        if root == &cwd {
+            return false;
+        }
+        std::fs::canonicalize(root)
+            .map(|r| canonical.starts_with(&r))
+            .unwrap_or(false)
+    });
+    if !inside {
+        return Err((StatusCode::FORBIDDEN, "forbidden").into_response());
     }
     let Ok(bytes) = tokio::fs::read(p).await else {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "read error").into_response());
@@ -1151,4 +1216,32 @@ fn run_export(model_dir: std::path::PathBuf, model_name: &str) -> Result<String,
 
     crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported")
         .map_err(|e| format!("export error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_rel_path() {
+        assert!(is_safe_rel_path("checkpoints_web"));
+        assert!(is_safe_rel_path("checkpoints_web/checkpoint_epoch_1.bin"));
+        assert!(is_safe_rel_path("exported/kuro-neko.gguf"));
+
+        assert!(!is_safe_rel_path(""));
+        assert!(!is_safe_rel_path(".."));
+        assert!(!is_safe_rel_path("../etc/passwd"));
+        assert!(!is_safe_rel_path("checkpoints_web/../../etc/passwd"));
+        assert!(!is_safe_rel_path("/etc/passwd"));
+        assert!(!is_safe_rel_path("."));
+    }
+
+    #[test]
+    fn test_query_token() {
+        assert_eq!(query_token(Some("token=abc")), Some("abc".into()));
+        assert_eq!(query_token(Some("a=1&token=xyz&b=2")), Some("xyz".into()));
+        assert_eq!(query_token(Some("a=1&b=2")), None);
+        assert_eq!(query_token(Some("token=")), Some("".into()));
+        assert_eq!(query_token(None), None);
+    }
 }

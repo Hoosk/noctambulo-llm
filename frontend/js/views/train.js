@@ -98,7 +98,8 @@ export default class TrainView {
 
     const devSel = el("select", { id: "train-device", class: inputCls });
     for (const d of devices) {
-      devSel.append(el("option", { value: d.name, selected: d.name === "DefaultDevice" || null }, d.name));
+      const sel = d.selector || d.name;
+      devSel.append(el("option", { value: sel, selected: sel === "DefaultDevice" || null }, sel));
     }
     this.fields["train-device"] = devSel;
 

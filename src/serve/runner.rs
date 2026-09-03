@@ -28,6 +28,30 @@ pub struct TrainParams {
     pub save_dir: Option<PathBuf>,
     pub resume: Option<PathBuf>,
     pub output_dir: String,
+    pub device: String,
+}
+
+/// Parse the machine-readable device selector (`DiscreteGpu(0)`, `Cpu`,
+/// `DefaultDevice`, ...) into a `WgpuDevice`. Unknown selectors fall back to
+/// the default so a stale frontend can never crash the worker.
+fn parse_device(selector: &str) -> burn::backend::wgpu::WgpuDevice {
+    use burn::backend::wgpu::WgpuDevice;
+    let s = selector.trim();
+    if s.eq_ignore_ascii_case("cpu") {
+        return WgpuDevice::Cpu;
+    }
+    for (prefix, mk) in [
+        ("DiscreteGpu(", WgpuDevice::DiscreteGpu as fn(usize) -> WgpuDevice),
+        ("IntegratedGpu(", WgpuDevice::IntegratedGpu as fn(usize) -> WgpuDevice),
+        ("VirtualGpu(", WgpuDevice::VirtualGpu as fn(usize) -> WgpuDevice),
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            if let Some(idx) = rest.trim_end_matches(')').parse::<usize>().ok() {
+                return mk(idx);
+            }
+        }
+    }
+    WgpuDevice::DefaultDevice
 }
 
 /// Shared handle for the currently running job, used to request a graceful stop
@@ -184,7 +208,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
             params.dropout,
             params.attn_softcap,
         );
-        let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
+        let device = parse_device(&params.device);
 
         let result = train_with_events::<burn::backend::Autodiff<burn::backend::Wgpu>>(
             params.file.as_deref(),
@@ -251,4 +275,29 @@ fn load_tokenizer() -> Result<LlmTokenizer, String> {
 #[allow(dead_code)]
 fn _tick() {
     std::thread::sleep(Duration::from_millis(200));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::wgpu::WgpuDevice;
+
+    #[test]
+    fn test_parse_device_selectors() {
+        assert!(matches!(parse_device("DefaultDevice"), WgpuDevice::DefaultDevice));
+        assert!(matches!(parse_device("Cpu"), WgpuDevice::Cpu));
+        assert!(matches!(parse_device("DiscreteGpu(0)"), WgpuDevice::DiscreteGpu(0)));
+        assert!(matches!(parse_device("DiscreteGpu(2)"), WgpuDevice::DiscreteGpu(2)));
+        assert!(matches!(parse_device("IntegratedGpu(1)"), WgpuDevice::IntegratedGpu(1)));
+        assert!(matches!(parse_device("VirtualGpu(3)"), WgpuDevice::VirtualGpu(3)));
+    }
+
+    #[test]
+    fn test_parse_device_falls_back_on_garbage() {
+        // Unknown / malformed selectors must never crash the worker.
+        assert!(matches!(parse_device(""), WgpuDevice::DefaultDevice));
+        assert!(matches!(parse_device("Intel Arc"), WgpuDevice::DefaultDevice));
+        assert!(matches!(parse_device("DiscreteGpu(x)"), WgpuDevice::DefaultDevice));
+        assert!(matches!(parse_device("../../etc"), WgpuDevice::DefaultDevice));
+    }
 }

@@ -77,7 +77,7 @@ struct ServeArgs {
     #[arg(long, default_value = "datasets")]
     datasets_dir: String,
     /// Directory containing model outputs and checkpoints
-    #[arg(long, default_value = ".")]
+    #[arg(long, default_value = "model_output")]
     models_dir: String,
 }
 
