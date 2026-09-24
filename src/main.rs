@@ -14,6 +14,8 @@ use export::export_to_gguf;
 use generate::generate;
 use model::Llm;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use train::{run_eval, train};
 
 use burn::backend::wgpu::WgpuDevice;
@@ -475,6 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
             let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
+            let cancel = sigint_cancel_flag();
 
             train::<Autodiff<Wgpu>>(
                 dataset_path_buf.as_deref(),
@@ -493,6 +496,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 resume_path_buf.as_deref(),
                 &device,
                 output_dir,
+                Some(cancel),
             )?;
         }
         Commands::Eval(args) => {
@@ -679,6 +683,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+/// Cancel flag shared with the SIGINT handler installed by `sigint_cancel_flag`.
+static SIGNAL_CANCEL: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+#[cfg(unix)]
+extern "C" fn handle_sigint(_signum: libc::c_int) {
+    if let Some(cancel) = SIGNAL_CANCEL.get() {
+        cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Install a SIGINT handler (once) that asks the trainer to stop gracefully so
+/// it can persist an interrupted checkpoint before the process exits.
+fn sigint_cancel_flag() -> Arc<AtomicBool> {
+    let flag = SIGNAL_CANCEL
+        .get_or_init(|| Arc::new(AtomicBool::new(false)))
+        .clone();
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+    }
+    flag
 }
 
 /// Generate a simple pseudo-random hex token from time + process id (no extra deps).

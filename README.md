@@ -63,9 +63,9 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--dropout <float>` | Probabilidad de dropout | `0.1` |
 | `--attn-softcap <float>` | Capping de atención (`0.0` desactivado, `50.0` Gemma 4) | `0.0` |
 | `--val-split <float>` | Ratio reservado para validación y cálculo de perplejidad ($PPL$) | `0.1` |
-| `--grad-accum <n>` | Pasos de acumulación de gradientes antes del paso de AdamW | `1` |
+| `--grad-accum <n>` | Micro-batches acumulados por paso de AdamW (media real de gradientes, equivalente a un batch mayor) | `1` |
 | `--save-dir <path>` | Directorio para guardado automático de checkpoints por época | `None` |
-| `--resume <path>` | Ruta a checkpoint o pesos previos para reanudar entrenamiento | `None` |
+| `--resume <path>` | Checkpoint desde el que reanudar (restaura pesos, AdamW, schedule y RNG; `--epochs` = épocas adicionales) | `None` |
 | `--seq-warmup-steps <n>` | Pasos iniciales para **Progressive Sequence Scaling** (de $N/4$ a $N$) | `0` |
 
 #### Ejemplos de Entrenamientos Personalizados
@@ -93,6 +93,24 @@ Pre-tokeniza un corpus o dataset de Hugging Face a un archivo binario `.bin` ult
 ```bash
 cargo run --release -- prepare-dataset --file corpus.txt --output datasets/corpus.bin
 ```
+
+> [!NOTE]
+> Los datasets `.bin` v2 incluyen un *fingerprint* del vocabulario del tokenizador. Si reentrenas el tokenizador, vuelve a ejecutar `prepare-dataset`: cargar un `.bin` tokenizado con otro vocabulario ahora falla con un error explícito en lugar de entrenar con IDs corruptos.
+
+---
+
+### 2b. Reanudar Entrenamiento y Parada Segura
+
+El progreso del entrenamiento se persiste en `train_state.json` (posición del schedule, RNG del shuffler, mejor `val_loss`) y `optimizer_state.bin` (momentos de AdamW), junto a los pesos:
+
+```bash
+# Reanudar 2 épocas adicionales desde el checkpoint de la época 3
+cargo run --release -- train --dataset roneneldan/TinyStories --resume checkpoints/checkpoint_epoch_3.bin --epochs 2
+
+# Detener con Ctrl+C o desde la web guarda checkpoint_interrupted.bin + estado completo
+```
+
+Con `--resume`, `--epochs` significa **épocas adicionales** y el schedule coseno continúa donde se quedó. Si el checkpoint es antiguo (sin sidecars), se cargan solo los pesos con un aviso.
 
 ---
 

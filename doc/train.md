@@ -8,7 +8,7 @@ Durante el entrenamiento, Kuro-Neko procesa conjuntos de datos en formato de tex
 
 ## ⚙️ Tabla Completa de Parámetros CLI
 
-El subcomando `train` acepta **15 parámetros** de configuración CLI:
+El subcomando `train` acepta **20 parámetros** de configuración CLI:
 
 | Flag | Tipo | Valor por Defecto | Descripción Detallada |
 | :--- | :--- | :--- | :--- |
@@ -27,6 +27,11 @@ El subcomando `train` acepta **15 parámetros** de configuración CLI:
 | `--lr <float>` | `f64` | `0.0003` (3e-4) | Tasa de aprendizaje pico (*peak learning rate*). Se ajusta dinámicamente mediante un schedule coseno con *warmup*. |
 | `--dropout <float>` | `f64` | `0.1` | Probabilidad de dropout aplicada a las probabilidades de atención y a las proyecciones residuales/MLP como regularización. |
 | `--attn-softcap <float>` | `f32` | `0.0` | Umbral de softcapping para los scores de atención. `0.0` desactiva la función. Un valor como `50.0` aplica la fórmula estilo Gemma 4 para estabilizar gradientes. |
+| `--val-split <float>` | `f32` | `0.1` | Fracción del corpus reservada para validación (cálculo de Loss y Perplexity por época). `0.0` desactiva la validación. |
+| `--grad-accum <n>` | `usize` | `1` | Pasos de acumulación de gradientes por actualización de AdamW. El gradiente acumulado es la **media** de los micro-batches (equivalente a un batch más grande). |
+| `--save-dir <path>` | `Option<String>` | `None` | Directorio donde guardar `checkpoint_epoch_N.bin` y `checkpoint_best.bin` al final de cada época. |
+| `--resume <path>` | `Option<String>` | `None` | Checkpoint `.bin` (o su directorio) desde el que reanudar. Restaura pesos, momentos de AdamW, posición del schedule y estado del shuffler. `--epochs` pasa a significar **épocas adicionales**. |
+| `--seq-warmup-steps <n>` | `usize` | `0` | Pasos iniciales de *Progressive Sequence Scaling*: el contexto crece de `n_ctx/4` hasta `n_ctx` durante el warmup. `0` lo desactiva. |
 
 ---
 
@@ -92,6 +97,33 @@ La función de pérdida para el modelado de lenguaje autorregresivo se calcula d
 
 > [!IMPORTANT]
 > **Acumulación Asíncrona en GPU**: Para evitar los cuellos de botella por sincronización CPU $\to$ GPU en cada paso de batch, la pérdida calculada se desengancha del grafo de autodiferenciación (`detach()`) y se acumula en un tensor residente en la memoria de la GPU (`accum_loss_tensor`). Únicamente se lee hacia la CPU en los intervalos de reporte configurados.
+
+---
+
+### 6. Acumulación Real de Gradientes (`--grad-accum`)
+
+Con `--grad-accum N` cada actualización de AdamW agrupa $N$ micro-batches. La pérdida de cada micro-batch se divide por el tamaño real de la ventana ($N$, o menos en la ventana parcial final de cada época) y los gradientes se suman con `burn::optim::GradientsAccumulator`:
+
+$$\nabla_\theta \frac{1}{N}\sum_{i=1}^{N} \mathcal{L}_i = \frac{1}{N}\sum_{i=1}^{N} \nabla_\theta \mathcal{L}_i$$
+
+Esto garantiza que acumular $N$ micro-batches de tamaño $B$ sea **matemáticamente equivalente** a un solo batch de tamaño $N \times B$ (linealidad del gradiente), que es exactamente lo que verifica el test `test_accumulated_gradients_match_full_batch`.
+
+---
+
+### 7. Estado de Entrenamiento Persistente y Reanudación
+
+Al final de cada época (y al detener el entrenamiento) Kuro-Neko guarda, junto a los pesos:
+
+- `train_state.json`: `global_step`, `total_steps`, `epochs_done`, `best_val_loss` y el estado interno del shuffler.
+- `optimizer_state.bin`: el record de AdamW (momentos de primer y segundo orden) serializado con `Optimizer::to_record`.
+
+Al reanudar con `--resume <checkpoint>` se restauran los pesos **y** ambos sidecars, por lo que el schedule coseno continúa desde el paso guardado, los momentos de AdamW no se pierden y el orden de las secuencias sigue donde estaba. `--epochs` en un resume indica épocas **adicionales**.
+
+Si no existe `train_state.json` (checkpoints previos), el resume es retrocompatible: se cargan solo los pesos y se avisa de que el estado de AdamW arranca de cero.
+
+### 8. Parada Segura (Stop / Ctrl+C)
+
+Detener un entrenamiento desde el servidor web o con `Ctrl+C` (CLI) no descarta el trabajo: antes de salir se guarda `checkpoint_interrupted.bin` junto con `train_state.json` y `optimizer_state.bin`, y se emite el evento `Checkpoint` con `kind = "interrupted"`. El servidor web además usa `with_graceful_shutdown` y espera hasta 30 segundos a que el worker termine de persistir.
 
 ---
 

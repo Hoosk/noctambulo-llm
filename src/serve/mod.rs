@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
+use runner::JobRegistry;
 use tower_http::services::{ServeDir, ServeFile};
 
 pub use state::ServerState;
@@ -22,10 +23,10 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = Arc::new(ServerState::new(token, datasets_dir, models_dir));
 
-    let router_state = state.clone();
+    let (api_router, registry) = api::router(state.clone());
     let frontend_dir = frontend_dir();
     let app = Router::new()
-        .merge(api::router(router_state))
+        .merge(api_router)
         .fallback_service(
             ServeDir::new(&frontend_dir)
                 .not_found_service(ServeFile::new(frontend_dir.join("index.html"))),
@@ -41,8 +42,23 @@ pub async fn run(
     }
     println!("   Datasets: {:?}", state.datasets_dir);
     println!("   Modelos:  {:?}", state.models_dir);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(state.clone(), registry))
+        .await?;
     Ok(())
+}
+
+/// Wait for Ctrl+C, request a graceful training stop and give the worker time
+/// to persist its interrupted checkpoint before the server exits.
+async fn shutdown_signal(state: Arc<ServerState>, registry: Arc<JobRegistry>) {
+    if tokio::signal::ctrl_c().await.is_ok() {
+        println!("\n   ⏹ Ctrl+C: stopping training (saving checkpoint, up to 30s)...");
+        registry.request_stop();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while state.job.read().unwrap().running && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
 }
 
 /// Locate the frontend directory (checked-out repo or compiled asset).

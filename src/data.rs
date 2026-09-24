@@ -67,7 +67,8 @@ impl LlmTokenizer {
 
         if is_binary_file(path)? {
             println!("Detected pre-tokenized binary dataset: {:?}", path);
-            let (tokens, vocab_sz) = load_tokens_from_binary(path, max_tokens)?;
+            let expected_hash = Some(tokenizer_vocab_hash(self));
+            let (tokens, vocab_sz) = load_tokens_from_binary(path, max_tokens, expected_hash)?;
             println!("Loaded {} pre-tokenized tokens (Vocab size in header: {}).", tokens.len(), vocab_sz);
             return Ok(tokens);
         }
@@ -596,6 +597,34 @@ pub fn train_custom_tokenizer(
 }
 
 const BINARY_MAGIC: &[u8; 4] = b"KNKB";
+/// v1: magic, version, vocab_size, token_count, tokens.
+/// v2: adds a tokenizer vocabulary fingerprint after vocab_size.
+const BINARY_VERSION: u32 = 2;
+
+fn fnv1a64(bytes: &[u8], mut hash: u64) -> u64 {
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
+}
+
+/// Deterministic fingerprint of a tokenizer vocabulary (id -> token pairs in
+/// id order). Stored in `.bin` datasets so a tokenizer swap cannot silently
+/// corrupt training data.
+pub fn tokenizer_vocab_hash(tokenizer: &LlmTokenizer) -> u64 {
+    let vocab = tokenizer.tokenizer.get_vocab(true);
+    let mut entries: Vec<(u32, &str)> = vocab.iter().map(|(token, &id)| (id, token.as_str())).collect();
+    entries.sort_unstable_by_key(|(id, _)| *id);
+
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash = fnv1a64(&(entries.len() as u64).to_le_bytes(), hash);
+    for (id, token) in entries {
+        hash = fnv1a64(&id.to_le_bytes(), hash);
+        hash = fnv1a64(token.as_bytes(), hash);
+    }
+    hash
+}
 
 pub fn is_binary_file<P: AsRef<Path>>(path: P) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let path = path.as_ref();
@@ -621,11 +650,13 @@ pub fn save_tokens_to_binary<P: AsRef<Path>>(
     path: P,
     tokens: &[u32],
     vocab_size: u32,
+    vocab_hash: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut file = std::io::BufWriter::new(File::create(path)?);
     file.write_all(BINARY_MAGIC)?;
-    file.write_all(&1u32.to_le_bytes())?;
+    file.write_all(&BINARY_VERSION.to_le_bytes())?;
     file.write_all(&vocab_size.to_le_bytes())?;
+    file.write_all(&vocab_hash.to_le_bytes())?;
     file.write_all(&(tokens.len() as u64).to_le_bytes())?;
 
     for chunk in tokens.chunks(1024) {
@@ -642,6 +673,7 @@ pub fn save_tokens_to_binary<P: AsRef<Path>>(
 pub fn load_tokens_from_binary<P: AsRef<Path>>(
     path: P,
     max_tokens: Option<usize>,
+    expected_vocab_hash: Option<u64>,
 ) -> Result<(Vec<u32>, u32), Box<dyn std::error::Error + Send + Sync>> {
     let mut file = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 4];
@@ -653,13 +685,36 @@ pub fn load_tokens_from_binary<P: AsRef<Path>>(
     let mut ver_buf = [0u8; 4];
     file.read_exact(&mut ver_buf)?;
     let version = u32::from_le_bytes(ver_buf);
-    if version != 1 {
+    if version != 1 && version != BINARY_VERSION {
         return Err(format!("Unsupported binary dataset version: {}", version).into());
     }
 
     let mut vocab_buf = [0u8; 4];
     file.read_exact(&mut vocab_buf)?;
     let vocab_size = u32::from_le_bytes(vocab_buf);
+
+    let stored_vocab_hash = if version >= 2 {
+        let mut hash_buf = [0u8; 8];
+        file.read_exact(&mut hash_buf)?;
+        Some(u64::from_le_bytes(hash_buf))
+    } else {
+        None
+    };
+
+    match (expected_vocab_hash, stored_vocab_hash) {
+        (Some(expected), Some(stored)) if expected != stored => {
+            return Err(format!(
+                "Tokenizer/dataset mismatch: the .bin dataset was tokenized with a different \
+                 tokenizer (dataset fingerprint {stored:#018x}, current tokenizer {expected:#018x}). \
+                 Re-run `prepare-dataset` with the current tokenizer."
+            )
+            .into());
+        }
+        (Some(_), None) => {
+            eprintln!("Warning: legacy v1 binary dataset has no tokenizer fingerprint; skipping validation.");
+        }
+        _ => {}
+    }
 
     let mut count_buf = [0u8; 8];
     file.read_exact(&mut count_buf)?;
@@ -697,7 +752,8 @@ pub fn prepare_binary_dataset<P1: AsRef<Path>, P2: AsRef<Path>>(
     println!("Preparing pre-tokenized binary dataset from {:?} to {:?}...", input_path.as_ref(), output_path.as_ref());
     let tokens = tokenizer.encode_file_streaming(input_path, max_tokens)?;
     let vocab_size = tokenizer.vocab_size() as u32;
-    save_tokens_to_binary(output_path.as_ref(), &tokens, vocab_size)?;
+    let vocab_hash = tokenizer_vocab_hash(tokenizer);
+    save_tokens_to_binary(output_path.as_ref(), &tokens, vocab_size, vocab_hash)?;
     println!("Saved binary dataset with {} tokens (vocab_size: {}) to {:?}", tokens.len(), vocab_size, output_path.as_ref());
     Ok(())
 }
@@ -712,14 +768,20 @@ mod tests {
 
         let original_tokens = vec![1, 100, 500, 1000, 7999, 42];
         let original_vocab_size = 8000;
+        let original_hash = 0xDEAD_BEEF_CAFE_F00Du64;
 
-        save_tokens_to_binary(&path, &original_tokens, original_vocab_size).unwrap();
+        save_tokens_to_binary(&path, &original_tokens, original_vocab_size, original_hash).unwrap();
 
         assert!(is_binary_file(&path).unwrap());
 
-        let (loaded_tokens, loaded_vocab) = load_tokens_from_binary(&path, None).unwrap();
+        let (loaded_tokens, loaded_vocab) =
+            load_tokens_from_binary(&path, None, Some(original_hash)).unwrap();
         assert_eq!(loaded_tokens, original_tokens);
         assert_eq!(loaded_vocab, original_vocab_size);
+
+        // Without an expected fingerprint the file still loads.
+        let (loaded_tokens, _) = load_tokens_from_binary(&path, None, None).unwrap();
+        assert_eq!(loaded_tokens, original_tokens);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -729,11 +791,49 @@ mod tests {
         let path = std::env::temp_dir().join("test_kuro_bin_limit.bin");
 
         let original_tokens: Vec<u32> = (0..100).collect();
-        save_tokens_to_binary(&path, &original_tokens, 1000).unwrap();
+        save_tokens_to_binary(&path, &original_tokens, 1000, 0x1234).unwrap();
 
-        let (loaded_tokens, _) = load_tokens_from_binary(&path, Some(30)).unwrap();
+        let (loaded_tokens, _) = load_tokens_from_binary(&path, Some(30), Some(0x1234)).unwrap();
         assert_eq!(loaded_tokens.len(), 30);
         assert_eq!(loaded_tokens, (0..30).collect::<Vec<u32>>());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_binary_vocab_hash_mismatch_rejected() {
+        let path = std::env::temp_dir().join("test_kuro_bin_mismatch.bin");
+
+        save_tokens_to_binary(&path, &[1, 2, 3], 100, 0xAAAA).unwrap();
+
+        let err = load_tokens_from_binary(&path, None, Some(0xBBBB)).unwrap_err();
+        assert!(
+            err.to_string().contains("mismatch"),
+            "expected tokenizer mismatch error, got: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_binary_v1_without_hash_still_loads() {
+        let path = std::env::temp_dir().join("test_kuro_bin_v1.bin");
+
+        let tokens: Vec<u32> = vec![5, 6, 7];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BINARY_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&(tokens.len() as u64).to_le_bytes());
+        for token in &tokens {
+            bytes.extend_from_slice(&token.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        // A v1 file cannot be validated: it must load with a warning, not fail.
+        let (loaded, vocab) = load_tokens_from_binary(&path, None, Some(0x1234)).unwrap();
+        assert_eq!(loaded, tokens);
+        assert_eq!(vocab, 100);
 
         let _ = std::fs::remove_file(&path);
     }

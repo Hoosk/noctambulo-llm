@@ -21,6 +21,11 @@ impl XorshiftRng {
         let scrambled = self.state.wrapping_mul(0x2545F4914F6CDD1D);
         (scrambled as f64 / u64::MAX as f64) as f32
     }
+
+    /// Current internal state, so the epoch shuffler survives a resume.
+    pub fn state(&self) -> u64 {
+        self.state
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

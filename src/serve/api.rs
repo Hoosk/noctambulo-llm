@@ -18,9 +18,11 @@ use crate::serve::runner::{JobRegistry, TrainParams, launch_job};
 use crate::serve::state::ServerState;
 use crate::train::TrainingEvent;
 
-pub fn router(state: Arc<ServerState>) -> Router {
+/// Build the API router. Also returns the job registry so the server can
+/// request a graceful training stop on shutdown (Ctrl+C).
+pub fn router(state: Arc<ServerState>) -> (Router, Arc<JobRegistry>) {
     let registry = Arc::new(JobRegistry::new());
-    Router::new()
+    let router = Router::new()
         .route("/api/devices", get(devices))
         .route("/api/datasets", get(datasets))
         .route("/api/datasets/download", post(dataset_download))
@@ -43,8 +45,9 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/export", post(export_model))
         .with_state(AppState {
             server: state,
-            registry,
-        })
+            registry: registry.clone(),
+        });
+    (router, registry)
 }
 
 #[derive(Clone)]
