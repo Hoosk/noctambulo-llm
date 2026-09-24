@@ -58,7 +58,7 @@ export default class GenerateView {
     };
 
     const output = el("div", {
-      class: "mt-4 rounded-xl bg-slate-950/70 border border-slate-800/70 border-l-2 border-l-violet-500/60 p-4 min-h-24",
+      class: "flex-1 min-w-0 rounded-xl bg-slate-950/70 border border-slate-800/70 border-l-2 border-l-violet-500/60 p-4 min-h-24",
     }, [
       el("pre", { class: "text-sm whitespace-pre-wrap text-slate-200 leading-relaxed" }, "—"),
     ]);
@@ -110,7 +110,7 @@ export default class GenerateView {
 
     const resultCard = card("Resultado", [
       el("div", { class: "flex items-start gap-3" }, [
-        catLogoSvg("w-8 h-8 shrink-0 mt-1"),
+        el("div", { class: "shrink-0 mt-1", html: catLogoSvg("w-8 h-8") }),
         output,
       ]),
     ], "lg:sticky lg:top-6 self-start");

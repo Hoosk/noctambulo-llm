@@ -9,8 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::{HeaderValue, header};
 use runner::JobRegistry;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 pub use state::ServerState;
 
@@ -30,7 +32,14 @@ pub async fn run(
         .fallback_service(
             ServeDir::new(&frontend_dir)
                 .not_found_service(ServeFile::new(frontend_dir.join("index.html"))),
-        );
+        )
+        // Revalidate static assets/API responses on every request: without this
+        // browsers heuristically cache the JS modules and keep running stale
+        // frontend code after an update.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ));
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("🐈‍⬛ Kuro-Neko serve listening on http://{bind}");

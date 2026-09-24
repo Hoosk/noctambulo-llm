@@ -118,7 +118,7 @@ function mountLayout() {
         <div class="flex-1"></div>
 
         <div class="rounded-xl border border-slate-800/70 bg-slate-950/60 p-3">
-          <div id="global-progress" class="mb-3 opacity-0 transition-opacity duration-300">
+          <div id="global-progress" class="mb-3 hidden">
             <div class="flex items-center justify-between gap-2 text-[11px] mb-1.5">
               <span id="global-progress-label" class="text-slate-500 truncate">—</span>
               <span id="global-progress-pct" class="tnum font-mono text-slate-400">0%</span>
@@ -128,7 +128,7 @@ function mountLayout() {
                 class="h-full w-0 rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-all duration-300"></div>
             </div>
           </div>
-          ${CONN_MARKUP}
+          <div class="flex items-center justify-center">${CONN_MARKUP}</div>
         </div>
       </aside>
 
@@ -219,7 +219,7 @@ function updateGlobalProgress(job) {
 
   const running = job.status === JobState.RUNNING;
   const hasJob = running || GLOBAL_LABELS[job.status];
-  wrap.classList.toggle("opacity-0", !hasJob);
+  wrap.classList.toggle("hidden", !hasJob);
 
   label.textContent = running
     ? (job.paused ? "pausado" : job.stopping ? "deteniendo…" : GLOBAL_LABELS[JobState.RUNNING])

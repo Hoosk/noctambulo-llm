@@ -1,6 +1,6 @@
 // Shared UI primitives: icons, cards, badges, toasts, modals, loaders.
 
-import { el, clear } from "../core/dom.js";
+import { el } from "../core/dom.js";
 
 // ---------------------------------------------------------------- icons
 // Minimal stroke icon set (24x24, currentColor).
@@ -59,8 +59,12 @@ const CAT_SVG = `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2
       <path d="M30 45 Q32 47.5 34 45" stroke="#d946ef" stroke-width="2.5" stroke-linecap="round"/>
     </svg>`;
 
+// The logo embeds a <linearGradient id>, so each insertion needs a unique id
+// to keep the document valid when the logo appears more than once.
+let catLogoSeq = 0;
 export function catLogoSvg(cls = "w-10 h-10") {
-  return CAT_SVG.replace("<svg ", `<svg class="${cls}" `);
+  const uid = `neko-grad-${++catLogoSeq}`;
+  return CAT_SVG.replaceAll("neko-grad", uid).replace("<svg ", `<svg class="${cls}" `);
 }
 
 // -------------------------------------------------------------- title bar

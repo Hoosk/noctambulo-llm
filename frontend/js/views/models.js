@@ -44,7 +44,8 @@ export default class ModelsView {
       return;
     }
 
-    this.root.append(this.activeBanner());
+    const banner = this.activeBanner();
+    if (banner) this.root.append(banner);
 
     const list = el("ul", { class: "mt-6 space-y-3" });
     for (const m of this.models) {

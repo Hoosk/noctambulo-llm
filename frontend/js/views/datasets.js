@@ -2,7 +2,7 @@
 
 import { api } from "../core/api.js";
 import { clear, el, fmtBytes } from "../core/dom.js";
-import { viewTitle, btn, iconSvg, toast, modal, stagger } from "../components/ui.js";
+import { viewTitle, btn, badge, iconSvg, toast, modal, stagger } from "../components/ui.js";
 
 export default class DatasetsView {
   constructor(root) {
@@ -67,7 +67,7 @@ export default class DatasetsView {
       ]),
       el("div", { class: "flex gap-3 items-start" }, [
         el("div", { class: "relative flex-1" }, [
-          el("span", { class: "absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none" }, iconSvg("search", "w-4 h-4")),
+          el("span", { class: "absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none", html: iconSvg("search", "w-4 h-4") }),
           searchInput,
         ]),
         btn.primary("Buscar", search),
@@ -187,21 +187,67 @@ export default class DatasetsView {
       return;
     }
 
+    const totalBytes = this.datasets.reduce((acc, d) => acc + (d.size_bytes || 0), 0);
+    const summary = el("span", { class: "text-xs text-slate-500 tnum" },
+      `${this.datasets.length} datasets · ${fmtBytes(totalBytes)}`);
+
+    const filter = el("input", {
+      type: "text",
+      placeholder: "Filtrar por nombre…",
+      class: "w-56 max-w-full px-3 py-1.5 rounded-lg bg-slate-950/70 border border-slate-700/60 text-white text-xs placeholder-slate-500 focus:outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/30 transition",
+    });
+
+    // Select-all header checkbox (toggles the whole filtered-agnostic list).
+    const allCb = el("input", { type: "checkbox", class: "w-4 h-4 rounded accent-violet-500 cursor-pointer" });
+
     // Table header
     const head = el("div", {
       class: "grid grid-cols-[auto_1fr_auto_auto] gap-3 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-600 border-b border-slate-800/70",
     }, [
-      el("span", {}, "✓"),
+      allCb,
       el("span", {}, "Nombre"),
       el("span", {}, "Tamaño"),
       el("span", {}, "Acciones"),
     ]);
 
     const rows = el("div", { class: "space-y-2 mt-3" });
-    for (const d of this.datasets) rows.append(this.row(d));
+
+    const syncSelectAll = () => {
+      const all = this.datasets.length > 0 && this.datasets.every((d) => this.selected.has(d.name));
+      allCb.checked = all;
+      allCb.indeterminate = !all && this.selected.size > 0;
+    };
+
+    const renderRows = () => {
+      clear(rows);
+      const query = filter.value.trim().toLowerCase();
+      const visible = query
+        ? this.datasets.filter((d) => d.name.toLowerCase().includes(query))
+        : this.datasets;
+      if (visible.length === 0) {
+        rows.append(el("p", { class: "text-xs text-slate-500 px-4 py-6 text-center" }, "Sin coincidencias."));
+      }
+      for (const d of visible) rows.append(this.row(d, syncSelectAll));
+      syncSelectAll();
+    };
+
+    filter.addEventListener("input", renderRows);
+
+    allCb.addEventListener("change", () => {
+      if (allCb.checked) this.datasets.forEach((d) => this.selected.add(d.name));
+      else this.selected.clear();
+      renderRows();
+      this.updateCombineCount();
+      if (this._renderWeights) this._renderWeights();
+    });
+
+    renderRows();
 
     const listCard = el("div", { class: "glass-card rounded-2xl p-5" }, [
-      el("h3", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-3" }, "Datasets locales"),
+      el("div", { class: "flex flex-wrap items-center justify-between gap-3 mb-3" }, [
+        el("h3", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500" }, "Datasets locales"),
+        el("div", { class: "flex items-center gap-3" }, [summary, filter]),
+      ]),
       head,
       rows,
     ]);
@@ -213,7 +259,7 @@ export default class DatasetsView {
   }
 
   // ------------------------------------------------------------- row
-  row(d) {
+  row(d, onChange) {
     const extBadge = d.ext === "bin"
       ? badge("bin", "violet")
       : badge("txt", "sky");
@@ -225,6 +271,7 @@ export default class DatasetsView {
       else this.selected.delete(d.name);
       this.updateCombineCount();
       if (this._renderWeights) this._renderWeights();
+      if (onChange) onChange();
     });
 
     const infoBtn = el("button", { class: rowBtnCls, onclick: () => this.showInfo(d) }, "info");
@@ -254,6 +301,7 @@ export default class DatasetsView {
     const count = el("span", { id: "combine-count", class: "text-xs text-slate-400 tnum" }, "0 seleccionados");
     const weightsHost = el("div", { class: "space-y-2 mt-3" });
     const outName = el("input", { type: "text", value: "weighted_mix_web.txt", class: inputBaseCls });
+    const maxMb = el("input", { type: "number", value: 0, min: 0, step: 64, class: inputBaseCls });
     const msg = el("p", { class: "text-xs text-slate-400 mt-3" }, "");
 
     // Show selected datasets with editable weights.
@@ -305,9 +353,11 @@ export default class DatasetsView {
       msg.textContent = "Combinando…";
       msg.className = "text-xs text-violet-300 mt-3";
       try {
+        const limitMb = Number(maxMb.value);
         const res = await api.post("/api/datasets/combine", {
           sources,
           output: outName.value.trim() || "weighted_mix_web.txt",
+          maxChars: limitMb > 0 ? Math.round(limitMb * 1024 * 1024) : undefined,
         });
         msg.textContent = `Mix creado: ${res.output}`;
         msg.className = "text-xs text-emerald-300 mt-3";
@@ -327,8 +377,9 @@ export default class DatasetsView {
       ]),
       el("p", { class: "text-xs text-slate-500 mb-2" }, "Marca datasets en la tabla de arriba, ajusta el peso de cada uno y genera un mix único."),
       weightsHost,
-      el("div", { class: "mt-4" }, [
+      el("div", { class: "mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3" }, [
         el("label", { class: "block text-xs font-medium text-slate-400" }, ["Nombre del mix", outName]),
+        el("label", { class: "block text-xs font-medium text-slate-400" }, ["Tamaño máx. (MB · 0 = todo)", maxMb]),
       ]),
       el("div", { class: "mt-4" }, [
         btn.success(iconSvg("layers", "w-3.5 h-3.5") + " Combinar", run),
