@@ -2,6 +2,14 @@
 
 import { api } from "../core/api.js";
 import { clear, el, fmtBytes } from "../core/dom.js";
+import { viewTitle, badge, icon, stagger } from "../components/ui.js";
+
+const TYPE_INFO = {
+  "Discrete GPU": { tone: "violet", icon: "zap" },
+  "Integrated GPU": { tone: "sky", icon: "cpu" },
+  "CPU": { tone: "slate", icon: "cpu" },
+  "Auto": { tone: "emerald", icon: "sparkles" },
+};
 
 export default class DevicesView {
   constructor(root) {
@@ -11,10 +19,7 @@ export default class DevicesView {
   async render() {
     clear(this.root);
     this.root.append(
-      el("div", { class: "mb-6" }, [
-        el("h2", { class: "text-xl font-semibold text-white" }, "Dispositivos GPU"),
-        el("p", { class: "text-sm text-slate-400 mt-1" }, "Adaptadores WGPU detectados en el host del servidor."),
-      ]),
+      viewTitle("Dispositivos GPU", "Adaptadores WGPU detectados en el host del servidor."),
     );
 
     let devices = [];
@@ -27,7 +32,7 @@ export default class DevicesView {
 
     if (devices.length === 0) {
       this.root.append(
-        el("div", { class: "p-10 rounded-2xl border border-dashed border-slate-700 text-center text-slate-500" },
+        el("div", { class: "p-10 rounded-2xl border border-dashed border-slate-700/70 text-center text-slate-500" },
           "No se detectaron adaptadores."),
       );
       return;
@@ -38,32 +43,36 @@ export default class DevicesView {
       list.append(this.card(d));
     }
     this.root.append(list);
+    stagger(this.root);
   }
 
   card(d) {
-    const typeBadge = {
-      "Discrete GPU": ["bg-violet-900 text-violet-300", "⚡"],
-      "Integrated GPU": ["bg-sky-900 text-sky-300", "🔧"],
-      "CPU": ["bg-slate-800 text-slate-300", "🧠"],
-      "Auto": ["bg-emerald-900 text-emerald-300", "✨"],
-    }[d.device_type] || ["bg-slate-800 text-slate-300", "❓"];
-    const [cls, icon] = typeBadge;
+    const info = TYPE_INFO[d.device_type] || { tone: "slate", icon: "info" };
+
+    const chipCls = {
+      violet: "bg-violet-500/15 text-violet-300",
+      sky: "bg-sky-500/15 text-sky-300",
+      slate: "bg-slate-700/40 text-slate-300",
+      emerald: "bg-emerald-500/15 text-emerald-300",
+    }[info.tone];
 
     const row = (label, value) =>
-      el("div", { class: "flex justify-between gap-4 text-xs py-1" }, [
+      el("div", { class: "flex justify-between gap-4 text-xs py-1.5" }, [
         el("span", { class: "text-slate-500" }, label),
-        el("span", { class: "text-slate-300 font-mono text-right" }, value),
+        el("span", { class: "text-slate-300 font-mono text-right tnum" }, value),
       ]);
 
-    return el("li", { class: "rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
-      el("div", { class: "flex items-center justify-between mb-3" }, [
-        el("span", { class: "text-sm font-medium text-white flex items-center gap-2" }, [
-          el("span", {}, icon),
-          d.name,
+    return el("li", { class: "lift glass-card rounded-2xl p-5" }, [
+      el("div", { class: "flex items-center justify-between gap-3 mb-3" }, [
+        el("span", { class: "text-sm font-medium text-white flex items-center gap-2.5 min-w-0" }, [
+          el("span", { class: `w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${chipCls}` }, [
+            icon(info.icon, "w-4 h-4"),
+          ]),
+          el("span", { class: "truncate" }, d.name),
         ]),
-        el("span", { class: `text-xs px-2 py-0.5 rounded-full ${cls}` }, d.device_type),
+        badge(d.device_type, info.tone),
       ]),
-      el("div", { class: "border-t border-slate-800 pt-2" }, [
+      el("div", { class: "border-t border-slate-800/70 pt-2" }, [
         row("Backend", d.backend),
         row("Driver", d.driver || "—"),
         row("Vendor ID", d.vendor ? `0x${d.vendor.toString(16)}` : "—"),

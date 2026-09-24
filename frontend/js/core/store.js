@@ -13,6 +13,7 @@ export const JobState = {
 const store = {
   status: JobState.IDLE,
   paused: false,
+  stopping: false,
   epoch: 0,
   epochs: 0,
   batch: 0,
@@ -51,6 +52,8 @@ export function handleTrainingEvent(ev) {
     case "Started":
       set({
         status: JobState.RUNNING,
+        paused: false,
+        stopping: false,
         epochs: v.epochs,
         epoch: 0,
         batch: 0,
@@ -93,10 +96,10 @@ export function handleTrainingEvent(ev) {
       set({ preview: v.text });
       break;
     case "Done":
-      set({ status: JobState.DONE, message: "Entrenamiento completado" });
+      set({ status: JobState.DONE, stopping: false, message: "Entrenamiento completado" });
       break;
     case "Stopped":
-      set({ status: JobState.STOPPED, message: v.reason || "Detenido" });
+      set({ status: JobState.STOPPED, stopping: false, message: v.reason || "Detenido" });
       break;
     case "Checkpoint":
       set({ message: `Checkpoint ${v.kind} guardado` });
@@ -130,9 +133,12 @@ export function pollStatus() {
     .then((s) => {
       if (!s) return;
 
-      // Reflect paused state even if no new event arrived.
+      // Reflect paused/stopping state even if no new event arrived.
       if (s.paused !== store.paused) {
         set({ paused: s.paused, message: s.paused ? "Entrenamiento pausado" : "Entrenamiento reanudado" });
+      }
+      if (Boolean(s.stopping) !== store.stopping) {
+        set({ stopping: Boolean(s.stopping), message: s.stopping ? "Deteniendo y guardando checkpoint…" : store.message });
       }
 
       // Chart backfill: after a reload/restart the server may hold loss

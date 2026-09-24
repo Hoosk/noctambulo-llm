@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::data::LlmTokenizer;
 use crate::train::{TrainingEvent, train_with_events};
-use crate::serve::state::ServerState;
+use crate::serve::state::{PERSIST_INTERVAL, ServerState, forces_persist};
 
 /// Parameters of a training job, mirroring the CLI `train` subcommand.
 #[derive(Debug, Clone)]
@@ -157,6 +157,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
             std::fs::create_dir_all("logs").ok();
             PathBuf::from("logs").join(format!("train_{}.log", job_id_fwd))
         };
+        let mut last_persist: Option<std::time::Instant> = None;
         while let Ok(event) = rx.recv() {
             {
                 let mut job = forwarder_state.job.write().unwrap();
@@ -188,7 +189,15 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
                 }
                 _ => {}
             }
-            forwarder_state.persist();
+            // Throttle disk writes: persistence is needed for restart/backfill,
+            // not on every progress tick.
+            let due = last_persist
+                .map(|t| t.elapsed() >= PERSIST_INTERVAL)
+                .unwrap_or(true);
+            if forces_persist(&event) || due {
+                forwarder_state.persist();
+                last_persist = Some(std::time::Instant::now());
+            }
             let _ = forwarder_events.send(event);
         }
     });

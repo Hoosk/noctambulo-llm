@@ -4,6 +4,10 @@
 
 import { el } from "../core/dom.js";
 
+const FONT = "'JetBrains Mono', ui-monospace, monospace";
+const VIOLET = "139, 92, 246";
+const FUCHSIA = "217, 70, 239";
+
 export default class LossChart {
   constructor() {
     this.history = []; // {x: step, y: loss}
@@ -24,6 +28,24 @@ export default class LossChart {
     if (this.chart || !this.canvas) return;
     const ctx = this.canvas.getContext("2d");
 
+    // Gradient helpers resolve lazily: chartArea is unknown until first layout.
+    const strokeGradient = (c) => {
+      const { chartArea, ctx: g2d } = c.chart;
+      if (!chartArea) return `rgb(${VIOLET})`;
+      const g = g2d.createLinearGradient(chartArea.left, 0, chartArea.right, 0);
+      g.addColorStop(0, `rgb(${VIOLET})`);
+      g.addColorStop(1, `rgb(${FUCHSIA})`);
+      return g;
+    };
+    const fillGradient = (c) => {
+      const { chartArea, ctx: g2d } = c.chart;
+      if (!chartArea) return `rgba(${VIOLET}, 0.14)`;
+      const g = g2d.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+      g.addColorStop(0, `rgba(${VIOLET}, 0.26)`);
+      g.addColorStop(1, `rgba(${VIOLET}, 0)`);
+      return g;
+    };
+
     this.chart = new Chart(ctx, {
       type: "line",
       data: {
@@ -31,12 +53,17 @@ export default class LossChart {
           {
             label: "Loss",
             data: this.history,
-            borderColor: "#8b5cf6",
-            backgroundColor: "rgba(139,92,246,0.08)",
+            borderColor: strokeGradient,
+            backgroundColor: fillGradient,
             fill: true,
             tension: 0.3,
-            pointRadius: 2,
+            pointRadius: (c) =>
+              this.history.length > 1 && c.dataIndex === this.history.length - 1 ? 3 : 0,
+            pointBackgroundColor: "#a78bfa",
+            pointBorderColor: "#0f172a",
+            pointBorderWidth: 1.5,
             pointHoverRadius: 4,
+            pointHoverBackgroundColor: "#c4b5fd",
             borderWidth: 2,
           },
         ],
@@ -49,23 +76,34 @@ export default class LossChart {
         plugins: {
           legend: { display: false },
           tooltip: {
-            backgroundColor: "#0f172a",
-            borderColor: "#334155",
+            backgroundColor: "rgba(2, 6, 23, 0.92)",
+            borderColor: `rgba(${VIOLET}, 0.35)`,
             borderWidth: 1,
+            cornerRadius: 10,
+            padding: 10,
+            displayColors: false,
             titleColor: "#e2e8f0",
-            bodyColor: "#94a3b8",
+            bodyColor: "#c4b5fd",
+            titleFont: { family: FONT, size: 10 },
+            bodyFont: { family: FONT, size: 12, weight: 600 },
+            callbacks: {
+              title: (items) => (items.length ? `step ${items[0].parsed.x}` : ""),
+              label: (item) => `loss ${Number(item.parsed.y).toFixed(4)}`,
+            },
           },
         },
         scales: {
           x: {
-            grid: { color: "rgba(51,65,85,0.3)" },
-            ticks: { color: "#64748b", maxTicksLimit: 10 },
-            title: { display: true, text: "step", color: "#64748b" },
+            grid: { color: "rgba(51, 65, 85, 0.15)" },
+            border: { color: "rgba(51, 65, 85, 0.4)" },
+            ticks: { color: "#64748b", maxTicksLimit: 10, font: { family: FONT, size: 10 } },
+            title: { display: true, text: "step", color: "#475569", font: { size: 10 } },
           },
           y: {
-            grid: { color: "rgba(51,65,85,0.3)" },
-            ticks: { color: "#64748b" },
-            title: { display: true, text: "loss", color: "#64748b" },
+            grid: { color: "rgba(51, 65, 85, 0.15)" },
+            border: { color: "rgba(51, 65, 85, 0.4)" },
+            ticks: { color: "#64748b", font: { family: FONT, size: 10 } },
+            title: { display: true, text: "loss", color: "#475569", font: { size: 10 } },
           },
         },
       },

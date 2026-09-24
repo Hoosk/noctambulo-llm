@@ -35,6 +35,24 @@ struct PersistedState {
     loss_points: Vec<LossPoint>,
 }
 
+/// Minimum interval between `persist()` writes during a running job. Progress
+/// events arrive at least twice per second; rewriting the state file on each of
+/// them is pure disk churn.
+pub const PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Rare or terminal events must be written immediately (they carry state the
+/// UI/backfill needs even if the server restarts right after).
+pub fn forces_persist(event: &TrainingEvent) -> bool {
+    matches!(
+        event,
+        TrainingEvent::Done { .. }
+            | TrainingEvent::Stopped { .. }
+            | TrainingEvent::Checkpoint { .. }
+            | TrainingEvent::Val { .. }
+            | TrainingEvent::EpochComplete { .. }
+    )
+}
+
 /// Shared server state, wrapped in `Arc` and handed to every handler.
 pub struct ServerState {
     pub token: RwLock<Option<String>>,
@@ -251,6 +269,38 @@ mod tests {
 
         let (none, _) = st.log_since(10);
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn test_forces_persist_only_on_rare_events() {
+        assert!(forces_persist(&TrainingEvent::Done {
+            final_loss: 1.0,
+            total_time_secs: 1.0,
+            weights_path: "w".into(),
+            config_path: "c".into(),
+        }));
+        assert!(forces_persist(&TrainingEvent::Stopped {
+            reason: "stop".into(),
+            epoch: 1,
+            batch: 0,
+        }));
+        assert!(forces_persist(&TrainingEvent::Val { loss: 1.0, ppl: 2.0, epoch: 1 }));
+        assert!(!forces_persist(&TrainingEvent::LogEvent { line: "x".into(), ts: 0 }));
+        assert!(!forces_persist(&TrainingEvent::Progress {
+            step: 1,
+            epoch: 1,
+            epochs: 1,
+            batch: 1,
+            num_batches: 1,
+            pct: 1.0,
+            loss: 1.0,
+            avg_loss: 1.0,
+            lr: 1e-4,
+            batches_per_sec: 1.0,
+            elapsed_secs: 1.0,
+            eta_secs: 1.0,
+            current_n_ctx: 8,
+        }));
     }
 
     #[test]

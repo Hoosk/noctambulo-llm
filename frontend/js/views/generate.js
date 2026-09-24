@@ -3,6 +3,7 @@
 import { api } from "../core/api.js";
 import { clear, el } from "../core/dom.js";
 import { getActiveModel } from "./models.js";
+import { viewTitle, btn, iconSvg, catLogoSvg, stagger } from "../components/ui.js";
 
 export default class GenerateView {
   constructor(root) {
@@ -14,7 +15,7 @@ export default class GenerateView {
   async render() {
     clear(this.root);
     this.root.append(
-      el("h2", { class: "text-xl font-semibold text-white mb-6" }, "Generar texto"),
+      viewTitle("Generar texto", "Generación autorregresiva con parámetros de muestreo."),
     );
 
     try {
@@ -24,7 +25,7 @@ export default class GenerateView {
       return;
     }
 
-    const modelSel = el("select", { class: "w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white" });
+    const modelSel = el("select", { class: inputCls });
     const active = getActiveModel();
     for (const m of this.models) {
       const selected = m.dir === active || (!active && m.default) || null;
@@ -33,7 +34,7 @@ export default class GenerateView {
 
     const prompt = el("textarea", {
       rows: 4,
-      class: "w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white resize-y",
+      class: `${inputCls} resize-y leading-relaxed`,
       placeholder: "Once upon a time...",
     }, "Once upon a time");
 
@@ -44,7 +45,7 @@ export default class GenerateView {
         value: val,
         min,
         step,
-        class: "w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white",
+        class: inputCls,
       });
 
     const params = {
@@ -56,20 +57,26 @@ export default class GenerateView {
       repetition_penalty: numInput("gen-rep", 1.2, 1, 0.05),
     };
 
-    const output = el("pre", { class: "mt-4 p-4 rounded-xl bg-slate-950 border border-slate-800 text-sm whitespace-pre-wrap text-slate-200 min-h-24" }, "—");
-    const msg = el("p", { class: "text-sm text-slate-400 mt-3" }, "");
+    const output = el("div", {
+      class: "mt-4 rounded-xl bg-slate-950/70 border border-slate-800/70 border-l-2 border-l-violet-500/60 p-4 min-h-24",
+    }, [
+      el("pre", { class: "text-sm whitespace-pre-wrap text-slate-200 leading-relaxed" }, "—"),
+    ]);
+    const msg = el("p", { class: "text-xs text-slate-400 mt-3" }, "");
 
     const field = (label, input) =>
-      el("label", { class: "block text-xs text-slate-400" }, [
+      el("label", { class: "block text-xs font-medium text-slate-400" }, [
         label,
         input,
       ]);
 
+    const runBtn = btn.primary("Generar", () => {});
     const run = async () => {
       if (this.busy) return;
       this.busy = true;
-      msg.textContent = "Generando…";
-      msg.className = "text-sm text-violet-300 mt-3";
+      runBtn.disabled = true;
+      const prev = runBtn.innerHTML;
+      runBtn.innerHTML = `${iconSvg("loader", "w-4 h-4 animate-spin")} Generando…`;
       try {
         const res = await api.post("/api/generate", {
           modelDir: modelSel.value,
@@ -81,27 +88,37 @@ export default class GenerateView {
           minP: Number(params.min_p.value),
           repetitionPenalty: Number(params.repetition_penalty.value),
         });
-        output.textContent = res.text;
+        output.querySelector("pre").textContent = res.text;
         msg.textContent = "";
       } catch (e) {
-        output.textContent = "";
+        output.querySelector("pre").textContent = "";
         msg.textContent = `Error: ${e.message}`;
-        msg.className = "text-sm text-rose-400 mt-3";
+        msg.className = "text-xs text-rose-400 mt-3";
       } finally {
         this.busy = false;
+        runBtn.disabled = false;
+        runBtn.innerHTML = prev;
       }
     };
+    runBtn.onclick = run;
 
-    const card = (title, body) =>
-      el("div", { class: "rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
-        el("h3", { class: "text-sm font-medium text-slate-300 mb-3" }, title),
-        ...body,
+    const card = (title, body, extra = "") =>
+      el("div", { class: `glass-card rounded-2xl p-5 min-w-0 ${extra}` }, [
+        el("h3", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4" }, title),
+        ...[].concat(body),
       ]);
 
-    const layout = el("div", { class: "grid grid-cols-1 lg:grid-cols-2 gap-5" }, [
+    const resultCard = card("Resultado", [
+      el("div", { class: "flex items-start gap-3" }, [
+        catLogoSvg("w-8 h-8 shrink-0 mt-1"),
+        output,
+      ]),
+    ], "lg:sticky lg:top-6 self-start");
+
+    const layout = el("div", { class: "grid grid-cols-1 lg:grid-cols-2 gap-5 items-start" }, [
       card("Configuración", [
-        el("label", { class: "block text-xs text-slate-400 mb-3" }, ["Modelo", modelSel]),
-        el("label", { class: "block text-xs text-slate-400 mb-3" }, ["Prompt", prompt]),
+        el("label", { class: "block text-xs font-medium text-slate-400 mb-3" }, ["Modelo", modelSel]),
+        el("label", { class: "block text-xs font-medium text-slate-400 mb-3" }, ["Prompt", prompt]),
         el("div", { class: "grid grid-cols-3 gap-3 mt-2" }, [
           field("Max tokens", params.max_tokens),
           field("Temperatura", params.temperature),
@@ -112,15 +129,16 @@ export default class GenerateView {
           field("Min-P", params.min_p),
           field("Repetition", params.repetition_penalty),
         ]),
-        el("button", {
-          class: "mt-5 w-full py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium transition",
-          onclick: run,
-        }, "Generar"),
+        el("div", { class: "mt-5" }, [runBtn]),
         msg,
       ]),
-      card("Resultado", [output]),
+      resultCard,
     ]);
 
     this.root.append(layout);
+    stagger(this.root);
   }
 }
+
+const inputCls =
+  "w-full px-3 py-2 mt-1.5 rounded-lg bg-slate-950/70 border border-slate-700/60 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/30 transition";

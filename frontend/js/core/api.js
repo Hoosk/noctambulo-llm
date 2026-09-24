@@ -36,6 +36,9 @@ async function request(path, options = {}) {
   });
 
   if (res.status === 401) {
+    // Token revoked/expired mid-session: drop it and let the app show the gate.
+    setToken("");
+    window.dispatchEvent(new CustomEvent("kuro:unauthorized"));
     throw new ApiError(401, "Token inválido o ausente");
   }
 
@@ -58,6 +61,9 @@ export const api = {
   get(path) {
     return request(path);
   },
+  ping() {
+    return request("/api/ping");
+  },
   getLogs(since = 0) {
     return request(`/api/train/logs?since=${since}`);
   },
@@ -69,12 +75,5 @@ export const api = {
   },
   delete(path) {
     return request(path, { method: "DELETE" });
-  },
-  async downloadUrl(path) {
-    const res = await fetch(`/api/download/${encodeURIComponent(path)}`, {
-      headers: buildHeaders(false),
-    });
-    if (!res.ok) throw new ApiError(res.status, "No se pudo descargar");
-    return res.url;
   },
 };

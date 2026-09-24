@@ -5,6 +5,7 @@ import { on } from "../core/events.js";
 import { getJob, JobState } from "../core/store.js";
 import { clear, el, fmtBytes, fmtDur } from "../core/dom.js";
 import LossChart from "../components/chart.js";
+import { statCard, stagger } from "../components/ui.js";
 
 export default class TrainView {
   constructor(root) {
@@ -34,11 +35,12 @@ export default class TrainView {
     const right = this.buildMetrics();
 
     this.root.append(
-      el("div", { class: "grid min-w-0 grid-cols-1 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)] gap-6" }, [
+      el("div", { class: "grid min-w-0 grid-cols-1 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)] gap-6 items-start" }, [
         left,
         right,
       ]),
     );
+    stagger(this.root);
 
     // Chart.js must init after the canvas is in the DOM.
     this.chart.attach();
@@ -76,14 +78,26 @@ export default class TrainView {
           this.logLines.splice(0, this.logLines.length - 800);
         }
         this.logSince = res.total;
-        view.textContent = this.logLines.join("\n");
-        view.scrollTop = view.scrollHeight;
+        this.renderLogLines(view);
       }
     } catch {
       /* ignore transient errors */
     } finally {
       this._logBusy = false;
     }
+  }
+
+  // Terminal-style render: color each line by severity keyword.
+  renderLogLines(view) {
+    const lineNode = (line) => {
+      let cls = "text-slate-400";
+      if (/error|panic|failed|fatal/i.test(line)) cls = "text-rose-400";
+      else if (/warn/i.test(line)) cls = "text-amber-300";
+      else if (/^== |checkpoint/i.test(line)) cls = "text-violet-300";
+      return el("div", { class: cls }, line);
+    };
+    view.replaceChildren(...this.logLines.map(lineNode));
+    view.scrollTop = view.scrollHeight;
   }
 
   // ------------------------------------------------------------------ form
@@ -113,52 +127,52 @@ export default class TrainView {
         class: inputCls,
       });
       this.fields[id] = input;
-      return el("label", { class: "block text-xs text-slate-400" }, [label, input]);
+      return el("label", { class: fieldLabelCls }, [label, input]);
     };
 
     const textField = (label, id, val) => {
       const input = el("input", { id, type: "text", value: val, class: inputCls });
       this.fields[id] = input;
-      return el("label", { class: "block text-xs text-slate-400" }, [label, input]);
+      return el("label", { class: fieldLabelCls }, [label, input]);
     };
 
     const startBtn = el("button", {
       id: "train-start",
-      class: "flex-1 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-medium transition disabled:opacity-40",
+      class: "flex-1 py-2 rounded-lg bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white text-sm font-medium shadow-lg shadow-violet-600/25 transition active:scale-[0.98] disabled:opacity-40",
       onclick: () => this.start(),
     }, "Iniciar");
 
     const stopBtn = el("button", {
       id: "train-stop",
-      class: "flex-1 py-2 rounded-lg bg-rose-700 hover:bg-rose-600 text-white font-medium transition disabled:opacity-40",
+      class: "flex-1 py-2 rounded-lg bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-500 hover:to-rose-600 text-white text-sm font-medium shadow-lg shadow-rose-600/20 transition active:scale-[0.98] disabled:opacity-40",
       onclick: () => this.stop(),
     }, "Detener");
 
     const pauseBtn = el("button", {
       id: "train-pause",
-      class: "flex-1 py-2 rounded-lg bg-amber-700 hover:bg-amber-600 text-white font-medium transition disabled:opacity-40",
+      class: "flex-1 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-sm font-medium shadow-lg shadow-amber-600/20 transition active:scale-[0.98] disabled:opacity-40",
       onclick: () => this.pause(),
     }, "Pausar");
 
-    const msg = el("p", { id: "train-msg", class: "text-sm text-slate-400 mt-3" }, "");
+    const msg = el("p", { id: "train-msg", class: "text-xs text-slate-400 mt-3" }, "");
 
     const resumeCheckbox = el("input", {
       id: "train-resume",
       type: "checkbox",
-      class: "accent-violet-500",
+      class: "w-4 h-4 rounded accent-violet-500 cursor-pointer",
       onchange: (e) => this.toggleResume(e.target.checked),
     });
 
     const resumeSelect = el("select", {
       id: "train-resume-cp",
-      class: `${inputCls} mt-2 disabled:opacity-40 disabled:cursor-not-allowed`,
+      class: `${inputCls} disabled:opacity-40 disabled:cursor-not-allowed`,
       disabled: true,
     }, el("option", { value: "" }, "— selecciona checkpoint —"));
 
-    const card = el("div", { class: "min-w-0 rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
-      el("h3", { class: "text-sm font-medium text-slate-300 mb-4" }, "Configuración"),
-      el("label", { class: "block text-xs text-slate-400 mb-3" }, ["Dataset", dsSel]),
-      el("label", { class: "block text-xs text-slate-400 mb-4" }, ["Dispositivo", devSel]),
+    const card = el("div", { class: "glass-card rounded-2xl p-5 lg:sticky lg:top-6 self-start min-w-0" }, [
+      el("h3", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4" }, "Configuración"),
+      el("label", { class: fieldLabelCls + " mb-3" }, ["Dataset", dsSel]),
+      el("label", { class: fieldLabelCls + " mb-4" }, ["Dispositivo", devSel]),
       el("div", { class: "grid grid-cols-2 gap-3" }, [
         field("Epochs", "train-epochs", 1, { min: 1 }),
         field("Batch", "train-batch", 32, { min: 1 }),
@@ -170,13 +184,17 @@ export default class TrainView {
         field("n_layer", "train-nLayer", 4, { min: 1 }),
         field("Val split", "train-valSplit", 0.02, { step: 0.01, min: 0, max: 0.9 }),
         field("Grad accum", "train-gradAccum", 1, { min: 1 }),
+        field("KV heads (GQA)", "train-nKvHead", 0, { min: 0 }),
+        field("Dropout", "train-dropout", 0.1, { step: 0.05, min: 0, max: 0.9 }),
+        field("Attn softcap", "train-attnSoftcap", 0, { step: 1, min: 0 }),
+        field("Seq warmup steps", "train-seqWarmup", 0, { min: 0 }),
       ]),
       el("div", { class: "grid grid-cols-2 gap-3 mt-3" }, [
         textField("Save dir", "train-saveDir", "checkpoints_web"),
         textField("Output dir", "train-outputDir", "model_output"),
       ]),
-      el("div", { class: "mt-3" }, [
-        el("label", { class: "flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none" }, [
+      el("div", { class: "mt-4" }, [
+        el("label", { class: "flex items-center gap-2.5 text-xs text-slate-400 cursor-pointer select-none" }, [
           resumeCheckbox,
           "Reanudar pesos desde checkpoint (warm start)",
         ]),
@@ -237,28 +255,28 @@ export default class TrainView {
 
   // --------------------------------------------------------------- metrics
   buildMetrics() {
-    const statCards = el("div", { id: "train-stats", class: "grid min-w-0 grid-cols-2 sm:grid-cols-3 gap-3 mb-4" });
+    const statCards = el("div", { id: "train-stats", class: "grid min-w-0 grid-cols-2 sm:grid-cols-3 gap-3 mb-5" });
 
-    const card = el("div", { class: "min-w-0 rounded-2xl border border-slate-800 bg-slate-900 p-5" }, [
-      el("div", { class: "flex items-center justify-between mb-4" }, [
-        el("h3", { class: "text-sm font-medium text-slate-300" }, "Métricas en vivo"),
-        el("span", { id: "train-status-badge", class: "text-xs px-2 py-0.5 rounded-full bg-slate-800 text-slate-400" }, "idle"),
+    const card = el("div", { class: "glass-card rounded-2xl p-5 min-w-0" }, [
+      el("div", { class: "flex items-center justify-between gap-3 mb-5" }, [
+        el("h3", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500" }, "Métricas en vivo"),
+        el("span", { id: "train-status-badge", class: badgeIdleCls }, "idle"),
       ]),
       statCards,
       this.chart.build(),
-      el("div", { class: "mt-4" }, [
-        el("h4", { class: "text-xs font-medium text-slate-400 mb-2" }, "Progress"),
-        el("div", { class: "h-2 rounded-full bg-slate-800 overflow-hidden" }, [
-          el("div", { id: "train-progress", class: "h-full bg-violet-600 transition-all duration-300", style: "width:0%" }),
+      el("div", { class: "mt-5" }, [
+        el("h4", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-2" }, "Progress"),
+        el("div", { class: "h-2.5 rounded-full bg-slate-800/80 overflow-hidden" }, [
+          el("div", { id: "train-progress", class: "h-full w-0 bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-all duration-300" }),
         ]),
       ]),
       el("div", { class: "mt-5" }, [
-        el("h4", { class: "text-xs font-medium text-slate-400 mb-2" }, "Preview"),
-        el("pre", { id: "train-preview", class: "p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs whitespace-pre-wrap text-slate-300 min-h-16" }, "—"),
+        el("h4", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-2" }, "Preview"),
+        el("pre", { id: "train-preview", class: "p-3.5 rounded-xl bg-slate-950/70 border border-slate-800/70 border-l-2 border-l-violet-500/60 text-xs whitespace-pre-wrap text-slate-300 min-h-16 leading-relaxed" }, "—"),
       ]),
-      el("details", { class: "mt-5", open: true }, [
-        el("summary", { class: "text-xs font-medium text-slate-400 cursor-pointer select-none" }, "Logs del worker"),
-        el("pre", { id: "train-log", class: "mt-2 p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono whitespace-pre-wrap text-slate-400 h-40 overflow-y-auto" }, ""),
+      el("details", { class: "mt-5 group", open: true }, [
+        el("summary", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500 cursor-pointer select-none hover:text-slate-300 transition" }, "Logs del worker"),
+        el("pre", { id: "train-log", class: "mt-2 p-3 rounded-xl bg-black/40 border border-slate-800/70 text-[11px] font-mono leading-relaxed whitespace-pre-wrap h-44 overflow-y-auto" }, ""),
       ]),
     ]);
 
@@ -293,19 +311,23 @@ export default class TrainView {
         nLayer: Number(read("train-nLayer").value),
         valSplit: Number(read("train-valSplit").value),
         gradAccum: Number(read("train-gradAccum").value),
+        nKvHead: Number(read("train-nKvHead").value) || null,
+        dropout: Number(read("train-dropout").value),
+        attnSoftcap: Number(read("train-attnSoftcap").value),
+        seqWarmupSteps: Number(read("train-seqWarmup").value),
         saveDir: read("train-saveDir").value,
         outputDir: read("train-outputDir").value,
         resume: resumeOn && resumePath ? resumePath : undefined,
       };
     } catch (e) {
       msg.textContent = `Error de configuración: ${e.message}`;
-      msg.className = "text-sm text-rose-400 mt-3";
+      msg.className = "text-xs text-rose-400 mt-3";
       return;
     }
 
     if (!body.file || body.file === "sin datasets") {
       msg.textContent = "Selecciona un dataset para entrenar.";
-      msg.className = "text-sm text-rose-400 mt-3";
+      msg.className = "text-xs text-rose-400 mt-3";
       return;
     }
 
@@ -315,18 +337,18 @@ export default class TrainView {
     const resumePath = this.fields["train-resume-cp"]?.value || "";
     if (resumeOn && !resumePath) {
       msg.textContent = "Selecciona un checkpoint para reanudar o desactiva la casilla.";
-      msg.className = "text-sm text-rose-400 mt-3";
+      msg.className = "text-xs text-rose-400 mt-3";
       return;
     }
 
     this.busy = true;
     this.chart.reset();
     msg.textContent = "Iniciando…";
-    msg.className = "text-sm text-violet-300 mt-3";
+    msg.className = "text-xs text-violet-300 mt-3";
     try {
       const res = await api.post("/api/train", body);
       msg.textContent = res.jobId ? `Entrenamiento iniciado (${res.jobId})` : "Entrenamiento iniciado";
-      msg.className = "text-sm text-emerald-300 mt-3";
+      msg.className = "text-xs text-emerald-300 mt-3";
       // Reset the resume toggle so the next run does not silently reuse it.
       if (this.fields["train-resume"]) this.fields["train-resume"].checked = false;
       const cpSel = this.fields["train-resume-cp"];
@@ -336,7 +358,7 @@ export default class TrainView {
       }
     } catch (e) {
       msg.textContent = `Error: ${e.message}`;
-      msg.className = "text-sm text-rose-400 mt-3";
+      msg.className = "text-xs text-rose-400 mt-3";
     } finally {
       this.busy = false;
       this.sync();
@@ -348,10 +370,10 @@ export default class TrainView {
     try {
       await api.post("/api/train/stop", {});
       msg.textContent = "Parando…";
-      msg.className = "text-sm text-amber-300 mt-3";
+      msg.className = "text-xs text-amber-300 mt-3";
     } catch (e) {
       msg.textContent = `Error: ${e.message}`;
-      msg.className = "text-sm text-rose-400 mt-3";
+      msg.className = "text-xs text-rose-400 mt-3";
     }
   }
 
@@ -360,10 +382,10 @@ export default class TrainView {
     try {
       await api.post("/api/train/pause", {});
       msg.textContent = "Pausando…";
-      msg.className = "text-sm text-amber-300 mt-3";
+      msg.className = "text-xs text-amber-300 mt-3";
     } catch (e) {
       msg.textContent = `Error: ${e.message}`;
-      msg.className = "text-sm text-rose-400 mt-3";
+      msg.className = "text-xs text-rose-400 mt-3";
     }
   }
 
@@ -372,10 +394,10 @@ export default class TrainView {
     try {
       await api.post("/api/train/resume", {});
       msg.textContent = "Reanudando…";
-      msg.className = "text-sm text-emerald-300 mt-3";
+      msg.className = "text-xs text-emerald-300 mt-3";
     } catch (e) {
       msg.textContent = `Error: ${e.message}`;
-      msg.className = "text-sm text-rose-400 mt-3";
+      msg.className = "text-xs text-rose-400 mt-3";
     }
   }
 
@@ -401,32 +423,38 @@ export default class TrainView {
 
     if (badge) {
       const map = {
-        [JobState.RUNNING]: ["bg-violet-900 text-violet-300", "entrenando"],
-        [JobState.DONE]: ["bg-emerald-900 text-emerald-300", "completado"],
-        [JobState.STOPPED]: ["bg-amber-900 text-amber-300", "detenido"],
-        [JobState.ERROR]: ["bg-rose-900 text-rose-300", "error"],
+        [JobState.RUNNING]: ["border-violet-500/30 bg-violet-500/15 text-violet-300", "entrenando", true],
+        [JobState.DONE]: ["border-emerald-500/30 bg-emerald-500/15 text-emerald-300", "completado", false],
+        [JobState.STOPPED]: ["border-amber-500/30 bg-amber-500/15 text-amber-300", "detenido", false],
+        [JobState.ERROR]: ["border-rose-500/30 bg-rose-500/15 text-rose-300", "error", false],
       };
       const running = job.status === JobState.RUNNING;
-      const [cls, label] = map[job.status] || ["bg-slate-800 text-slate-400", "idle"];
-      badge.className = `text-xs px-2 py-0.5 rounded-full ${cls}`;
-      badge.textContent = job.paused && running ? "pausado" : label;
+      const [cls, label, pulse] = map[job.status] || [badgeIdleCls, "idle", false];
+      badge.className = `inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full border ${cls}${pulse ? " animate-pulse" : ""}`;
+      badge.textContent = job.paused && running ? "pausado" : job.stopping && running ? "deteniendo" : label;
     }
     if (startBtn) startBtn.disabled = job.status === JobState.RUNNING;
-    if (stopBtn) stopBtn.disabled = job.status !== JobState.RUNNING;
+    if (stopBtn) {
+      stopBtn.disabled = job.status !== JobState.RUNNING || job.stopping;
+      stopBtn.textContent = job.stopping ? "Deteniendo…" : "Detener";
+    }
     if (pauseBtn) {
       const running = job.status === JobState.RUNNING;
-      pauseBtn.disabled = !running;
+      pauseBtn.disabled = !running || job.stopping;
       pauseBtn.textContent = job.paused ? "Reanudar" : "Pausar";
-      pauseBtn.className = `flex-1 py-2 rounded-lg font-medium transition disabled:opacity-40 ${
+      pauseBtn.className = `flex-1 py-2 rounded-lg text-white text-sm font-medium shadow-lg transition active:scale-[0.98] disabled:opacity-40 ${
         job.paused
-          ? "bg-emerald-700 hover:bg-emerald-600 text-white"
-          : "bg-amber-700 hover:bg-amber-600 text-white"
+          ? "bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/20"
+          : "bg-amber-600 hover:bg-amber-500 shadow-amber-600/20"
       }`;
       pauseBtn.onclick = job.paused ? () => this.resume() : () => this.pause();
     }
 
     const pb = document.getElementById("train-progress");
-    if (pb) pb.style.width = `${job.pct || 0}%`;
+    if (pb) {
+      pb.style.width = `${job.pct || 0}%`;
+      pb.classList.toggle("progress-shimmer", job.status === JobState.RUNNING && !job.paused);
+    }
 
     const preview = document.getElementById("train-preview");
     if (preview && job.preview) preview.textContent = job.preview;
@@ -442,27 +470,28 @@ export default class TrainView {
     if (!box) return;
     clear(box);
 
-    const stat = (label, value, sub) =>
-      el("div", { class: "rounded-xl bg-slate-950 border border-slate-800 px-4 py-3" }, [
-        el("div", { class: "text-xs text-slate-500" }, label),
-        el("div", { class: "text-lg font-semibold text-white mt-0.5" }, value),
-        sub ? el("div", { class: "text-xs text-slate-500 mt-0.5" }, sub) : null,
-      ]);
+    const stat = (label, value, iconName, tone = "slate", sub) =>
+      statCard(label, value, { icon: iconName, tone, sub });
+
+    const lossGood = job.loss != null && job.avgLoss != null && job.loss <= job.avgLoss;
 
     const items = [
-      stat("Epoch", job.epochs ? `${job.epoch}/${job.epochs}` : "—"),
-      stat("Batch", job.numBatches ? `${job.batch}/${job.numBatches}` : "—"),
-      stat("Loss", job.loss != null ? job.loss.toFixed(4) : "—"),
-      stat("Avg Loss", job.avgLoss != null ? job.avgLoss.toFixed(4) : "—"),
-      stat("PPL val", job.valPpl != null ? job.valPpl.toFixed(2) : "—"),
-      stat("Velocidad", job.batchesPerSec != null ? `${job.batchesPerSec.toFixed(1)} b/s` : "—"),
-      stat("ETA", fmtDur(job.etaSecs)),
-      stat("Transcurrido", fmtDur(job.elapsedSecs)),
-      stat("Progreso", job.pct != null ? `${job.pct.toFixed(1)}%` : "—"),
+      stat("Epoch", job.epochs ? `${job.epoch}/${job.epochs}` : "—", "layers", "violet"),
+      stat("Batch", job.numBatches ? `${job.batch}/${job.numBatches}` : "—", "gauge", "sky"),
+      stat("Contexto", job.nCtx ? `${job.nCtx} tok` : "—", "cpu", "sky"),
+      stat("Loss", job.loss != null ? job.loss.toFixed(4) : "—", "activity", job.loss == null ? "slate" : lossGood ? "emerald" : "amber"),
+      stat("Avg Loss", job.avgLoss != null ? job.avgLoss.toFixed(4) : "—", "gauge", "slate"),
+      stat("PPL val", job.valPpl != null ? job.valPpl.toFixed(2) : "—", "zap", "fuchsia"),
+      stat("Velocidad", job.batchesPerSec != null ? `${job.batchesPerSec.toFixed(1)} b/s` : "—", "zap", "sky"),
+      stat("ETA", fmtDur(job.etaSecs), "clock", "amber"),
+      stat("Transcurrido", fmtDur(job.elapsedSecs), "clock", "slate"),
+      stat("Progreso", job.pct != null ? `${job.pct.toFixed(1)}%` : "—", "gauge", "violet"),
     ];
     for (const it of items) box.append(it);
   }
 }
 
+const badgeIdleCls = "inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full border border-slate-700 bg-slate-800/80 text-slate-400";
+const fieldLabelCls = "block text-xs font-medium text-slate-400";
 const inputCls =
-  "w-full px-3 py-2 mt-1 rounded-lg bg-slate-950 border border-slate-700 text-white focus:outline-none focus:ring-2 focus:ring-violet-500";
+  "w-full px-3 py-2 mt-1.5 rounded-lg bg-slate-950/70 border border-slate-700/60 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/30 transition";

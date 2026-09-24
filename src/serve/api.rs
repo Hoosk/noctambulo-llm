@@ -23,6 +23,7 @@ use crate::train::TrainingEvent;
 pub fn router(state: Arc<ServerState>) -> (Router, Arc<JobRegistry>) {
     let registry = Arc::new(JobRegistry::new());
     let router = Router::new()
+        .route("/api/ping", get(ping))
         .route("/api/devices", get(devices))
         .route("/api/datasets", get(datasets))
         .route("/api/datasets/download", post(dataset_download))
@@ -73,6 +74,14 @@ fn check_token(server: &ServerState, headers: &HeaderMap, query: Option<&str>) -
         }
     }
     Ok(())
+}
+
+/// Lightweight authenticated health check used by the frontend token gate
+/// (much faster than enumerating WGPU adapters).
+#[allow(clippy::unused_async)]
+async fn ping(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, Response> {
+    check_token(&state.server, &headers, None)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 fn query_token(query: Option<&str>) -> Option<String> {
@@ -174,21 +183,26 @@ fn enum_adapter_specs() -> Vec<DeviceInfo> {
     out
 }
 
-#[allow(clippy::unused_async)]
 async fn devices(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<DeviceInfo>>, Response> {
     check_token(&state.server, &headers, None)?;
 
-    // WGPU adapter enumeration can be slow/blocking; run it off the async core.
-    // Guard against panics from missing GPU drivers so the server stays up.
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<DeviceInfo>>();
-    std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(enum_adapter_specs));
-        let _ = tx.send(result.unwrap_or_default());
-    });
-    let specs = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
+    // WGPU adapter enumeration is blocking; run it on a blocking thread pool so
+    // it never parks an async worker. Timeout keeps a hung driver from locking
+    // the endpoint (the detached task is simply abandoned).
+    let specs = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::task::spawn_blocking(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(enum_adapter_specs))
+                .unwrap_or_default()
+        }),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
 
     if specs.is_empty() {
         // Fallback: expose the selectors we know the runner supports.
@@ -278,22 +292,29 @@ fn list_dataset_infos(dir: &Path) -> Vec<DatasetInfo> {
     out
 }
 
+/// True when `name` is a single, separator-free path component that is safe to
+/// join under a root directory (rejects `..`, absolute paths and separators).
+fn is_safe_child_name(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    Path::new(name)
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
 /// Resolve a user-supplied dataset name to a safe path inside the datasets dir.
 /// Only a bare file name (no path separators / traversal) is accepted.
 fn resolve_dataset(dir: &Path, name: &str) -> Result<std::path::PathBuf, Response> {
-    let file_name = Path::new(name).file_name().and_then(|n| n.to_str());
-    let file_name = match file_name {
-        Some(n) if !n.is_empty() && n == name => n,
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid dataset path" })),
-            )
-                .into_response())
-        }
-    };
+    if !is_safe_child_name(name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid dataset path" })),
+        )
+            .into_response());
+    }
 
-    let cand = dir.join(file_name);
+    let cand = dir.join(name);
     if !cand.is_file() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -302,6 +323,59 @@ fn resolve_dataset(dir: &Path, name: &str) -> Result<std::path::PathBuf, Respons
             .into_response());
     }
     Ok(cand)
+}
+
+/// Validate a new output file name inside the datasets dir (must not exist
+/// yet). Rejects traversal so `/api/datasets/combine` cannot write elsewhere.
+fn resolve_dataset_output(dir: &Path, name: &str) -> Result<std::path::PathBuf, Response> {
+    if !is_safe_child_name(name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid output name" })),
+        )
+            .into_response());
+    }
+    Ok(dir.join(name))
+}
+
+/// Resolve a model directory request. Bare names are resolved under the models
+/// root; explicit paths are accepted only if they canonicalize inside it.
+fn resolve_model_dir(root: &Path, requested: &str) -> Result<std::path::PathBuf, Response> {
+    if requested.trim().is_empty() {
+        return Ok(root.join("model_output"));
+    }
+
+    let candidate = if is_safe_child_name(requested) {
+        root.join(requested)
+    } else {
+        std::path::PathBuf::from(requested)
+    };
+    let canonical = std::fs::canonicalize(&candidate).map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("model dir not found: {requested}") })),
+        )
+            .into_response()
+    })?;
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if !canonical.starts_with(&canonical_root) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "model dir outside the models directory" })),
+        )
+            .into_response());
+    }
+    Ok(canonical)
+}
+
+/// Validate the exported GGUF base name so `/api/export` cannot escape
+/// `exported/` (e.g. `../foo`) or produce surprising file names.
+fn is_safe_export_name(name: &str) -> bool {
+    is_safe_child_name(name)
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 #[allow(clippy::unused_async)]
@@ -320,7 +394,6 @@ struct DatasetDownloadRequest {
 
 fn default_download_filename() -> String { "TinyStories-train.txt".into() }
 
-#[allow(clippy::unused_async)]
 async fn dataset_download(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -331,22 +404,24 @@ async fn dataset_download(
     if repo_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "repoId is required" }))).into_response());
     }
+    let filename = req.filename.clone();
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<std::path::PathBuf, String>>();
-    std::thread::spawn(move || {
-        let _ = tx.send(
-            crate::data::download_dataset_from_hf(&repo_id, &req.filename)
-                .map_err(|e| e.to_string()),
-        );
-    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        tokio::task::spawn_blocking(move || {
+            crate::data::download_dataset_from_hf(&repo_id, &filename).map_err(|e| e.to_string())
+        }),
+    )
+    .await;
 
-    match rx.recv_timeout(std::time::Duration::from_secs(300)) {
-        Ok(Ok(path)) => Ok(Json(serde_json::json!({
+    match result {
+        Ok(Ok(Ok(path))) => Ok(Json(serde_json::json!({
             "status": "ok",
             "path": path.to_string_lossy(),
             "name": path.file_name().unwrap_or_default().to_string_lossy(),
         }))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Ok(Ok(Err(e))) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("download task failed: {e}") }))).into_response()),
         Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "error": "download timed out" }))).into_response()),
     }
 }
@@ -370,7 +445,6 @@ struct DatasetHit {
     tags: Vec<String>,
 }
 
-#[allow(clippy::unused_async)]
 async fn dataset_search(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -389,9 +463,9 @@ async fn dataset_search(
         limit
     );
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<DatasetHit>, String>>();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<Vec<DatasetHit>, String> {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(25),
+        tokio::task::spawn_blocking(move || -> Result<Vec<DatasetHit>, String> {
             let client = reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(20))
                 .build()
@@ -429,13 +503,14 @@ async fn dataset_search(
                 });
             }
             Ok(hits)
-        })();
-        let _ = tx.send(result);
-    });
+        }),
+    )
+    .await;
 
-    match rx.recv_timeout(std::time::Duration::from_secs(25)) {
-        Ok(Ok(hits)) => Ok(Json(hits)),
-        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e }))).into_response()),
+    match result {
+        Ok(Ok(Ok(hits))) => Ok(Json(hits)),
+        Ok(Ok(Err(e))) => Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": e }))).into_response()),
+        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, Json(serde_json::json!({ "error": format!("search task failed: {e}") }))).into_response()),
         Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "error": "search timed out" }))).into_response()),
     }
 }
@@ -503,7 +578,6 @@ async fn dataset_delete(
     Ok(Json(serde_json::json!({ "status": "ok", "deleted": name })))
 }
 
-#[allow(clippy::unused_async)]
 async fn dataset_info(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -521,11 +595,15 @@ async fn dataset_info(
         "ext": ext,
     });
 
-    // Cheap text stats: line count (for .txt) without loading fully.
+    // Cheap text stats: line count (for .txt) on a blocking thread so huge
+    // corpora (several GB) cannot park an async worker.
     if ext == "txt" {
-        if let Ok(f) = std::fs::File::open(&path) {
-            let reader = std::io::BufReader::new(f);
-            let lines = reader.lines().count();
+        let lines = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+            let reader = std::io::BufReader::new(std::fs::File::open(&path)?);
+            Ok(reader.lines().count())
+        })
+        .await;
+        if let Ok(Ok(lines)) = lines {
             info["lines"] = serde_json::json!(lines);
         }
     }
@@ -552,7 +630,6 @@ struct CombineSource {
 
 fn default_combine_output() -> String { "weighted_mix_web.txt".into() }
 
-#[allow(clippy::unused_async)]
 async fn dataset_combine(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -569,23 +646,27 @@ async fn dataset_combine(
         sources.push((p, s.weight));
     }
 
-    let output_path = state.server.datasets_dir.join(&req.output);
+    let output_path = resolve_dataset_output(&state.server.datasets_dir, &req.output)?;
     let max_chars = req.max_chars.unwrap_or(usize::MAX);
     let output_clone = output_path.clone();
-    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    std::thread::spawn(move || {
-        let result = crate::data::combine_and_mix_weighted(&sources, &output_clone, max_chars)
-            .map(|_| ())
-            .map_err(|e| e.to_string());
-        let _ = tx.send(result);
-    });
 
-    match rx.recv_timeout(std::time::Duration::from_secs(600)) {
-        Ok(Ok(())) => Ok(Json(serde_json::json!({
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(600),
+        tokio::task::spawn_blocking(move || {
+            crate::data::combine_and_mix_weighted(&sources, &output_clone, max_chars)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => Ok(Json(serde_json::json!({
             "status": "ok",
             "output": output_path.to_string_lossy(),
         }))),
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Ok(Ok(Err(e))) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("combine task failed: {e}") }))).into_response()),
         Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({ "error": "combine timed out" }))).into_response()),
     }
 }
@@ -797,15 +878,28 @@ async fn train(
 ) -> Result<Json<serde_json::Value>, Response> {
     check_token(&state.server, &headers, None)?;
 
-    let file_path = {
-        let p = Path::new(&req.file);
-        if p.is_absolute() || p.components().count() > 1 {
-            p.to_path_buf()
-        } else {
-            state.server.datasets_dir.join(p)
+    let file_path = if is_safe_child_name(&req.file) {
+        state.server.datasets_dir.join(&req.file)
+    } else {
+        let canonical = std::fs::canonicalize(&req.file).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("dataset not found: {}", req.file) })),
+            )
+                .into_response()
+        })?;
+        let canonical_root = std::fs::canonicalize(&state.server.datasets_dir)
+            .unwrap_or_else(|_| state.server.datasets_dir.clone());
+        if !canonical.starts_with(&canonical_root) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "dataset outside the datasets directory" })),
+            )
+                .into_response());
         }
+        canonical
     };
-    if !file_path.exists() {
+    if !file_path.is_file() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("dataset not found: {}", file_path.display()) })),
@@ -1063,7 +1157,6 @@ fn default_topp() -> f32 { 0.9 }
 fn default_minp() -> f32 { 0.05 }
 fn default_rep() -> f32 { 1.2 }
 
-#[allow(clippy::unused_async)]
 async fn generate_text(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1071,20 +1164,7 @@ async fn generate_text(
 ) -> Result<Json<serde_json::Value>, Response> {
     check_token(&state.server, &headers, None)?;
 
-    let model_dir = if req.model_dir.is_empty() {
-        state.server.models_dir.join("model_output")
-    } else {
-        Path::new(&req.model_dir).to_path_buf()
-    };
-
-    let state_models = state.server.models_dir.clone();
-    let model_dir = if model_dir.is_absolute() {
-        model_dir
-    } else if model_dir.exists() {
-        model_dir
-    } else {
-        state_models.join(model_dir)
-    };
+    let model_dir = resolve_model_dir(&state.server.models_dir, &req.model_dir)?;
 
     let prompt = req.prompt;
     let max_tokens = req.max_tokens;
@@ -1094,16 +1174,15 @@ async fn generate_text(
     let min_p = req.min_p;
     let rep = req.repetition_penalty;
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    std::thread::spawn(move || {
-        let result = run_generate(model_dir, &prompt, max_tokens, temperature, top_k, top_p, min_p, rep);
-        let _ = tx.send(result);
-    });
+    let result = tokio::task::spawn_blocking(move || {
+        run_generate(model_dir, &prompt, max_tokens, temperature, top_k, top_p, min_p, rep)
+    })
+    .await;
 
-    match rx.recv() {
+    match result {
         Ok(Ok(text)) => Ok(Json(serde_json::json!({ "text": text }))),
         Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
-        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "generate thread died" }))).into_response()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("generate task failed: {e}") }))).into_response()),
     }
 }
 
@@ -1165,7 +1244,6 @@ struct ExportRequest {
 
 fn default_model_name() -> String { "kuro-neko".into() }
 
-#[allow(clippy::unused_async)]
 async fn export_model(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1173,27 +1251,22 @@ async fn export_model(
 ) -> Result<Json<serde_json::Value>, Response> {
     check_token(&state.server, &headers, None)?;
 
-    let model_dir = if req.model_dir.is_empty() {
-        state.server.models_dir.join("model_output")
-    } else {
-        Path::new(&req.model_dir).to_path_buf()
-    };
-    let model_dir = if model_dir.is_absolute() || model_dir.exists() {
-        model_dir
-    } else {
-        state.server.models_dir.join(model_dir)
-    };
+    let model_dir = resolve_model_dir(&state.server.models_dir, &req.model_dir)?;
+    if !is_safe_export_name(&req.model_name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid model_name" })),
+        )
+            .into_response());
+    }
 
-    let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let name = req.model_name;
-    std::thread::spawn(move || {
-        let _ = tx.send(run_export(model_dir, &name));
-    });
+    let result = tokio::task::spawn_blocking(move || run_export(model_dir, &name)).await;
 
-    match rx.recv() {
+    match result {
         Ok(Ok(path)) => Ok(Json(serde_json::json!({ "gguf": path }))),
         Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response()),
-        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "export thread died" }))).into_response()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("export task failed: {e}") }))).into_response()),
     }
 }
 
@@ -1246,5 +1319,56 @@ mod tests {
         assert_eq!(query_token(Some("a=1&b=2")), None);
         assert_eq!(query_token(Some("token=")), Some("".into()));
         assert_eq!(query_token(None), None);
+    }
+
+    #[test]
+    fn test_is_safe_child_name() {
+        assert!(is_safe_child_name("dataset.bin"));
+        assert!(is_safe_child_name("TinyStories-train.txt"));
+        assert!(is_safe_child_name("model_output_v2_ppl1.83"));
+
+        assert!(!is_safe_child_name(""));
+        assert!(!is_safe_child_name("."));
+        assert!(!is_safe_child_name(".."));
+        assert!(!is_safe_child_name("../evil.txt"));
+        assert!(!is_safe_child_name("a/b"));
+        assert!(!is_safe_child_name("a\\b"));
+        assert!(!is_safe_child_name("/etc/passwd"));
+    }
+
+    #[test]
+    fn test_is_safe_export_name() {
+        assert!(is_safe_export_name("kuro-neko-2026"));
+        assert!(is_safe_export_name("model_v3.gguf"));
+
+        assert!(!is_safe_export_name("../evil"));
+        assert!(!is_safe_export_name("a/b"));
+        assert!(!is_safe_export_name(".hidden"));
+        assert!(!is_safe_export_name(""));
+        assert!(!is_safe_export_name("model name"));
+        assert!(!is_safe_export_name("model$name"));
+    }
+
+    #[test]
+    fn test_resolve_model_dir_blocks_traversal() {
+        let root = std::env::temp_dir().join(format!("kuro_models_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("model_output")).unwrap();
+        std::fs::create_dir_all(root.join("model_output_v2")).unwrap();
+        std::fs::create_dir_all(root.parent().unwrap().join("kuro_outside_models")).unwrap();
+
+        assert!(resolve_model_dir(&root, "model_output").is_ok());
+        assert!(resolve_model_dir(&root, "").is_ok());
+        assert!(resolve_model_dir(&root, "does_not_exist").is_err());
+        // Traversal / outside paths must be rejected.
+        assert!(resolve_model_dir(&root, "../kuro_outside_models").is_err());
+        assert!(resolve_model_dir(&root, "model_output/../../kuro_outside_models").is_err());
+
+        // Absolute path inside the root is accepted (frontend sends full dirs).
+        let inside = root.join("model_output_v2");
+        assert!(resolve_model_dir(&root, inside.to_str().unwrap()).is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap().join("kuro_outside_models"));
     }
 }
