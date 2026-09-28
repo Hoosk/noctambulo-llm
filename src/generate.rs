@@ -165,6 +165,30 @@ pub fn generate<B: Backend>(
     seed: u64,
     device: &B::Device,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    generate_streaming(
+        model, tokenizer, prompt, max_new_tokens, temperature, top_k, top_p, min_p,
+        repetition_penalty, seed, device, |_| true,
+    )
+}
+
+/// Same as [`generate`], but calls `on_token` with each freshly decoded chunk
+/// as soon as it is available. Returning `false` from the callback stops the
+/// generation (used by the SSE endpoint when the client disconnects).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_streaming<B: Backend>(
+    model: &Llm<B>,
+    tokenizer: &LlmTokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    seed: u64,
+    device: &B::Device,
+    mut on_token: impl FnMut(&str) -> bool,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = XorshiftRng::new(seed);
     let mut tokens = tokenizer.encode(prompt)?;
     if tokens.is_empty() {
@@ -185,6 +209,7 @@ pub fn generate<B: Backend>(
 
     let initial_prompt_len = tokens.len();
     let eos_token_id = tokenizer.end_of_text_id();
+    let mut decode_stream = tokenizer.decode_stream(true);
 
     let mut caches: Vec<KvCache<B>> = (0..model.blocks.len())
         .map(|_| KvCache::empty())
@@ -200,6 +225,7 @@ pub fn generate<B: Backend>(
     let last_logits = logits.slice([0..1, (prompt_len - 1)..prompt_len]);
     let mut logits_vec: Vec<f32> = last_logits
         .into_data()
+        .convert::<f32>()
         .to_vec::<f32>()
         .map_err(|e| format!("Failed to convert tensor data: {:?}", e))?;
 
@@ -214,6 +240,12 @@ pub fn generate<B: Backend>(
         &mut rng,
     );
     tokens.push(sampled_token);
+
+    if let Some(chunk) = decode_stream.step(sampled_token)? {
+        if !on_token(&chunk) {
+            return tokenizer.decode(&tokens);
+        }
+    }
 
     if let Some(eos_id) = eos_token_id {
         if sampled_token == eos_id {
@@ -241,6 +273,7 @@ pub fn generate<B: Backend>(
         let last_logits = logits.slice([0..1, 0..1]);
         let mut logits_vec: Vec<f32> = last_logits
             .into_data()
+            .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|e| format!("Failed to convert tensor data: {:?}", e))?;
 
@@ -255,6 +288,12 @@ pub fn generate<B: Backend>(
             &mut rng,
         );
         tokens.push(sampled_token);
+
+        if let Some(chunk) = decode_stream.step(sampled_token)? {
+            if !on_token(&chunk) {
+                break;
+            }
+        }
 
         if let Some(eos_id) = eos_token_id {
             if sampled_token == eos_id && (tokens.len() - initial_prompt_len) >= 3 {

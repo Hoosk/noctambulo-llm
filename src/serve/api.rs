@@ -14,6 +14,7 @@ use axum::{
 use futures_core::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::config::DType;
 use crate::serve::runner::{JobRegistry, TrainParams, launch_job};
 use crate::serve::state::ServerState;
 use crate::train::TrainingEvent;
@@ -43,6 +44,7 @@ pub fn router(state: Arc<ServerState>) -> (Router, Arc<JobRegistry>) {
         .route("/api/train/stream", get(train_stream))
         .route("/api/download/*rest", get(download))
         .route("/api/generate", post(generate_text))
+        .route("/api/generate/stream", post(generate_stream))
         .route("/api/export", post(export_model))
         .with_state(AppState {
             server: state,
@@ -844,9 +846,12 @@ struct TrainRequest {
     output_dir: String,
     #[serde(default = "default_device")]
     device: String,
+    #[serde(default = "default_dtype")]
+    dtype: String,
 }
 
 fn default_device() -> String { "DefaultDevice".into() }
+fn default_dtype() -> String { "f32".into() }
 
 fn default_epochs() -> usize { 1 }
 fn default_batch() -> usize { 32 }
@@ -925,8 +930,17 @@ async fn train(
             .into_response());
     }
 
+    let dtype = DType::parse(&req.dtype).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response()
+    })?;
+
     let params = TrainParams {
         file: Some(file_path),
+        dtype,
         epochs: req.epochs,
         batch_size: req.batch_size,
         lr: req.lr,
@@ -1177,6 +1191,104 @@ async fn generate_text(
     }
 }
 
+/// Token-by-token generation over SSE. Dropping the client stream drops the
+/// receiver, which makes `blocking_send` fail and stops the generation loop.
+async fn generate_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<GenerateRequest>,
+) -> Result<Response, Response> {
+    check_token(&state.server, &headers, None)?;
+
+    let model_dir = resolve_model_dir(&state.server.models_dir, &req.model_dir)?;
+    let prompt = req.prompt;
+    let max_tokens = req.max_tokens;
+    let temperature = req.temperature;
+    let top_k = req.top_k;
+    let top_p = req.top_p;
+    let min_p = req.min_p;
+    let rep = req.repetition_penalty;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = run_generate_streaming(
+            model_dir, &prompt, max_tokens, temperature, top_k, top_p, min_p, rep, tx,
+        ) {
+            eprintln!("generate stream error: {e}");
+        }
+    });
+
+    let stream = async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            let data = serde_json::json!({ "token": chunk }).to_string();
+            yield Ok::<Event, axum::Error>(Event::default().event("token").data(data));
+        }
+        yield Ok(Event::default().event("done").data("{\"done\":true}"));
+    };
+
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_generate_streaming(
+    model_dir: std::path::PathBuf,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    rep: f32,
+    tx: tokio::sync::mpsc::Sender<String>,
+) -> Result<String, String> {
+    use burn::backend::Wgpu;
+    use burn::module::Module;
+    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+    let config_path = model_dir.join("config.json");
+    let weights_path = model_dir.join("model_weights");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
+    let config: crate::config::ModelConfig =
+        serde_json::from_str(&config_str).map_err(|e| format!("bad config: {e}"))?;
+
+    let tokenizer_path = "custom_tokenizer.json";
+    let tokenizer = crate::data::LlmTokenizer::from_file(tokenizer_path)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+
+    let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
+    let model: crate::model::Llm<Wgpu> = config.init_model(&device);
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let record = recorder
+        .load(weights_path.clone(), &device)
+        .map_err(|e| format!("failed to load weights: {e:?}"))?;
+    let model = model.load_record(record);
+
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(42);
+
+    crate::generate::generate_streaming(
+        &model,
+        &tokenizer,
+        prompt,
+        max_tokens,
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        rep,
+        seed,
+        &device,
+        |chunk| tx.blocking_send(chunk.to_string()).is_ok(),
+    )
+    .map_err(|e| format!("generate error: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_generate(
     model_dir: std::path::PathBuf,
     prompt: &str,

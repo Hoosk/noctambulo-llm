@@ -51,6 +51,7 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--file <path>` | Archivo de texto plano local o binario (`.bin`) para entrenar | `None` |
 | `--dataset-file <filename>` | Nombre de archivo dentro del repo de HF | `TinyStories-train.txt` |
 | `--preset <name>` | Preset de arquitectura: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M) | `None` |
+| `--dtype <f32\|f16>` | Precisión de cómputo. `f16` acelera en GPUs compatibles (backend sin fusión); requiere LR estables | `f32` |
 | `--batch-size <n>` | Tamaño de lote (Batch size) | `128` |
 | `--epochs <n>` | Número de épocas de entrenamiento | `3` |
 | `--max-tokens <n>` | Máximo de tokens a cargar (`0` = sin límite). La referencia Chinchilla es ~20 tokens/parámetro | `100000000` |

@@ -1,3 +1,4 @@
+mod backend;
 mod config;
 mod data;
 mod export;
@@ -7,8 +8,9 @@ mod serve;
 mod train;
 mod tui;
 
+use burn::tensor::f16;
 use clap::{Args, Parser, Subcommand};
-use config::ModelConfig;
+use config::{DType, ModelConfig};
 use data::{combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf, extract_parquet_text_column, prepare_binary_dataset, train_custom_tokenizer, LlmTokenizer};
 use export::export_to_gguf;
 use generate::generate;
@@ -233,6 +235,10 @@ struct TrainArgs {
     /// Explicit --n-embd/--n-head/--n-kv-head/--n-layer/--n-ctx override it.
     #[arg(long)]
     preset: Option<String>,
+    /// Compute precision: f32 (default), bf16 or f16 (faster on GPUs that
+    /// support them; records are always stored as f32 for portable inference).
+    #[arg(long, default_value = "f32")]
+    dtype: String,
     /// Batch size
     #[arg(long, default_value_t = 128)]
     batch_size: usize,
@@ -544,26 +550,38 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
             let cancel = sigint_cancel_flag();
 
-            train::<Autodiff<Wgpu>>(
-                dataset_path_buf.as_deref(),
-                raw_text.as_deref(),
-                model_config,
-                &tokenizer,
-                args.epochs,
-                args.batch_size,
-                args.lr,
-                args.step,
-                max_tokens,
-                args.val_split,
-                args.grad_accum,
-                args.seq_warmup_steps,
-                save_dir_buf.as_deref(),
-                resume_path_buf.as_deref(),
-                &device,
-                output_dir,
-                args.early_stop_patience,
-                Some(cancel),
-            )?;
+            // The trainer is generic over the backend; dispatch on --dtype.
+            macro_rules! run_training {
+                ($backend:ty) => {
+                    train::<$backend>(
+                        dataset_path_buf.as_deref(),
+                        raw_text.as_deref(),
+                        model_config,
+                        &tokenizer,
+                        args.epochs,
+                        args.batch_size,
+                        args.lr,
+                        args.step,
+                        max_tokens,
+                        args.val_split,
+                        args.grad_accum,
+                        args.seq_warmup_steps,
+                        save_dir_buf.as_deref(),
+                        resume_path_buf.as_deref(),
+                        &device,
+                        output_dir,
+                        args.early_stop_patience,
+                        Some(cancel),
+                    )
+                };
+            }
+
+            let dtype = DType::parse(&args.dtype)?;
+            tui::print_info(&format!("Compute precision: {}", dtype.as_str()));
+            match dtype {
+                DType::F32 => run_training!(Autodiff<Wgpu>)?,
+                DType::F16 => run_training!(Autodiff<crate::backend::WgpuHalf<f16>>)?,
+            };
         }
         Commands::Eval(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();

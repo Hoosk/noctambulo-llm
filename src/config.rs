@@ -1,5 +1,36 @@
 use serde::{Deserialize, Serialize};
 
+/// Compute precision used for training. Records are always serialized with
+/// `FullPrecisionSettings` (f32), so a model trained in f16 can be loaded and
+/// exported by the f32 inference path without conversion steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DType {
+    #[default]
+    F32,
+    F16,
+}
+
+impl DType {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "f32" | "fp32" | "float32" => Ok(Self::F32),
+            "f16" | "fp16" | "half" => Ok(Self::F16),
+            // WGSL has no bf16 type; cubecl panics deep in the shader compiler.
+            "bf16" | "bfloat16" => Err(
+                "bf16 is not supported by the WGPU/WGSL backend; use f16 (or f32)".into(),
+            ),
+            other => Err(format!("Unknown dtype '{other}'. Available: f32, f16")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModelConfig {
     pub vocab_size: usize,
@@ -85,5 +116,33 @@ impl ModelConfig {
         let block = q + k + v + out + norms + mlp;
 
         embed + self.n_layer * block + n_embd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dtype_parse_and_default() {
+        assert_eq!(DType::parse("f32").unwrap(), DType::F32);
+        assert_eq!(DType::parse("FP16").unwrap(), DType::F16);
+        assert_eq!(DType::parse("half").unwrap(), DType::F16);
+        assert_eq!(DType::default(), DType::F32);
+        assert_eq!(DType::F16.as_str(), "f16");
+        assert!(DType::parse("int8").is_err());
+        // bf16 has no WGSL support: reject with a helpful message.
+        let err = DType::parse("bfloat16").unwrap_err();
+        assert!(err.contains("bf16 is not supported"), "{err}");
+    }
+
+    #[test]
+    fn test_param_count_matches_known_architecture() {
+        let cfg = ModelConfig::new(8000, 256, 4, Some(2), 4, 256, 0.1, 0.0);
+        let hidden = 768usize;
+        let kv_dim = 2 * 64;
+        let block = (256 * 256 + 256) + 2 * (256 * kv_dim + kv_dim) + 256 * 256 + 2 * 256 + 3 * 256 * hidden;
+        let expected = 8000 * 256 + 4 * block + 256;
+        assert_eq!(cfg.param_count(), expected);
     }
 }

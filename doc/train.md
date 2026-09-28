@@ -8,7 +8,7 @@ Durante el entrenamiento, Kuro-Neko procesa conjuntos de datos en formato de tex
 
 ## ⚙️ Tabla Completa de Parámetros CLI
 
-El subcomando `train` acepta **22 parámetros** de configuración CLI:
+El subcomando `train` acepta **23 parámetros** de configuración CLI:
 
 | Flag | Tipo | Valor por Defecto | Descripción Detallada |
 | :--- | :--- | :--- | :--- |
@@ -16,6 +16,7 @@ El subcomando `train` acepta **22 parámetros** de configuración CLI:
 | `--file <path>` | `Option<String>` | `None` | Ruta a un archivo de texto local en el sistema de archivos para usar como corpus de entrenamiento. |
 | `--dataset-file <filename>` | `String` | `TinyStories-train.txt` | Nombre del archivo objetivo a descargar e inspeccionar dentro del repositorio de Hugging Face. |
 | `--preset <name>` | `Option<String>` | `None` | Preset de arquitectura (`nano`, `tiny`, `small`, `base`); los flags explícitos de dimensión tienen prioridad. |
+| `--dtype <name>` | `String` | `f32` | Precisión de cómputo (`f32` o `f16`). `f16` usa el `CubeBackend` sin fusión (burn-fusion 0.21 crashea con streams half en Vulkan) y suele ser un 2–3× más rápido; puede desestabilizar si el LR es alto. `bf16` se rechaza con un error claro porque WGSL no lo soporta. Los checkpoints se guardan en f32. |
 | `--batch-size <n>` | `usize` | `128` | Número de secuencias por lote (*batch*) de entrenamiento. Un tamaño mayor aprovecha mejor la GPU y acelera la convergencia, pero requiere más VRAM. |
 | `--epochs <n>` | `usize` | `3` | Número de pasadas completas a través del conjunto de datos procesado. |
 | `--max-tokens <n>` | `usize` | `100000000` (100M) | Número máximo de tokens a cargar desde el conjunto de datos. Un valor de `0` desactiva el límite y carga el dataset completo. El presupuesto Chinchilla de referencia es ~20 tokens por parámetro. |

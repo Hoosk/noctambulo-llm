@@ -702,6 +702,7 @@ pub fn train_with_events<B: AutodiffBackend>(
             if is_log_step {
                 let interval_loss = accum_loss_tensor
                     .into_data()
+                    .convert::<f32>()
                     .to_vec::<f32>()
                     .unwrap_or_default()
                     .first()
@@ -957,6 +958,7 @@ pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
 
         let loss_val = loss
             .into_data()
+            .convert::<f32>()
             .to_vec::<f32>()
             .unwrap_or_default()
             .first()
@@ -1116,6 +1118,50 @@ mod tests {
         assert!(ctx_mid > ctx_start && ctx_mid < ctx_end);
         assert_eq!(ctx_end, target_ctx);
         assert_eq!(ctx_after, target_ctx);
+    }
+
+    #[test]
+    fn test_streaming_generation_matches_full_generation() {
+        let device = NdArrayDevice::Cpu;
+        let dir = test_dir("stream_gen");
+        let (tokenizer, _corpus) = tiny_tokenizer_and_corpus(&dir);
+        let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        let model: Llm<TestBackend> = config.init_model(&device);
+
+        let full = crate::generate::generate::<NdArray<f32, i32>>(
+            &model.valid(), &tokenizer, "once", 8, 0.9, 40, 0.9, 0.05, 1.1, 7, &device,
+        )
+        .unwrap();
+
+        let mut streamed = String::new();
+        let also_full = crate::generate::generate_streaming::<NdArray<f32, i32>>(
+            &model.valid(),
+            &tokenizer,
+            "once",
+            8,
+            0.9,
+            40,
+            0.9,
+            0.05,
+            1.1,
+            7,
+            &device,
+            |chunk| {
+                streamed.push_str(chunk);
+                true
+            },
+        )
+        .unwrap();
+
+        // Same seed => same trajectory as the non-streaming call.
+        assert_eq!(also_full, full);
+        // Streaming emits only the generated continuation (the prompt is
+        // already known by the caller), which must appear in the full text.
+        assert!(!streamed.is_empty(), "streaming emitted no chunks");
+        assert!(
+            also_full.contains(&streamed),
+            "streamed chunks {streamed:?} not contained in {also_full:?}"
+        );
     }
 
     #[test]

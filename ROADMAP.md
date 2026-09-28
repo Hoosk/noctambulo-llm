@@ -11,7 +11,7 @@
 ## Etapa D — Calidad y velocidad de entrenamiento
 
 1. ✅ **Presupuesto de tokens**: default 10M → 100M, aviso estilo Chinchilla (~20 tokens/parámetro) y presets `nano`/`tiny`/`small`/`base`.
-2. **BF16/FP16**: flag `--dtype` con `Wgpu<f16, i32>`; validar export GGUF (castear a f32).
+2. ✅ **FP16**: flag `--dtype f32|f16` (backend sin fusión para f16). `bf16` descartado: WGSL no lo soporta y cubecl crashea; se devuelve un error explícito. Records siempre en f32, así que generate/export no cambian.
 3. ✅ **Eval**: eliminado el cap fijo de 100 batches (`--eval-batches`, 0 = todos), métrica BPB (bits-per-byte) y early stopping (`--early-stop-patience`).
 4. **RoPE scaling** (linear/NTK/YaRN) para inferencia más allá de `n_ctx` + claves GGUF `rope.scaling.*`.
 5. **Datasets**: ingesta Parquet/HF directa a `.bin` en `prepare-dataset` y dedupe opcional.
@@ -20,7 +20,7 @@
 
 ## Etapa E — Web suite
 
-1. **Generación en streaming** por SSE + botón de cancelar.
+1. ✅ **Generación en streaming** por SSE (`/api/generate/stream`) con cancelación por desconexión y botón "Detener" en la UI + tok/s en vivo.
 2. **CRUD de modelos/checkpoints**: borrar, renombrar, descargar pesos/config y tokenizer por modelo.
 3. **Progreso real** de operaciones largas (descarga HF, combine, export).
 4. **Telemetría GPU/VRAM** en vivo.

@@ -15,7 +15,35 @@ pub struct LlmTokenizer {
     tokenizer: Tokenizer,
 }
 
+/// UTF-8-safe incremental decoder used by streaming generation: token ids are
+/// fed one by one and it only emits chunks that are valid on their own.
+pub struct LlmDecodeStream<'a> {
+    inner: tokenizers::DecodeStream<
+        'a,
+        tokenizers::ModelWrapper,
+        tokenizers::NormalizerWrapper,
+        tokenizers::PreTokenizerWrapper,
+        tokenizers::PostProcessorWrapper,
+        tokenizers::DecoderWrapper,
+    >,
+}
+
+impl LlmDecodeStream<'_> {
+    pub fn step(&mut self, id: u32) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .step(id)
+            .map_err(|e| format!("Decode stream error: {e}").into())
+    }
+}
+
 impl LlmTokenizer {
+    /// Incremental decoder for token-by-token streaming.
+    pub fn decode_stream(&self, skip_special_tokens: bool) -> LlmDecodeStream<'_> {
+        LlmDecodeStream {
+            inner: self.tokenizer.decode_stream(skip_special_tokens),
+        }
+    }
+
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let tokenizer = Tokenizer::from_file(path)
             .map_err(|e| format!("Failed to load tokenizer from file: {}", e))?;

@@ -1,6 +1,6 @@
 // Generate view: run autoregressive text generation on a model.
 
-import { api } from "../core/api.js";
+import { api, getToken } from "../core/api.js";
 import { clear, el } from "../core/dom.js";
 import { getActiveModel } from "./models.js";
 import { viewTitle, btn, iconSvg, catLogoSvg, stagger } from "../components/ui.js";
@@ -71,33 +71,102 @@ export default class GenerateView {
       ]);
 
     const runBtn = btn.primary("Generar", () => {});
+    const stopBtn = el("button", {
+      class: "px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-sm font-medium transition active:scale-[0.98] disabled:opacity-40",
+      disabled: true,
+      onclick: () => this._controller?.abort(),
+    }, "Detener");
+
     const run = async () => {
       if (this.busy) return;
       this.busy = true;
       runBtn.disabled = true;
+      stopBtn.disabled = false;
       const prev = runBtn.innerHTML;
       runBtn.innerHTML = `${iconSvg("loader", "w-4 h-4 animate-spin")} Generando…`;
+      const pre = output.querySelector("pre");
+      pre.textContent = "";
+      msg.textContent = "";
+
+      const controller = new AbortController();
+      this._controller = controller;
+      let text = "";
+      let tokens = 0;
+      const started = performance.now();
+
       try {
-        const res = await api.post("/api/generate", {
-          modelDir: modelSel.value,
-          prompt: prompt.value,
-          maxTokens: Number(params.max_tokens.value),
-          temperature: Number(params.temperature.value),
-          topK: Number(params.top_k.value),
-          topP: Number(params.top_p.value),
-          minP: Number(params.min_p.value),
-          repetitionPenalty: Number(params.repetition_penalty.value),
+        const res = await fetch("/api/generate/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-API-Token": getToken() },
+          body: JSON.stringify({
+            modelDir: modelSel.value,
+            prompt: prompt.value,
+            maxTokens: Number(params.max_tokens.value),
+            temperature: Number(params.temperature.value),
+            topK: Number(params.top_k.value),
+            topP: Number(params.top_p.value),
+            minP: Number(params.min_p.value),
+            repetitionPenalty: Number(params.repetition_penalty.value),
+          }),
+          signal: controller.signal,
         });
-        output.querySelector("pre").textContent = res.text;
-        msg.textContent = "";
+        if (!res.ok) {
+          let detail = res.statusText;
+          try {
+            const body = await res.json();
+            if (body.error) detail = body.error;
+          } catch {
+            /* not json */
+          }
+          throw new Error(detail);
+        }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let boundary;
+          while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+            const chunk = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            const dataLine = chunk.split("\n").find((l) => l.startsWith("data:"));
+            if (!dataLine) continue;
+            try {
+              const ev = JSON.parse(dataLine.slice(5).trim());
+              if (ev.token) {
+                text += ev.token;
+                tokens += 1;
+                pre.textContent = text;
+                output.scrollTop = output.scrollHeight;
+                const secs = Math.max((performance.now() - started) / 1000, 0.001);
+                msg.textContent = `${tokens} tokens · ${(tokens / secs).toFixed(1)} tok/s`;
+                msg.className = "text-xs text-violet-300 mt-3";
+              }
+            } catch {
+              /* keep-alive or malformed chunk */
+            }
+          }
+        }
+        const secs = Math.max((performance.now() - started) / 1000, 0.001);
+        msg.textContent = `Listo: ${tokens} tokens en ${secs.toFixed(2)}s · ${(tokens / secs).toFixed(1)} tok/s`;
+        msg.className = "text-xs text-emerald-300 mt-3";
       } catch (e) {
-        output.querySelector("pre").textContent = "";
-        msg.textContent = `Error: ${e.message}`;
-        msg.className = "text-xs text-rose-400 mt-3";
+        if (e.name === "AbortError") {
+          msg.textContent = `Generación detenida (${tokens} tokens).`;
+          msg.className = "text-xs text-amber-300 mt-3";
+        } else {
+          msg.textContent = `Error: ${e.message}`;
+          msg.className = "text-xs text-rose-400 mt-3";
+        }
       } finally {
         this.busy = false;
+        this._controller = null;
         runBtn.disabled = false;
         runBtn.innerHTML = prev;
+        stopBtn.disabled = true;
       }
     };
     runBtn.onclick = run;
@@ -129,7 +198,7 @@ export default class GenerateView {
           field("Min-P", params.min_p),
           field("Repetition", params.repetition_penalty),
         ]),
-        el("div", { class: "mt-5" }, [runBtn]),
+        el("div", { class: "mt-5 flex gap-3" }, [runBtn, stopBtn]),
         msg,
       ]),
       resultCard,

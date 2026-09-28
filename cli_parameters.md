@@ -13,6 +13,7 @@ Ejecuta el pipeline de entrenamiento de la red neuronal en la GPU usando WGPU.
 | `--file` | `Option<String>`| `None` | Ruta a un archivo de texto plano local o binario (`.bin`) para entrenar. |
 | `--dataset-file` | `String` | `"TinyStories-train.txt"` | Nombre del archivo objetivo dentro del repositorio del dataset de HF. |
 | `--preset` | `Option<String>` | `None` | Preset de arquitectura: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M). Los flags explícitos tienen prioridad. |
+| `--dtype` | `String` | `"f32"` | Precisión de cómputo: `f32` o `f16`. `bf16` no está soportado por el backend WGPU/WGSL (error explícito). Los records se guardan siempre en f32. |
 | `--batch-size` | `usize` | `128` | Tamaño del lote (batch size) a procesar en la GPU antes de la actualización de pesos. |
 | `--epochs` | `usize` | `3` | Número de pasadas completas a través del conjunto de datos. Con `--resume`, épocas **adicionales**. |
 | `--max-tokens` | `usize` | `100000000` | Límite máximo de tokens a cargar desde el corpus. Un valor de `0` entrena con el archivo completo. La referencia Chinchilla es ~20 tokens/parámetro. |

@@ -11,6 +11,7 @@ use crate::serve::state::{PERSIST_INTERVAL, ServerState, forces_persist};
 #[derive(Debug, Clone)]
 pub struct TrainParams {
     pub file: Option<PathBuf>,
+    pub dtype: crate::config::DType,
     pub epochs: usize,
     pub batch_size: usize,
     pub lr: f64,
@@ -219,29 +220,45 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
             params.attn_softcap,
         );
         let device = parse_device(&params.device);
+        let _ = tx.send(TrainingEvent::LogEvent {
+            line: format!("Compute precision: {}", params.dtype.as_str()),
+            ts: start_unix(),
+        });
 
-        let result = train_with_events::<burn::backend::Autodiff<burn::backend::Wgpu>>(
-            params.file.as_deref(),
-            None,
-            config,
-            &worker_tokenizer,
-            params.epochs,
-            params.batch_size,
-            params.lr,
-            None, // custom_step
-            params.max_tokens,
-            params.val_split,
-            params.grad_accum,
-            params.seq_warmup_steps,
-            params.save_dir.as_deref(),
-            params.resume.as_deref(),
-            &device,
-            &params.output_dir,
-            params.early_stop_patience,
-            &tx,
-            &worker_cancel,
-            Some(&worker_pause),
-        );
+        // Dispatch the generic trainer over the requested compute precision.
+        macro_rules! run_training {
+            ($backend:ty) => {
+                train_with_events::<$backend>(
+                    params.file.as_deref(),
+                    None,
+                    config,
+                    &worker_tokenizer,
+                    params.epochs,
+                    params.batch_size,
+                    params.lr,
+                    None, // custom_step
+                    params.max_tokens,
+                    params.val_split,
+                    params.grad_accum,
+                    params.seq_warmup_steps,
+                    params.save_dir.as_deref(),
+                    params.resume.as_deref(),
+                    &device,
+                    &params.output_dir,
+                    params.early_stop_patience,
+                    &tx,
+                    &worker_cancel,
+                    Some(&worker_pause),
+                )
+            };
+        }
+
+        let result = match params.dtype {
+            crate::config::DType::F32 => run_training!(burn::backend::Autodiff<burn::backend::Wgpu>),
+            crate::config::DType::F16 => run_training!(
+                burn::backend::Autodiff<crate::backend::WgpuHalf<burn::tensor::f16>>
+            ),
+        };
 
         if let Err(e) = result {
             let _ = tx.send(TrainingEvent::Stopped {

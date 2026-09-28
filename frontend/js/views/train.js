@@ -117,6 +117,12 @@ export default class TrainView {
     }
     this.fields["train-device"] = devSel;
 
+    const dtypeSel = el("select", { id: "train-dtype", class: inputCls }, [
+      el("option", { value: "f32", selected: true }, "f32 · precisión completa"),
+      el("option", { value: "f16" }, "f16 · más rápido en GPU compatibles"),
+    ]);
+    this.fields["train-dtype"] = dtypeSel;
+
     const field = (label, id, val, opts = {}) => {
       const input = el("input", {
         id,
@@ -172,7 +178,8 @@ export default class TrainView {
     const card = el("div", { class: "glass-card rounded-2xl p-5 lg:sticky lg:top-6 self-start min-w-0" }, [
       el("h3", { class: "text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4" }, "Configuración"),
       el("label", { class: fieldLabelCls + " mb-3" }, ["Dataset", dsSel]),
-      el("label", { class: fieldLabelCls + " mb-4" }, ["Dispositivo", devSel]),
+      el("label", { class: fieldLabelCls + " mb-3" }, ["Dispositivo", devSel]),
+      el("label", { class: fieldLabelCls + " mb-4" }, ["Precisión de cómputo (dtype)", dtypeSel]),
       el("div", { class: "grid grid-cols-2 gap-3" }, [
         field("Epochs", "train-epochs", 1, { min: 1 }),
         field("Batch", "train-batch", 32, { min: 1 }),
@@ -188,6 +195,7 @@ export default class TrainView {
         field("Dropout", "train-dropout", 0.1, { step: 0.05, min: 0, max: 0.9 }),
         field("Attn softcap", "train-attnSoftcap", 0, { step: 1, min: 0 }),
         field("Seq warmup steps", "train-seqWarmup", 0, { min: 0 }),
+        field("Early stop (épocas)", "train-earlyStop", 0, { min: 0 }),
       ]),
       el("div", { class: "grid grid-cols-2 gap-3 mt-3" }, [
         textField("Save dir", "train-saveDir", "checkpoints_web"),
@@ -301,6 +309,8 @@ export default class TrainView {
       body = {
         file: read("train-dataset").value,
         device: read("train-device").value,
+        dtype: read("train-dtype").value,
+        earlyStopPatience: Number(read("train-earlyStop").value),
         epochs: Number(read("train-epochs").value),
         batchSize: Number(read("train-batch").value),
         lr: Number(read("train-lr").value),
