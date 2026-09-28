@@ -50,9 +50,10 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--dataset <repo>` | Repositorio(s) de Hugging Face (ej. `roneneldan/TinyStories`) | `[]` |
 | `--file <path>` | Archivo de texto plano local o binario (`.bin`) para entrenar | `None` |
 | `--dataset-file <filename>` | Nombre de archivo dentro del repo de HF | `TinyStories-train.txt` |
+| `--preset <name>` | Preset de arquitectura: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M) | `None` |
 | `--batch-size <n>` | Tamaño de lote (Batch size) | `128` |
 | `--epochs <n>` | Número de épocas de entrenamiento | `3` |
-| `--max-tokens <n>` | Máximo de tokens a cargar (`0` = sin límite) | `10000000` |
+| `--max-tokens <n>` | Máximo de tokens a cargar (`0` = sin límite). La referencia Chinchilla es ~20 tokens/parámetro | `100000000` |
 | `--step <n>` | Paso de ventana deslizante (`None` = `n-ctx`) | `None` |
 | `--n-ctx <n>` | Ventana de contexto del modelo | `256` |
 | `--n-embd <n>` | Dimensión de embedding | `256` |
@@ -67,6 +68,7 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--save-dir <path>` | Directorio para guardado automático de checkpoints por época | `None` |
 | `--resume <path>` | Checkpoint desde el que reanudar (restaura pesos, AdamW, schedule y RNG; `--epochs` = épocas adicionales) | `None` |
 | `--seq-warmup-steps <n>` | Pasos iniciales para **Progressive Sequence Scaling** (de $N/4$ a $N$) | `0` |
+| `--early-stop-patience <n>` | Detiene el entrenamiento tras `n` épocas sin mejorar `val_loss` (`0` = desactivado) | `0` |
 
 #### Ejemplos de Entrenamientos Personalizados
 
@@ -114,12 +116,12 @@ Con `--resume`, `--epochs` significa **épocas adicionales** y el schedule cosen
 
 ---
 
-### 3. Evaluar Modelo y Perplejidad (`eval`)
+### 3. Evaluar Modelo, Perplejidad y BPB (`eval`)
 
-Evalúa la pérdida de entropía cruzada y la Perplejidad ($PPL = e^{\text{loss}}$) de un modelo entrenado:
+Evalúa la pérdida de entropía cruzada, la Perplejidad ($PPL = e^{\text{loss}}$) y los **bits por byte** (BPB, comparable entre tokenizers) de un modelo entrenado. Por defecto evalúa **todos** los batches del dataset (`--eval-batches 0`); el BPB no está disponible con `.bin` porque no conservan el tamaño original en bytes:
 
 ```bash
-cargo run --release -- eval --model-dir model_output --file datasets/corpus.bin
+cargo run --release -- eval --model-dir model_output --file datasets/corpus.txt
 ```
 
 ---

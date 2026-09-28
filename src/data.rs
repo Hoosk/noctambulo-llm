@@ -58,11 +58,15 @@ impl LlmTokenizer {
 
     /// Parallel multi-threaded batch tokenization using encode_batch() across all CPU cores.
     /// Uses zero-cost ownership transfers to avoid redundant Heap cloning.
+    ///
+    /// Returns `(tokens, bytes_consumed)`; the byte count feeds the
+    /// bits-per-byte metric (0 for pre-tokenized `.bin` inputs, where the
+    /// source text size is unknown).
     pub fn encode_file_streaming<P: AsRef<Path>>(
         &self,
         file_path: P,
         max_tokens: Option<usize>,
-    ) -> Result<Vec<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(Vec<u32>, u64), Box<dyn std::error::Error + Send + Sync>> {
         let path = file_path.as_ref();
 
         if is_binary_file(path)? {
@@ -70,7 +74,7 @@ impl LlmTokenizer {
             let expected_hash = Some(tokenizer_vocab_hash(self));
             let (tokens, vocab_sz) = load_tokens_from_binary(path, max_tokens, expected_hash)?;
             println!("Loaded {} pre-tokenized tokens (Vocab size in header: {}).", tokens.len(), vocab_sz);
-            return Ok(tokens);
+            return Ok((tokens, 0));
         }
 
         let eos_id = self.end_of_text_id();
@@ -208,7 +212,7 @@ impl LlmTokenizer {
             all_tokens.len(),
             elapsed_secs,
         );
-        Ok(all_tokens)
+        Ok((all_tokens, bytes_read))
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -750,7 +754,7 @@ pub fn prepare_binary_dataset<P1: AsRef<Path>, P2: AsRef<Path>>(
     max_tokens: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Preparing pre-tokenized binary dataset from {:?} to {:?}...", input_path.as_ref(), output_path.as_ref());
-    let tokens = tokenizer.encode_file_streaming(input_path, max_tokens)?;
+    let (tokens, _bytes) = tokenizer.encode_file_streaming(input_path, max_tokens)?;
     let vocab_size = tokenizer.vocab_size() as u32;
     let vocab_hash = tokenizer_vocab_hash(tokenizer);
     save_tokens_to_binary(output_path.as_ref(), &tokens, vocab_size, vocab_hash)?;

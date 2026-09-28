@@ -284,7 +284,7 @@ mod tests {
             epoch: 1,
             batch: 0,
         }));
-        assert!(forces_persist(&TrainingEvent::Val { loss: 1.0, ppl: 2.0, epoch: 1 }));
+        assert!(forces_persist(&TrainingEvent::Val { loss: 1.0, ppl: 2.0, bpb: Some(1.2), epoch: 1 }));
         assert!(!forces_persist(&TrainingEvent::LogEvent { line: "x".into(), ts: 0 }));
         assert!(!forces_persist(&TrainingEvent::Progress {
             step: 1,

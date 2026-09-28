@@ -10,9 +10,9 @@
 
 ## Etapa D — Calidad y velocidad de entrenamiento
 
-1. **Presupuesto de tokens**: subir el default (10M → 100M) y añadir presets de arquitectura.
+1. ✅ **Presupuesto de tokens**: default 10M → 100M, aviso estilo Chinchilla (~20 tokens/parámetro) y presets `nano`/`tiny`/`small`/`base`.
 2. **BF16/FP16**: flag `--dtype` con `Wgpu<f16, i32>`; validar export GGUF (castear a f32).
-3. **Eval**: quitar el cap de 100 batches, métrica BPB (bits-per-byte) y early stopping opcional.
+3. ✅ **Eval**: eliminado el cap fijo de 100 batches (`--eval-batches`, 0 = todos), métrica BPB (bits-per-byte) y early stopping (`--early-stop-patience`).
 4. **RoPE scaling** (linear/NTK/YaRN) para inferencia más allá de `n_ctx` + claves GGUF `rope.scaling.*`.
 5. **Datasets**: ingesta Parquet/HF directa a `.bin` en `prepare-dataset` y dedupe opcional.
 6. **Optimizador**: param groups de weight decay (excluir norms/biases), z-loss/label smoothing opcionales.

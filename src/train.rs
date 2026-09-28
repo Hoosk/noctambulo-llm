@@ -129,22 +129,40 @@ pub struct TextDataset {
     pub tokens: Vec<u32>,
     pub n_ctx: usize,
     pub step: usize,
+    /// Source text size (bytes) for the kept tokens; 0 when unknown (`.bin`
+    /// inputs). Powers the bits-per-byte metric.
+    pub total_bytes: u64,
 }
 
 impl TextDataset {
     pub fn split(self, val_ratio: f32) -> (Self, Self) {
         let val_ratio = val_ratio.clamp(0.0, 0.9);
         if val_ratio <= 0.0 || self.tokens.len() < (self.n_ctx + 1) * 2 {
-            return (self.clone(), Self { tokens: vec![], n_ctx: self.n_ctx, step: self.step });
+            return (
+                self.clone(),
+                Self { tokens: vec![], n_ctx: self.n_ctx, step: self.step, total_bytes: 0 },
+            );
         }
 
         let split_idx = ((self.tokens.len() as f32) * (1.0 - val_ratio)) as usize;
         let train_tokens = self.tokens[..split_idx].to_vec();
         let val_tokens = self.tokens[split_idx..].to_vec();
 
+        // Split the byte count proportionally to the token split.
+        let train_bytes = if self.tokens.is_empty() {
+            0
+        } else {
+            (self.total_bytes as f64 * (split_idx as f64 / self.tokens.len() as f64)) as u64
+        };
+
         (
-            Self { tokens: train_tokens, n_ctx: self.n_ctx, step: self.step },
-            Self { tokens: val_tokens, n_ctx: self.n_ctx, step: self.step },
+            Self { tokens: train_tokens, n_ctx: self.n_ctx, step: self.step, total_bytes: train_bytes },
+            Self {
+                tokens: val_tokens,
+                n_ctx: self.n_ctx,
+                step: self.step,
+                total_bytes: self.total_bytes.saturating_sub(train_bytes),
+            },
         )
     }
 
@@ -155,16 +173,18 @@ impl TextDataset {
         custom_step: Option<usize>,
         max_tokens: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let mut tokens = tokenizer.encode_file_streaming(path, max_tokens)?;
+        let (mut tokens, mut total_bytes) = tokenizer.encode_file_streaming(path, max_tokens)?;
         if let Some(limit) = max_tokens {
             if limit > 0 && tokens.len() > limit {
                 tui::print_warning(&format!("Limiting training dataset to {} tokens.", tui::format_number(limit)));
+                // Keep the byte count in proportion to the kept tokens.
+                total_bytes = (total_bytes as f64 * (limit as f64 / tokens.len() as f64)) as u64;
                 tokens.truncate(limit);
             }
         }
         let step = custom_step.unwrap_or(n_ctx);
         let step = std::cmp::max(1, step);
-        Ok(Self { tokens, n_ctx, step })
+        Ok(Self { tokens, n_ctx, step, total_bytes })
     }
 
     #[allow(dead_code)]
@@ -176,14 +196,16 @@ impl TextDataset {
         max_tokens: Option<usize>,
     ) -> Self {
         let mut tokens = tokenizer.encode(text).unwrap_or_default();
+        let mut total_bytes = text.len() as u64;
         if let Some(limit) = max_tokens {
             if limit > 0 && tokens.len() > limit {
+                total_bytes = (total_bytes as f64 * (limit as f64 / tokens.len() as f64)) as u64;
                 tokens.truncate(limit);
             }
         }
         let step = custom_step.unwrap_or(n_ctx);
         let step = std::cmp::max(1, step);
-        Self { tokens, n_ctx, step }
+        Self { tokens, n_ctx, step, total_bytes }
     }
 
     pub fn len(&self) -> usize {
@@ -264,6 +286,8 @@ pub enum TrainingEvent {
     Val {
         loss: f32,
         ppl: f32,
+        /// Bits per byte (None when the source byte count is unknown, e.g. `.bin` datasets).
+        bpb: Option<f32>,
         epoch: usize,
     },
     Checkpoint {
@@ -320,6 +344,11 @@ fn shuffle_indices(indices: &mut [usize], rng: &mut XorshiftRng) {
     }
 }
 
+/// True when early stopping should trigger (patience 0 disables it).
+fn should_stop_early(patience: usize, epochs_without_improvement: usize) -> bool {
+    patience > 0 && epochs_without_improvement >= patience
+}
+
 pub fn compute_scheduled_n_ctx(
     global_step: usize,
     warmup_steps: usize,
@@ -359,6 +388,7 @@ pub fn train<B: AutodiffBackend>(
     resume_path: Option<&Path>,
     device: &B::Device,
     output_dir: &str,
+    early_stop_patience: usize,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
@@ -409,7 +439,8 @@ pub fn train<B: AutodiffBackend>(
     let result = train_with_events::<B>(
         dataset_path, raw_text, model_config, tokenizer, epochs, batch_size, lr,
         custom_step, max_tokens, val_split, grad_accum_steps, seq_warmup_steps,
-        save_dir, resume_path, device, output_dir, &tx, &cancel_thread, None,
+        save_dir, resume_path, device, output_dir, early_stop_patience,
+        &tx, &cancel_thread, None,
     );
 
     drop(tx);
@@ -435,6 +466,7 @@ pub fn train_with_events<B: AutodiffBackend>(
     resume_path: Option<&Path>,
     device: &B::Device,
     output_dir: &str,
+    early_stop_patience: usize,
     tx: &Sender<TrainingEvent>,
     cancel: &Arc<AtomicBool>,
     pause: Option<&Arc<AtomicBool>>,
@@ -456,7 +488,7 @@ pub fn train_with_events<B: AutodiffBackend>(
         emit_log(tx, format!("Dataset split: {} training samples, {} validation samples ({:.1}% val).", tr.len(), va.len(), val_split * 100.0));
         (tr, va)
     } else {
-        (full_dataset, TextDataset { tokens: vec![], n_ctx: model_config.n_ctx, step: custom_step.unwrap_or(model_config.n_ctx) })
+        (full_dataset, TextDataset { tokens: vec![], n_ctx: model_config.n_ctx, step: custom_step.unwrap_or(model_config.n_ctx), total_bytes: 0 })
     };
 
     tui::print_info("Initializing model architecture on WGPU device...");
@@ -518,6 +550,25 @@ pub fn train_with_events<B: AutodiffBackend>(
         emit_log(tx, format!("Sequence Length Warmup active: scaling context length over the first {} steps.", seq_warmup_steps));
     }
 
+    // Chinchilla-style budget check: ~20 tokens per parameter saturates a model
+    // of this size; warning early avoids a silently undertrained run.
+    if let Some(limit) = max_tokens {
+        if limit > 0 {
+            let params = model_config.param_count();
+            let recommended = params.saturating_mul(20);
+            if limit < recommended {
+                emit_log(tx, format!(
+                    "Note: {} tokens is below the ~{} token budget suggested for {} ({:.1}M params). \
+                     Consider --max-tokens 0 (full dataset) or a larger value.",
+                    tui::format_number(limit),
+                    tui::format_number(recommended),
+                    "this model",
+                    params as f64 / 1_000_000.0
+                ));
+            }
+        }
+    }
+
     tui::print_training_header(
         &model_config,
         train_dataset.len(),
@@ -547,6 +598,7 @@ pub fn train_with_events<B: AutodiffBackend>(
     let mut last_loss = 0.0f32;
     let mut last_avg_loss = 0.0f32;
     let mut best_val_loss: Option<f32> = train_state.best_val_loss;
+    let mut epochs_without_improvement = 0usize;
     let training_start = Instant::now();
 
     for epoch in 1..=epochs {
@@ -734,18 +786,29 @@ pub fn train_with_events<B: AutodiffBackend>(
         train_state.rng_state = shuffle_rng.state();
 
         if val_dataset.len() > 0 {
-            let (val_loss, val_ppl) = evaluate_dataset(&model.valid(), &val_dataset, effective_batch_size, device);
+            // Evaluate the whole validation split (max_batches = 0): the old
+            // hard cap of 100 batches silently made PPL incomparable across
+            // datasets of different sizes.
+            let (val_loss, val_ppl, val_bpb) =
+                evaluate_dataset(&model.valid(), &val_dataset, effective_batch_size, 0, device);
             if !val_loss.is_finite() {
                 emit_log(tx, "Warning: validation loss is non-finite; skipping validation this epoch.");
             } else {
-                emit_log(tx, format!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl));
-                let _ = tx.send(TrainingEvent::Val { loss: val_loss, ppl: val_ppl, epoch });
+                match val_bpb {
+                    Some(bpb) => emit_log(tx, format!(
+                        "   └── Validation Loss: {:.4} | Perplexity (PPL): {:.4} | Bits/Byte (BPB): {:.4}",
+                        val_loss, val_ppl, bpb
+                    )),
+                    None => emit_log(tx, format!("   └── Validation Loss: {:.4} | Validation Perplexity (PPL): {:.4}", val_loss, val_ppl)),
+                }
+                let _ = tx.send(TrainingEvent::Val { loss: val_loss, ppl: val_ppl, bpb: val_bpb, epoch });
 
                 let is_best = match best_val_loss {
                     None => true,
                     Some(prev) => val_loss < prev,
                 };
                 if is_best {
+                    epochs_without_improvement = 0;
                     best_val_loss = Some(val_loss);
                     if let Some(s_dir) = save_dir {
                         let best_path = s_dir.join("checkpoint_best");
@@ -762,6 +825,8 @@ pub fn train_with_events<B: AutodiffBackend>(
                             });
                         }
                     }
+                } else {
+                    epochs_without_improvement += 1;
                 }
             }
         }
@@ -819,6 +884,14 @@ pub fn train_with_events<B: AutodiffBackend>(
             avg_loss: final_epoch_avg,
             elapsed_secs: elapsed,
         });
+
+        if should_stop_early(early_stop_patience, epochs_without_improvement) {
+            emit_log(tx, format!(
+                "Early stopping: validation loss did not improve for {} epoch(s).",
+                early_stop_patience
+            ));
+            break;
+        }
     }
 
     std::fs::create_dir_all(output_dir)?;
@@ -853,13 +926,18 @@ pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
     model: &crate::model::Llm<B>,
     dataset: &TextDataset,
     batch_size: usize,
+    max_batches: usize,
     device: &B::Device,
-) -> (f32, f32) {
+) -> (f32, f32, Option<f32>) {
     if dataset.len() == 0 {
-        return (0.0, 1.0);
+        return (0.0, 1.0, None);
     }
     let total_batches = dataset.len().div_ceil(batch_size);
-    let eval_batches = total_batches.min(100);
+    let eval_batches = if max_batches == 0 {
+        total_batches
+    } else {
+        total_batches.min(max_batches)
+    };
     let mut total_loss = 0.0f32;
 
     for batch_idx in 0..eval_batches {
@@ -890,15 +968,25 @@ pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
 
     let avg_loss = total_loss / (eval_batches as f32);
     let perplexity = avg_loss.exp();
-    (avg_loss, perplexity)
+    // BPB = (NLL in bits) / source bytes. The tokens/bytes ratio of the full
+    // dataset is a valid estimator because both scale together with the
+    // evaluated subset.
+    let bpb = if dataset.total_bytes > 0 && !dataset.tokens.is_empty() {
+        Some(avg_loss / std::f32::consts::LN_2 * (dataset.tokens.len() as f32 / dataset.total_bytes as f32))
+    } else {
+        None
+    };
+    (avg_loss, perplexity, bpb)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_eval<B: burn::tensor::backend::Backend>(
     model_dir: &Path,
     dataset_path: &Path,
     tokenizer: &LlmTokenizer,
     n_ctx: Option<usize>,
     eval_batch_size: usize,
+    eval_batches: usize,
     device: &B::Device,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = model_dir.join("config.json");
@@ -929,10 +1017,14 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     };
 
     let dataset = TextDataset::from_file(dataset_path, tokenizer, config.n_ctx, None, None)?;
-    println!("Evaluating model on dataset {:?} ({} samples, {} tokens) [batch={}]...", dataset_path, dataset.len(), dataset.tokens.len(), eval_batch_size);
+    let batch_limit = if eval_batches == 0 { "all".to_string() } else { eval_batches.to_string() };
+    println!(
+        "Evaluating model on dataset {:?} ({} samples, {} tokens) [batch={}, batches={}]...",
+        dataset_path, dataset.len(), dataset.tokens.len(), eval_batch_size, batch_limit
+    );
 
     let start_time = Instant::now();
-    let (loss, ppl) = evaluate_dataset::<B>(&model, &dataset, eval_batch_size, device);
+    let (loss, ppl, bpb) = evaluate_dataset::<B>(&model, &dataset, eval_batch_size, eval_batches, device);
     let elapsed = start_time.elapsed().as_secs_f64();
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");
@@ -940,6 +1032,10 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║ Cross-Entropy Loss : {:<39.4} ║", loss);
     println!("║ Perplexity (PPL)   : {:<39.4} ║", ppl);
+    match bpb {
+        Some(bpb) => println!("║ Bits per Byte (BPB): {:<39.4} ║", bpb),
+        None => println!("║ Bits per Byte (BPB): {:<39} ║", "n/a (.bin input has no byte count)"),
+    }
     println!("║ Evaluation Time    : {:<35.2}s ║", elapsed);
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
@@ -961,11 +1057,14 @@ mod tests {
     #[test]
     fn test_train_val_split() {
         let tokens: Vec<u32> = (0..1000).collect();
-        let dataset = TextDataset { tokens, n_ctx: 32, step: 32 };
+        let dataset = TextDataset { tokens, n_ctx: 32, step: 32, total_bytes: 1000 };
 
         let (train_ds, val_ds) = dataset.split(0.2);
         assert_eq!(train_ds.tokens.len(), 800);
         assert_eq!(val_ds.tokens.len(), 200);
+        // Bytes are split proportionally to the token split.
+        assert_eq!(train_ds.total_bytes, 800);
+        assert_eq!(val_ds.total_bytes, 200);
     }
 
     #[test]
@@ -1017,6 +1116,46 @@ mod tests {
         assert!(ctx_mid > ctx_start && ctx_mid < ctx_end);
         assert_eq!(ctx_end, target_ctx);
         assert_eq!(ctx_after, target_ctx);
+    }
+
+    #[test]
+    fn test_should_stop_early() {
+        assert!(!should_stop_early(0, 99)); // disabled
+        assert!(!should_stop_early(3, 2));
+        assert!(should_stop_early(3, 3));
+        assert!(should_stop_early(1, 5));
+    }
+
+    #[test]
+    fn test_eval_reports_bpb_and_batch_limit() {
+        let device = NdArrayDevice::Cpu;
+        let config = ModelConfig::new(64, 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+
+        let tokens: Vec<u32> = (0..160).map(|i| (i % 64) as u32).collect();
+        let dataset = TextDataset { tokens, n_ctx: 8, step: 8, total_bytes: 1600 };
+
+        let (loss, ppl, bpb) = evaluate_dataset(&model, &dataset, 4, 0, &device);
+        assert!(loss.is_finite());
+        assert!((ppl - loss.exp()).abs() < 1e-6);
+
+        // BPB = loss / ln(2) * tokens per byte.
+        let expected = loss / std::f32::consts::LN_2 * (dataset.tokens.len() as f32 / 1600.0);
+        assert!((bpb.expect("bpb for text dataset") - expected).abs() < 1e-6);
+
+        // max_batches > 0 limits the evaluation windows.
+        let (limited, _, _) = evaluate_dataset(&model, &dataset, 4, 2, &device);
+        assert!(limited.is_finite());
+
+        // .bin inputs have no byte count: no BPB.
+        let no_bytes = TextDataset {
+            tokens: (0..160).map(|i| (i % 64) as u32).collect(),
+            n_ctx: 8,
+            step: 8,
+            total_bytes: 0,
+        };
+        let (_, _, bpb_none) = evaluate_dataset(&model, &no_bytes, 4, 0, &device);
+        assert!(bpb_none.is_none());
     }
 
     #[test]
@@ -1099,6 +1238,7 @@ mod tests {
             Some(resume),
             device,
             output_dir.to_str().unwrap(),
+            0,
             &tx,
             &cancel,
             None,
@@ -1367,7 +1507,7 @@ mod tests {
             let device = NdArrayDevice::Cpu;
             train_with_events::<TestBackend>(
                 None, Some(&corpus), config, &tokenizer, 4, 1, 0.1, None, Some(72), 0.0, 1, 0,
-                None, Some(&init), &device, out.to_str().unwrap(), &tx, &cancel, None,
+                None, Some(&init), &device, out.to_str().unwrap(), 0, &tx, &cancel, None,
             )
             .expect("training run failed");
         });

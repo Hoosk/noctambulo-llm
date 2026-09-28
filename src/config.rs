@@ -67,4 +67,23 @@ impl ModelConfig {
             self.n_kv_head
         }
     }
+
+    /// Total trainable parameters for this architecture (attention biases and
+    /// tied embeddings included; MLP hidden size aligned to 256 like the model).
+    pub fn param_count(&self) -> usize {
+        let n_embd = self.n_embd;
+        let kv_dim = self.get_n_kv_head() * (n_embd / self.n_head);
+        let hidden = ((8 * n_embd) / 3).div_ceil(256) * 256;
+
+        let embed = self.vocab_size * n_embd;
+        let q = n_embd * n_embd + n_embd;
+        let k = n_embd * kv_dim + kv_dim;
+        let v = n_embd * kv_dim + kv_dim;
+        let out = n_embd * n_embd;
+        let norms = 2 * n_embd;
+        let mlp = 3 * n_embd * hidden;
+        let block = q + k + v + out + norms + mlp;
+
+        embed + self.n_layer * block + n_embd
+    }
 }

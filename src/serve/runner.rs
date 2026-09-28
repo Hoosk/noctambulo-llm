@@ -29,6 +29,7 @@ pub struct TrainParams {
     pub resume: Option<PathBuf>,
     pub output_dir: String,
     pub device: String,
+    pub early_stop_patience: usize,
 }
 
 /// Parse the machine-readable device selector (`DiscreteGpu(0)`, `Cpu`,
@@ -236,6 +237,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
             params.resume.as_deref(),
             &device,
             &params.output_dir,
+            params.early_stop_patience,
             &tx,
             &worker_cancel,
             Some(&worker_pause),

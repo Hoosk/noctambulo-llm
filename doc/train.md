@@ -8,16 +8,17 @@ Durante el entrenamiento, Kuro-Neko procesa conjuntos de datos en formato de tex
 
 ## ⚙️ Tabla Completa de Parámetros CLI
 
-El subcomando `train` acepta **20 parámetros** de configuración CLI:
+El subcomando `train` acepta **22 parámetros** de configuración CLI:
 
 | Flag | Tipo | Valor por Defecto | Descripción Detallada |
 | :--- | :--- | :--- | :--- |
 | `--dataset <repo>` | `Vec<String>` (separados por coma) | `[]` | Identificador(es) del repositorio de Hugging Face (ej. `roneneldan/TinyStories`). Admite múltiples repositorios separados por comas para entrenamiento combinado. |
 | `--file <path>` | `Option<String>` | `None` | Ruta a un archivo de texto local en el sistema de archivos para usar como corpus de entrenamiento. |
 | `--dataset-file <filename>` | `String` | `TinyStories-train.txt` | Nombre del archivo objetivo a descargar e inspeccionar dentro del repositorio de Hugging Face. |
+| `--preset <name>` | `Option<String>` | `None` | Preset de arquitectura (`nano`, `tiny`, `small`, `base`); los flags explícitos de dimensión tienen prioridad. |
 | `--batch-size <n>` | `usize` | `128` | Número de secuencias por lote (*batch*) de entrenamiento. Un tamaño mayor aprovecha mejor la GPU y acelera la convergencia, pero requiere más VRAM. |
 | `--epochs <n>` | `usize` | `3` | Número de pasadas completas a través del conjunto de datos procesado. |
-| `--max-tokens <n>` | `usize` | `10000000` (10M) | Número máximo de tokens a cargar desde el conjunto de datos. Un valor de `0` desactiva el límite y carga el dataset completo. |
+| `--max-tokens <n>` | `usize` | `100000000` (100M) | Número máximo de tokens a cargar desde el conjunto de datos. Un valor de `0` desactiva el límite y carga el dataset completo. El presupuesto Chinchilla de referencia es ~20 tokens por parámetro. |
 | `--step <n>` | `Option<usize>` | `None` (`= n-ctx`) | Paso de la ventana deslizante en tokens. Controla la superposición entre secuencias consecutivas. Si se omite, equivale a `n-ctx` (sin superposición). |
 | `--n-ctx <n>` | `usize` | `256` | Longitud de la ventana de contexto del modelo en tokens. Determina el tamaño máximo de secuencia que el modelo puede observar a la vez. |
 | `--n-embd <n>` | `usize` | `256` | Dimensión del espacio de embedding y de los estados ocultos. Valores más grandes incrementan la capacidad de representación. |
@@ -32,6 +33,7 @@ El subcomando `train` acepta **20 parámetros** de configuración CLI:
 | `--save-dir <path>` | `Option<String>` | `None` | Directorio donde guardar `checkpoint_epoch_N.bin` y `checkpoint_best.bin` al final de cada época. |
 | `--resume <path>` | `Option<String>` | `None` | Checkpoint `.bin` (o su directorio) desde el que reanudar. Restaura pesos, momentos de AdamW, posición del schedule y estado del shuffler. `--epochs` pasa a significar **épocas adicionales**. |
 | `--seq-warmup-steps <n>` | `usize` | `0` | Pasos iniciales de *Progressive Sequence Scaling*: el contexto crece de `n_ctx/4` hasta `n_ctx` durante el warmup. `0` lo desactiva. |
+| `--early-stop-patience <n>` | `usize` | `0` | Detiene el entrenamiento tras `n` épocas consecutivas sin mejorar `val_loss`. `0` lo desactiva. |
 
 ---
 
@@ -124,6 +126,12 @@ Si no existe `train_state.json` (checkpoints previos), el resume es retrocompati
 ### 8. Parada Segura (Stop / Ctrl+C)
 
 Detener un entrenamiento desde el servidor web o con `Ctrl+C` (CLI) no descarta el trabajo: antes de salir se guarda `checkpoint_interrupted.bin` junto con `train_state.json` y `optimizer_state.bin`, y se emite el evento `Checkpoint` con `kind = "interrupted"`. El servidor web además usa `with_graceful_shutdown` y espera hasta 30 segundos a que el worker termine de persistir.
+
+### 9. Presupuesto de Tokens y Early Stopping
+
+- **Aviso Chinchilla**: si `--max-tokens` queda por debajo de ~20 tokens por parámetro, el entrenador emite un aviso al inicio (p. ej. un modelo de 5.5M params pide ~110M tokens). Usa `--max-tokens 0` para entrenar con el dataset completo.
+- **Early stopping**: con `--early-stop-patience N`, el bucle termina cuando `val_loss` no mejora durante `N` épocas; al salir se guardan los pesos y el estado como en una parada normal.
+- **Métricas de validación**: la validación evalúa **todo** el split (ya no hay tope fijo de 100 batches) y reporta Loss, PPL y BPB. El BPB (`loss / ln2 × tokens/byte`) permite comparar modelos entrenados con tokenizers distintos; no está disponible para datasets `.bin` (no conservan el tamaño en bytes).
 
 ---
 

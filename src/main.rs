@@ -38,6 +38,51 @@ This model will learn the statistics of the words and start producing text \
 that sounds like a tutorial or technical documentation on Rust and Burn. \
 ";
 
+/// Named architecture presets so common model sizes don't need 5 flags.
+struct ArchPreset {
+    n_embd: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    n_layer: usize,
+    n_ctx: usize,
+}
+
+fn arch_preset(name: &str) -> Result<ArchPreset, String> {
+    let preset = match name {
+        "nano" => ArchPreset { n_embd: 128, n_head: 4, n_kv_head: 2, n_layer: 4, n_ctx: 256 },
+        "tiny" => ArchPreset { n_embd: 256, n_head: 4, n_kv_head: 2, n_layer: 4, n_ctx: 256 },
+        "small" => ArchPreset { n_embd: 512, n_head: 8, n_kv_head: 2, n_layer: 8, n_ctx: 512 },
+        "base" => ArchPreset { n_embd: 768, n_head: 12, n_kv_head: 4, n_layer: 12, n_ctx: 1024 },
+        other => {
+            return Err(format!(
+                "Unknown preset '{other}'. Available presets: nano, tiny, small, base"
+            ))
+        }
+    };
+    Ok(preset)
+}
+
+/// Resolve the architecture: explicit flag > preset > built-in default.
+fn resolve_arch(
+    preset: Option<&ArchPreset>,
+    n_embd: Option<usize>,
+    n_head: Option<usize>,
+    n_kv_head: Option<usize>,
+    n_layer: Option<usize>,
+    n_ctx: Option<usize>,
+) -> (usize, usize, Option<usize>, usize, usize) {
+    let pick = |value: Option<usize>, from_preset: fn(&ArchPreset) -> usize, default: usize| {
+        value.or_else(|| preset.map(from_preset)).unwrap_or(default)
+    };
+    (
+        pick(n_embd, |p| p.n_embd, 256),
+        pick(n_head, |p| p.n_head, 4),
+        n_kv_head.or_else(|| preset.map(|p| p.n_kv_head)),
+        pick(n_layer, |p| p.n_layer, 4),
+        pick(n_ctx, |p| p.n_ctx, 256),
+    )
+}
+
 #[derive(Parser)]
 #[command(name = "kuro-neko", author, version, about = "🐈‍⬛ Kuro-Neko 2026 Engine", long_about = None)]
 struct Cli {
@@ -168,6 +213,9 @@ struct EvalArgs {
     /// Evaluation batch size (default 16, lower if OOM on small GPUs)
     #[arg(long, default_value_t = 16)]
     eval_batch_size: usize,
+    /// Max batches to evaluate (0 = all; the old hard cap was 100)
+    #[arg(long, default_value_t = 0)]
+    eval_batches: usize,
 }
 
 #[derive(Args)]
@@ -181,33 +229,38 @@ struct TrainArgs {
     /// Target file name inside HF dataset repo
     #[arg(long, default_value = "TinyStories-train.txt")]
     dataset_file: String,
+    /// Architecture preset: nano (~2M), tiny (~5.5M), small (~30M), base (~100M).
+    /// Explicit --n-embd/--n-head/--n-kv-head/--n-layer/--n-ctx override it.
+    #[arg(long)]
+    preset: Option<String>,
     /// Batch size
     #[arg(long, default_value_t = 128)]
     batch_size: usize,
-    /// Number of epochs
+    /// Number of epochs (on resume: additional epochs)
     #[arg(long, default_value_t = 3)]
     epochs: usize,
-    /// Max dataset tokens to load (0 = all)
-    #[arg(long, default_value_t = 10_000_000)]
+    /// Max dataset tokens to load (0 = all). ~20 tokens/param is the
+    /// Chinchilla-style budget for this model size.
+    #[arg(long, default_value_t = 100_000_000)]
     max_tokens: usize,
     /// Sliding window step in tokens (default: same as n-ctx)
     #[arg(long)]
     step: Option<usize>,
-    /// Context window size
-    #[arg(long, default_value_t = 256)]
-    n_ctx: usize,
-    /// Embedding dimension
-    #[arg(long, default_value_t = 256)]
-    n_embd: usize,
-    /// Attention query heads count
-    #[arg(long, default_value_t = 4)]
-    n_head: usize,
+    /// Context window size [default: 256, preset-dependent]
+    #[arg(long)]
+    n_ctx: Option<usize>,
+    /// Embedding dimension [default: 256, preset-dependent]
+    #[arg(long)]
+    n_embd: Option<usize>,
+    /// Attention query heads count [default: 4, preset-dependent]
+    #[arg(long)]
+    n_head: Option<usize>,
     /// Attention key/value heads count for GQA (0 or None = same as n-head)
     #[arg(long)]
     n_kv_head: Option<usize>,
-    /// Transformer layers count
-    #[arg(long, default_value_t = 4)]
-    n_layer: usize,
+    /// Transformer layers count [default: 4, preset-dependent]
+    #[arg(long)]
+    n_layer: Option<usize>,
     /// Learning rate
     #[arg(long, default_value_t = 3e-4)]
     lr: f64,
@@ -232,6 +285,9 @@ struct TrainArgs {
     /// Number of steps for progressive sequence length warmup (0 = disabled)
     #[arg(long, default_value_t = 0)]
     seq_warmup_steps: usize,
+    /// Stop early after N epochs without validation improvement (0 = disabled)
+    #[arg(long, default_value_t = 0)]
+    early_stop_patience: usize,
 }
 
 #[derive(Args)]
@@ -464,13 +520,22 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
 
-            let model_config = ModelConfig::new(
-                vocab_size,
+            let preset = args.preset.as_deref().map(arch_preset).transpose()?;
+            let (n_embd, n_head, n_kv_head, n_layer, n_ctx) = resolve_arch(
+                preset.as_ref(),
                 args.n_embd,
                 args.n_head,
                 args.n_kv_head,
                 args.n_layer,
                 args.n_ctx,
+            );
+            let model_config = ModelConfig::new(
+                vocab_size,
+                n_embd,
+                n_head,
+                n_kv_head,
+                n_layer,
+                n_ctx,
                 args.dropout,
                 args.attn_softcap,
             );
@@ -496,6 +561,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 resume_path_buf.as_deref(),
                 &device,
                 output_dir,
+                args.early_stop_patience,
                 Some(cancel),
             )?;
         }
@@ -536,6 +602,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &tokenizer,
                 args.n_ctx,
                 args.eval_batch_size,
+                args.eval_batches,
                 &device,
             )?;
         }
@@ -620,29 +687,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let n_embd = model_config.n_embd;
             let n_head = model_config.n_head;
             let n_kv_head = model_config.get_n_kv_head();
-            let head_dim = n_embd / n_head;
-            let kv_dim = n_kv_head * head_dim;
             let n_layer = model_config.n_layer;
             let vocab_size = model_config.vocab_size;
 
             let raw_hidden = (8 * n_embd) / 3;
             let hidden_dim = raw_hidden.div_ceil(256) * 256;
 
-            // Parameter Count Breakdown
-            let embed_params = vocab_size * n_embd;
-            let q_params = n_embd * n_embd + n_embd; // with bias
-            let k_params = n_embd * kv_dim + kv_dim; // with bias
-            let v_params = n_embd * kv_dim + kv_dim; // with bias
-            let out_params = n_embd * n_embd;
-            let attn_norm_params = n_embd;
-            let ffn_norm_params = n_embd;
-            let gate_params = n_embd * hidden_dim;
-            let up_params = n_embd * hidden_dim;
-            let down_params = hidden_dim * n_embd;
-
-            let block_params = attn_norm_params + q_params + k_params + v_params + out_params + ffn_norm_params + gate_params + up_params + down_params;
-            let final_norm_params = n_embd;
-            let total_params = embed_params + (n_layer * block_params) + final_norm_params;
+            let total_params = model_config.param_count();
 
             let fp32_bytes = total_params * 4;
             let fp32_mb = fp32_bytes as f64 / (1024.0 * 1024.0);
@@ -725,4 +776,26 @@ fn rand_like_token() -> u128 {
     acc ^= acc >> 7;
     acc ^= acc << 17;
     acc.wrapping_mul(0x9E3779B97F4A7C15)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arch_presets_and_overrides() {
+        let tiny = arch_preset("tiny").unwrap();
+        assert_eq!(resolve_arch(Some(&tiny), None, None, None, None, None), (256, 4, Some(2), 4, 256));
+
+        // Explicit flags win over the preset.
+        let resolved = resolve_arch(Some(&tiny), Some(384), Some(8), Some(1), Some(6), Some(512));
+        assert_eq!(resolved, (384, 8, Some(1), 6, 512));
+
+        // Without a preset the historical defaults apply (MHA, no GQA).
+        assert_eq!(resolve_arch(None, None, None, None, None, None), (256, 4, None, 4, 256));
+
+        assert!(arch_preset("small").is_ok());
+        assert!(arch_preset("base").is_ok());
+        assert!(arch_preset("nope").is_err());
+    }
 }

@@ -694,25 +694,13 @@ fn model_meta(dir: &Path) -> Option<ModelInfo> {
     let cfg: crate::config::ModelConfig = serde_json::from_str(&std::fs::read_to_string(config_path).ok()?).ok()?;
     let size_mb = weights_path.metadata().ok()?.len() as f64 / (1024.0 * 1024.0);
 
-    let n_embd = cfg.n_embd;
-    let n_head = cfg.n_head;
-    let n_kv_head = cfg.get_n_kv_head();
-    let head_dim = n_embd / n_head;
-    let kv_dim = n_kv_head * head_dim;
-    let hidden = ((8 * n_embd) / 3).div_ceil(256) * 256;
-    let embed = cfg.vocab_size * n_embd;
-    let q = n_embd * n_embd + n_embd;
-    let k = n_embd * kv_dim + kv_dim;
-    let v = n_embd * kv_dim + kv_dim;
-    let o = n_embd * n_embd;
-    let block = n_embd + q + k + v + o + n_embd + n_embd * hidden + n_embd * hidden + hidden * n_embd;
-    let params = embed + cfg.n_layer * block + n_embd;
+    let params = cfg.param_count();
 
     Some(ModelInfo {
         dir: dir.to_string_lossy().to_string(),
         name: dir.file_name().unwrap_or_default().to_string_lossy().to_string(),
-        n_embd,
-        n_head,
+        n_embd: cfg.n_embd,
+        n_head: cfg.n_head,
         n_layer: cfg.n_layer,
         n_ctx: cfg.n_ctx,
         vocab: cfg.vocab_size,
@@ -832,6 +820,8 @@ struct TrainRequest {
     grad_accum: usize,
     #[serde(default)]
     seq_warmup_steps: usize,
+    #[serde(default)]
+    early_stop_patience: usize,
     #[serde(default = "default_nctx")]
     n_ctx: usize,
     #[serde(default = "default_nembd")]
@@ -955,6 +945,7 @@ async fn train(
         resume: req.resume.map(path_buf_from),
         output_dir: req.output_dir,
         device: req.device,
+        early_stop_patience: req.early_stop_patience,
     };
 
     match launch_job(&state.server, &state.registry, params) {
