@@ -28,6 +28,11 @@ pub(super) struct GenerateRequest {
     min_p: f32,
     #[serde(default = "default_rep")]
     repetition_penalty: f32,
+    /// RoPE context-extension scaling: none, linear, ntk or yarn.
+    #[serde(default)]
+    rope_scaling: Option<String>,
+    #[serde(default = "default_rope_factor")]
+    rope_factor: f32,
 }
 
 fn default_max_new_tokens() -> usize {
@@ -54,6 +59,10 @@ fn default_rep() -> f32 {
     1.2
 }
 
+fn default_rope_factor() -> f32 {
+    1.0
+}
+
 /// Sampling knobs shared by the streaming and non-streaming endpoints.
 struct Sampling {
     prompt: String,
@@ -63,11 +72,22 @@ struct Sampling {
     top_p: f32,
     min_p: f32,
     repetition_penalty: f32,
+    rope_kind: crate::config::RopeScalingKind,
+    rope_factor: f32,
 }
 
 impl Sampling {
-    fn from_request(req: GenerateRequest) -> Self {
-        Self {
+    fn from_request(req: GenerateRequest) -> Result<Self, ApiError> {
+        let rope_kind = match req.rope_scaling.as_deref() {
+            Some(name) => crate::config::RopeScalingKind::parse(name).map_err(ApiError::bad_request)?,
+            None => crate::config::RopeScalingKind::None,
+        };
+        let rope_factor = if req.rope_factor.is_finite() && req.rope_factor > 0.0 {
+            req.rope_factor
+        } else {
+            1.0
+        };
+        Ok(Self {
             prompt: req.prompt,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
@@ -75,7 +95,9 @@ impl Sampling {
             top_p: req.top_p,
             min_p: req.min_p,
             repetition_penalty: req.repetition_penalty,
-        }
+            rope_kind,
+            rope_factor,
+        })
     }
 }
 
@@ -87,23 +109,9 @@ pub(super) async fn generate_text(
     check_token(&state.server, &headers, None)?;
 
     let model_dir = resolve_model_dir(&state.server.models_dir, &req.model_dir)?;
-    let s = Sampling::from_request(req);
+    let s = Sampling::from_request(req)?;
 
-    let result = tokio::task::spawn_blocking(move || {
-        run_generate(
-            model_dir,
-            &s.prompt,
-            s.max_tokens,
-            s.temperature,
-            s.top_k,
-            s.top_p,
-            s.min_p,
-            s.repetition_penalty,
-            false,
-            None,
-        )
-    })
-    .await;
+    let result = tokio::task::spawn_blocking(move || run_generate(model_dir, s, false, None)).await;
 
     match result {
         Ok(Ok(text)) => Ok(Json(serde_json::json!({ "text": text }))),
@@ -122,22 +130,11 @@ pub(super) async fn generate_stream(
     check_token(&state.server, &headers, None)?;
 
     let model_dir = resolve_model_dir(&state.server.models_dir, &req.model_dir)?;
-    let s = Sampling::from_request(req);
+    let s = Sampling::from_request(req)?;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     tokio::task::spawn_blocking(move || {
-        let streamed = run_generate(
-            model_dir,
-            &s.prompt,
-            s.max_tokens,
-            s.temperature,
-            s.top_k,
-            s.top_p,
-            s.min_p,
-            s.repetition_penalty,
-            true,
-            Some(tx),
-        );
+        let streamed = run_generate(model_dir, s, true, Some(tx));
         if let Err(e) = streamed {
             eprintln!("generate stream error: {e}");
         }
@@ -159,16 +156,9 @@ pub(super) async fn generate_stream(
 /// Load a saved model and run generation on it. With `stream` enabled the
 /// continuation is pushed chunk by chunk through `tx`; the returned string is
 /// then empty (the caller only uses it to surface errors).
-#[allow(clippy::too_many_arguments)]
 fn run_generate(
     model_dir: std::path::PathBuf,
-    prompt: &str,
-    max_tokens: usize,
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    min_p: f32,
-    rep: f32,
+    s: Sampling,
     stream: bool,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String, String> {
@@ -180,8 +170,11 @@ fn run_generate(
     let weights_path = model_dir.join("model_weights");
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
-    let config: crate::config::ModelConfig =
+    let mut config: crate::config::ModelConfig =
         serde_json::from_str(&config_str).map_err(|e| format!("bad config: {e}"))?;
+    // Request-level RoPE override for context extension; `none` + factor 1
+    // keeps whatever the checkpoint config declares.
+    config.set_rope_scaling(s.rope_kind, s.rope_factor);
 
     let tokenizer_path = "custom_tokenizer.json";
     let tokenizer = crate::data::LlmTokenizer::from_file(tokenizer_path)
@@ -205,13 +198,13 @@ fn run_generate(
         crate::generate::generate_streaming(
             &model,
             &tokenizer,
-            prompt,
-            max_tokens,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            rep,
+            &s.prompt,
+            s.max_tokens,
+            s.temperature,
+            s.top_k,
+            s.top_p,
+            s.min_p,
+            s.repetition_penalty,
             seed,
             &device,
             |chunk| tx.blocking_send(chunk.to_string()).is_ok(),
@@ -221,7 +214,17 @@ fn run_generate(
     }
 
     crate::generate::generate(
-        &model, &tokenizer, prompt, max_tokens, temperature, top_k, top_p, min_p, rep, seed, &device,
+        &model,
+        &tokenizer,
+        &s.prompt,
+        s.max_tokens,
+        s.temperature,
+        s.top_k,
+        s.top_p,
+        s.min_p,
+        s.repetition_penalty,
+        seed,
+        &device,
     )
     .map_err(|e| format!("generate error: {e}"))
 }

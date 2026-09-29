@@ -195,15 +195,17 @@ pub fn generate_streaming<B: Backend>(
         return Ok(String::new());
     }
 
-    if tokens.len() > model.n_ctx {
+    // `max_seq_len` is the trained context window extended by the active RoPE
+    // scaling factor (equal to `n_ctx` when scaling is off).
+    let max_seq = model.max_seq_len();
+    if tokens.len() > max_seq {
         eprintln!(
             "Warning: prompt length ({}) exceeds model context window ({}). Keeping the most recent {} tokens.",
             tokens.len(),
-            model.n_ctx,
-            model.n_ctx
+            max_seq,
+            max_seq
         );
-        let keep = model.n_ctx;
-        let drop = tokens.len() - keep;
+        let drop = tokens.len() - max_seq;
         tokens.drain(0..drop);
     }
 
@@ -261,8 +263,8 @@ pub fn generate_streaming<B: Backend>(
         let last_token = tokens.last().copied().unwrap_or(0) as i32;
         let start_pos = tokens.len() - 1;
 
-        if start_pos >= model.n_ctx {
-            println!("\n[Reached maximum context length ({}). Stopping generation.]", model.n_ctx);
+        if start_pos >= max_seq {
+            println!("\n[Reached maximum context length ({max_seq}). Stopping generation.]");
             break;
         }
 

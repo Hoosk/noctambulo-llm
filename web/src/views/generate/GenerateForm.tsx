@@ -10,6 +10,8 @@ export interface GenForm {
   topP: string;
   minP: string;
   rep: string;
+  ropeScaling: string;
+  ropeFactor: string;
 }
 
 interface Props {
@@ -88,6 +90,29 @@ export function GenerateForm({
           <Input type="number" min={1} step={0.05} value={form.rep} onChange={(e) => onField("rep", e.target.value)} />
         </Field>
       </div>
+
+      <div className="grid grid-cols-2 gap-3 mt-3">
+        <Field label="RoPE scaling">
+          <Select value={form.ropeScaling} onChange={(e) => onField("ropeScaling", e.target.value)}>
+            <option value="none">none</option>
+            <option value="linear">linear</option>
+            <option value="ntk">ntk (dynamic)</option>
+            <option value="yarn">yarn</option>
+          </Select>
+        </Field>
+        <Field label="RoPE factor">
+          <Input
+            type="number"
+            min={1}
+            step={0.5}
+            value={form.ropeFactor}
+            onChange={(e) => onField("ropeFactor", e.target.value)}
+          />
+        </Field>
+      </div>
+      <p className="text-[11px] text-slate-500 -mt-1 mb-1">
+        Scaling extends the usable context past the trained window (generation past n_ctx works with or without it).
+      </p>
 
       <div className="mt-5 flex gap-3">
         <Button variant="primary" disabled={busy || !modelDir} onClick={onRun}>

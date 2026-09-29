@@ -359,9 +359,8 @@ pub fn export_to_gguf<B: Backend>(
     let types_clone = token_types.clone();
     let merges_clone = vocab_merges.clone();
 
-    let kv_pairs: Vec<(&str, u32, GgufKvWriter<'_>)> = vec![
-        ("general.architecture", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "llama")? as u64) })),
-        ("general.name", GGUF_TYPE_STRING, Box::new(move |w| { Ok(write_gguf_string(w, model_name)? as u64) })),
+    let mut kv_pairs: Vec<(&str, u32, GgufKvWriter<'_>)> = vec![
+        ("general.architecture", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "llama")? as u64) })),        ("general.name", GGUF_TYPE_STRING, Box::new(move |w| { Ok(write_gguf_string(w, model_name)? as u64) })),
         ("llama.context_length", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.n_ctx as u32).to_le_bytes())?; Ok(4) })),
         ("llama.embedding_length", GGUF_TYPE_UINT32, Box::new(|w| { w.write_all(&(config.n_embd as u32).to_le_bytes())?; Ok(4) })),
         ("llama.block_count", GGUF_TYPE_UINT32, Box::new(|w| { w.write_all(&(config.n_layer as u32).to_le_bytes())?; Ok(4) })),
@@ -415,6 +414,35 @@ pub fn export_to_gguf<B: Backend>(
             Ok(written)
         })),
     ];
+
+    // RoPE context-extension metadata: only written when scaling is active, so
+    // unscaled exports keep the exact same key set as before.
+    if config.rope_kind() != crate::config::RopeScalingKind::None {
+        let kind = config.rope_kind().as_str().to_string();
+        let factor = config.rope_factor;
+        let original_ctx = config.n_ctx as u32;
+        kv_pairs.push((
+            "llama.rope.scaling.type",
+            GGUF_TYPE_STRING,
+            Box::new(move |w| Ok(write_gguf_string(w, &kind)? as u64)),
+        ));
+        kv_pairs.push((
+            "llama.rope.scaling.factor",
+            GGUF_TYPE_FLOAT32,
+            Box::new(move |w| {
+                w.write_all(&factor.to_le_bytes())?;
+                Ok(4)
+            }),
+        ));
+        kv_pairs.push((
+            "llama.rope.scaling.original_context_length",
+            GGUF_TYPE_UINT32,
+            Box::new(move |w| {
+                w.write_all(&original_ctx.to_le_bytes())?;
+                Ok(4)
+            }),
+        ));
+    }
 
     w.write_all(&tensor_count.to_le_bytes())?;
     w.write_all(&(kv_pairs.len() as u64).to_le_bytes())?;

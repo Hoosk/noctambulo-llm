@@ -25,6 +25,9 @@ interface FormState {
   dropout: string;
   attnSoftcap: string;
   seqWarmup: string;
+  weightDecay: string;
+  labelSmoothing: string;
+  zLoss: string;
   saveDir: string;
   outputDir: string;
 }
@@ -48,6 +51,9 @@ const DEFAULT_FORM: FormState = {
   dropout: "0.1",
   attnSoftcap: "0",
   seqWarmup: "0",
+  weightDecay: "0.1",
+  labelSmoothing: "0",
+  zLoss: "0",
   saveDir: "checkpoints_web",
   outputDir: "model_output",
 };
@@ -93,6 +99,9 @@ function buildTrainBody(
       dropout: num(form.dropout),
       attnSoftcap: num(form.attnSoftcap),
       seqWarmupSteps: num(form.seqWarmup),
+      weightDecay: num(form.weightDecay),
+      labelSmoothing: num(form.labelSmoothing),
+      zLoss: num(form.zLoss),
       saveDir: form.saveDir,
       outputDir: form.outputDir,
       resume: resumeOn && resumePath ? resumePath : undefined,
@@ -322,6 +331,9 @@ function ConfigFields({ form, set, datasets, devices, onSaveDirChange }: ConfigF
         <NumberField label="Attn softcap" step={1} min={0} value={form.attnSoftcap} onChange={(v) => set("attnSoftcap", v)} />
         <NumberField label="Seq warmup steps" min={0} value={form.seqWarmup} onChange={(v) => set("seqWarmup", v)} />
         <NumberField label="Early stop (epochs)" min={0} value={form.earlyStop} onChange={(v) => set("earlyStop", v)} />
+        <NumberField label="Weight decay" step={0.01} min={0} value={form.weightDecay} onChange={(v) => set("weightDecay", v)} />
+        <NumberField label="Label smoothing" step={0.01} min={0} max={0.9} value={form.labelSmoothing} onChange={(v) => set("labelSmoothing", v)} />
+        <NumberField label="Z-loss" step={0.0001} min={0} value={form.zLoss} onChange={(v) => set("zLoss", v)} />
       </div>
 
       <div className="grid grid-cols-2 gap-3 mt-3">

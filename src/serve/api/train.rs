@@ -38,6 +38,12 @@ pub(super) struct TrainRequest {
     seq_warmup_steps: usize,
     #[serde(default)]
     early_stop_patience: usize,
+    #[serde(default = "default_weight_decay")]
+    weight_decay: f64,
+    #[serde(default)]
+    label_smoothing: f32,
+    #[serde(default)]
+    z_loss: f32,
     #[serde(default = "default_nctx")]
     n_ctx: usize,
     #[serde(default = "default_nembd")]
@@ -109,6 +115,10 @@ fn default_nlayer() -> usize {
 }
 
 fn default_dropout() -> f64 {
+    0.1
+}
+
+fn default_weight_decay() -> f64 {
     0.1
 }
 
@@ -194,6 +204,9 @@ pub(super) async fn train(
         output_dir: req.output_dir,
         device: req.device,
         early_stop_patience: req.early_stop_patience,
+        weight_decay: req.weight_decay,
+        label_smoothing: req.label_smoothing,
+        z_loss: req.z_loss,
     };
 
     match launch_job(&state.server, &state.registry, params) {

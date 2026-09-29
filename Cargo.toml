@@ -3,6 +3,11 @@ name = "kuro-neko-llm"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Optional CUDA backend for the CLI (train/eval/generate/export). Build with
+# `cargo build --release --features cuda`; the web server keeps using WGPU.
+cuda = ["burn/cuda"]
+
 [dependencies]
 # Deep Learning (última versión disponible en crates.io)
 burn = { version = "0.21", features = ["wgpu", "train", "autodiff", "fusion"] }

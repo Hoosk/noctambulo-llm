@@ -4,16 +4,79 @@ use crate::generate::{generate, XorshiftRng};
 use crate::model::Llm;
 use crate::tui;
 use burn::grad_clipping::GradientClippingConfig;
-use burn::module::{AutodiffModule, Module};
+use burn::module::{AutodiffModule, Module, ModuleMapper, Param};
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::AutodiffBackend;
+use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor, TensorData};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
+
+/// Training loss and decay knobs (Stage D6).
+#[derive(Debug, Clone, Copy)]
+pub struct LossOptions {
+    /// Decoupled weight decay applied only to rank >= 2 parameters (weight
+    /// matrices and embeddings); norms and biases are excluded.
+    pub weight_decay: f64,
+    /// Label-smoothing factor (0.0 disables it).
+    pub label_smoothing: f32,
+    /// Z-loss coefficient on `logsumexp(logits)^2` (0.0 disables it).
+    pub z_loss: f32,
+}
+
+impl Default for LossOptions {
+    fn default() -> Self {
+        Self {
+            weight_decay: 0.1,
+            label_smoothing: 0.0,
+            z_loss: 0.0,
+        }
+    }
+}
+
+/// Applies decoupled decay (`w <- w * factor`) to rank >= 2 parameters only.
+struct WeightDecayMapper {
+    factor: f64,
+}
+
+impl<B: Backend> ModuleMapper<B> for WeightDecayMapper {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        if D < 2 || (self.factor - 1.0).abs() < 1e-12 {
+            return param;
+        }
+        let (id, tensor, mapper) = param.consume();
+        Param::from_mapped_value(id, tensor.mul_scalar(self.factor), mapper)
+    }
+}
+
+/// Cross-entropy with optional label smoothing and z-loss. Kept generic so the
+/// math can be unit-tested on the CPU backend.
+fn compute_loss<B: Backend>(
+    logits_flat: Tensor<B, 2>,
+    targets_flat: Tensor<B, 2, Int>,
+    opts: LossOptions,
+) -> Tensor<B, 1> {
+    let log_probs = burn::tensor::activation::log_softmax(logits_flat.clone(), 1);
+    let nll = log_probs.clone().gather(1, targets_flat).mean().neg();
+    let mut loss = if opts.label_smoothing > 0.0 {
+        let smooth = log_probs.mean().neg();
+        let eps = opts.label_smoothing as f64;
+        nll * (1.0 - eps) + smooth * eps
+    } else {
+        nll
+    };
+
+    if opts.z_loss > 0.0 {
+        let max = logits_flat.clone().max_dim(1);
+        let z = (logits_flat - max.clone()).exp().sum_dim(1).log() + max;
+        loss = loss + z.powf_scalar(2.0).mean() * opts.z_loss;
+    }
+
+    loss
+}
 
 /// JSON sidecar file holding scheduler position, RNG and best validation loss.
 pub const TRAIN_STATE_FILE: &str = "train_state.json";
@@ -389,6 +452,7 @@ pub fn train<B: AutodiffBackend>(
     device: &B::Device,
     output_dir: &str,
     early_stop_patience: usize,
+    loss_opts: LossOptions,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
@@ -440,7 +504,7 @@ pub fn train<B: AutodiffBackend>(
         dataset_path, raw_text, model_config, tokenizer, epochs, batch_size, lr,
         custom_step, max_tokens, val_split, grad_accum_steps, seq_warmup_steps,
         save_dir, resume_path, device, output_dir, early_stop_patience,
-        &tx, &cancel_thread, None,
+        loss_opts, &tx, &cancel_thread, None,
     );
 
     drop(tx);
@@ -467,6 +531,7 @@ pub fn train_with_events<B: AutodiffBackend>(
     device: &B::Device,
     output_dir: &str,
     early_stop_patience: usize,
+    loss_opts: LossOptions,
     tx: &Sender<TrainingEvent>,
     cancel: &Arc<AtomicBool>,
     pause: Option<&Arc<AtomicBool>>,
@@ -511,8 +576,10 @@ pub fn train_with_events<B: AutodiffBackend>(
         emit_log(tx, "Successfully loaded checkpoint weights!");
     }
 
+    // Weight decay is applied manually through `WeightDecayMapper` so norms and
+    // biases are excluded (rank >= 2 only); AdamW's uniform decay stays off.
     let mut optim = AdamWConfig::new()
-        .with_weight_decay(0.1f32)
+        .with_weight_decay(0.0f32)
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
@@ -675,10 +742,8 @@ pub fn train_with_events<B: AutodiffBackend>(
             let [b, t, v] = logits.dims();
 
             let logits_flat = logits.reshape([b * t, v]);
-            let log_probs = burn::tensor::activation::log_softmax(logits_flat, 1);
             let targets_flat = targets.reshape([b * t, 1]);
-            let target_log_probs = log_probs.gather(1, targets_flat);
-            let loss = target_log_probs.mean().neg();
+            let loss = compute_loss(logits_flat, targets_flat, loss_opts);
 
             // Metrics use the unscaled loss; gradients are scaled by the
             // micro-batch window size so the accumulated update equals the mean
@@ -693,6 +758,10 @@ pub fn train_with_events<B: AutodiffBackend>(
 
             if batch_idx + 1 - window_start == window_len {
                 let grads = grad_accumulator.grads();
+                if loss_opts.weight_decay > 0.0 {
+                    let factor = 1.0 - current_lr * loss_opts.weight_decay;
+                    model = model.map(&mut WeightDecayMapper { factor });
+                }
                 model = optim.step(current_lr, model, grads);
                 window_start = batch_idx + 1;
             }
@@ -990,6 +1059,7 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     eval_batch_size: usize,
     eval_batches: usize,
     device: &B::Device,
+    rope_override: Option<(crate::config::RopeScalingKind, f32)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = model_dir.join("config.json");
     if !config_path.exists() {
@@ -1000,6 +1070,10 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
 
     if let Some(ctx) = n_ctx {
         config.n_ctx = ctx;
+    }
+    if let Some((kind, factor)) = rope_override {
+        config.set_rope_scaling(kind, factor);
+        println!("RoPE scaling override: {} (factor {})", kind.as_str(), config.rope_factor);
     }
 
     println!("Loading model config from {:?}...", config_path);
@@ -1285,6 +1359,7 @@ mod tests {
             device,
             output_dir.to_str().unwrap(),
             0,
+            LossOptions::default(),
             &tx,
             &cancel,
             None,
@@ -1553,7 +1628,8 @@ mod tests {
             let device = NdArrayDevice::Cpu;
             train_with_events::<TestBackend>(
                 None, Some(&corpus), config, &tokenizer, 4, 1, 0.1, None, Some(72), 0.0, 1, 0,
-                None, Some(&init), &device, out.to_str().unwrap(), 0, &tx, &cancel, None,
+                None, Some(&init), &device, out.to_str().unwrap(), 0, LossOptions::default(),
+                &tx, &cancel, None,
             )
             .expect("training run failed");
         });
@@ -1576,6 +1652,106 @@ mod tests {
             dir.join("out/optimizer_state.bin").is_file(),
             "optimizer_state.bin missing"
         );
+    }
+
+    #[test]
+    fn test_weight_decay_mapper_skips_rank1() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let config = ModelConfig::new(64, 32, 4, Some(2), 1, 8, 0.0, 0.0);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+
+        let embed_before = model.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap();
+        let weight_before = model.blocks[0].attn.q_proj.weight.val().into_data().to_vec::<f32>().unwrap();
+        let norm_before = model.blocks[0].input_layernorm.weight.val().into_data().to_vec::<f32>().unwrap();
+        let bias_before = model
+            .blocks[0]
+            .attn
+            .q_proj
+            .bias
+            .as_ref()
+            .unwrap()
+            .val()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let mapped = model.map(&mut WeightDecayMapper { factor: 0.5 });
+
+        let embed_after = mapped.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap();
+        let weight_after = mapped.blocks[0].attn.q_proj.weight.val().into_data().to_vec::<f32>().unwrap();
+        let norm_after = mapped.blocks[0].input_layernorm.weight.val().into_data().to_vec::<f32>().unwrap();
+        let bias_after = mapped
+            .blocks[0]
+            .attn
+            .q_proj
+            .bias
+            .as_ref()
+            .unwrap()
+            .val()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        // Rank >= 2 (embeddings, projection matrices) is decayed...
+        for (before, after) in embed_before.iter().zip(embed_after.iter()) {
+            assert!((before * 0.5 - after).abs() < 1e-6);
+        }
+        for (before, after) in weight_before.iter().zip(weight_after.iter()) {
+            assert!((before * 0.5 - after).abs() < 1e-6);
+        }
+        // ...while norms and biases are untouched.
+        assert_eq!(norm_before, norm_after);
+        assert_eq!(bias_before, bias_after);
+    }
+
+    #[test]
+    fn test_compute_loss_label_smoothing_and_z_loss() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+
+        let opts = |ls: f32, z: f32| LossOptions {
+            weight_decay: 0.0,
+            label_smoothing: ls,
+            z_loss: z,
+        };
+        let scalar = |loss: Tensor<NdArray<f32, i32>, 1>| loss.into_data().to_vec::<f32>().unwrap()[0];
+
+        let logits = Tensor::<NdArray<f32, i32>, 2>::from_data(
+            TensorData::new(vec![0.0f32, 2.0, 0.0, 0.0], [1, 4]),
+            &device,
+        );
+        let target = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(vec![1i32], [1, 1]),
+            &device,
+        );
+
+        let lse = (1.0f32 + (2.0f32).exp() + 1.0 + 1.0).ln();
+        let nll = lse - 2.0;
+        let plain = scalar(compute_loss(logits.clone(), target.clone(), opts(0.0, 0.0)));
+        assert!((plain - nll).abs() < 1e-5, "plain={plain} nll={nll}");
+
+        // Uniform logits: NLL = ln(4) and smoothing keeps it unchanged.
+        let uniform = Tensor::<NdArray<f32, i32>, 2>::from_data(
+            TensorData::new(vec![0.0f32; 4], [1, 4]),
+            &device,
+        );
+        let t0 = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(vec![0i32], [1, 1]),
+            &device,
+        );
+        let ln4 = 4.0f32.ln();
+        let smoothed = scalar(compute_loss(uniform.clone(), t0.clone(), opts(0.5, 0.0)));
+        assert!((smoothed - ln4).abs() < 1e-5, "smoothed={smoothed} ln4={ln4}");
+
+        // Z-loss adds mean(z^2) with z = logsumexp(logits).
+        let with_z = scalar(compute_loss(uniform, t0, opts(0.0, 1.0)));
+        let expected = ln4 + ln4 * ln4;
+        assert!((with_z - expected).abs() < 1e-4, "with_z={with_z} expected={expected}");
+
+        // Smoothing raises the loss when the model is confidently correct.
+        let harder = scalar(compute_loss(logits, target, opts(0.5, 0.0)));
+        assert!(harder > plain, "harder={harder} plain={plain}");
     }
 }
 

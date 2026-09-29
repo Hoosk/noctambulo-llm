@@ -288,6 +288,9 @@ mod tests {
             output_dir: "model_output".into(),
             device: "DiscreteGpu(0)".into(),
             early_stop_patience: 0,
+            weight_decay: 0.1,
+            label_smoothing: 0.0,
+            z_loss: 0.0,
         }
     }
 

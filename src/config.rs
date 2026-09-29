@@ -31,6 +31,45 @@ impl DType {
     }
 }
 
+/// RoPE context-extension strategy. `Linear` and `Yarn` map to the GGUF
+/// `rope.scaling.type` values understood by llama.cpp; `Ntk` is our extension
+/// (dynamic NTK base adjustment) and is exported as `ntk`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RopeScalingKind {
+    #[default]
+    None,
+    Linear,
+    Ntk,
+    Yarn,
+}
+
+impl RopeScalingKind {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "off" => Ok(Self::None),
+            "linear" => Ok(Self::Linear),
+            "ntk" | "dynamic" | "dynamic-ntk" => Ok(Self::Ntk),
+            "yarn" => Ok(Self::Yarn),
+            other => Err(format!(
+                "Unknown rope scaling '{other}'. Available: none, linear, ntk, yarn"
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Linear => "linear",
+            Self::Ntk => "ntk",
+            Self::Yarn => "yarn",
+        }
+    }
+}
+
+fn default_rope_factor() -> f32 {
+    1.0
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModelConfig {
     pub vocab_size: usize,
@@ -44,6 +83,13 @@ pub struct ModelConfig {
     pub dropout: f64,
     #[serde(default)]
     pub attn_softcap: f32,
+    /// RoPE context-extension strategy (`none`, `linear`, `ntk`, `yarn`).
+    /// Absent in older configs, which is equivalent to `none`.
+    #[serde(default)]
+    pub rope_scaling: Option<String>,
+    /// Context-extension factor (e.g. `2.0` doubles the usable context).
+    #[serde(default = "default_rope_factor")]
+    pub rope_factor: f32,
 }
 
 impl ModelConfig {
@@ -88,7 +134,25 @@ impl ModelConfig {
             n_ctx,
             dropout,
             attn_softcap,
+            rope_scaling: None,
+            rope_factor: 1.0,
         }
+    }
+
+    /// Parsed RoPE strategy; unknown strings fall back to `none`.
+    pub fn rope_kind(&self) -> RopeScalingKind {
+        self.rope_scaling
+            .as_deref()
+            .and_then(|s| RopeScalingKind::parse(s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_rope_scaling(&mut self, kind: RopeScalingKind, factor: f32) {
+        self.rope_scaling = match kind {
+            RopeScalingKind::None => None,
+            other => Some(other.as_str().to_string()),
+        };
+        self.rope_factor = if factor.is_finite() && factor > 0.0 { factor } else { 1.0 };
     }
 
     pub fn get_n_kv_head(&self) -> usize {
@@ -144,5 +208,42 @@ mod tests {
         let block = (256 * 256 + 256) + 2 * (256 * kv_dim + kv_dim) + 256 * 256 + 2 * 256 + 3 * 256 * hidden;
         let expected = 8000 * 256 + 4 * block + 256;
         assert_eq!(cfg.param_count(), expected);
+    }
+
+    #[test]
+    fn test_rope_scaling_kind_parse() {
+        assert_eq!(RopeScalingKind::parse("none").unwrap(), RopeScalingKind::None);
+        assert_eq!(RopeScalingKind::parse("").unwrap(), RopeScalingKind::None);
+        assert_eq!(RopeScalingKind::parse("LINEAR").unwrap(), RopeScalingKind::Linear);
+        assert_eq!(RopeScalingKind::parse("dynamic").unwrap(), RopeScalingKind::Ntk);
+        assert_eq!(RopeScalingKind::parse("yarn").unwrap(), RopeScalingKind::Yarn);
+        assert!(RopeScalingKind::parse("magic").is_err());
+        assert_eq!(RopeScalingKind::Linear.as_str(), "linear");
+    }
+
+    #[test]
+    fn test_rope_fields_default_when_absent() {
+        let json = r#"{"vocab_size":100,"n_embd":64,"n_head":4,"n_layer":2,"n_ctx":32}"#;
+        let cfg: ModelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.rope_kind(), RopeScalingKind::None);
+        assert_eq!(cfg.rope_factor, 1.0);
+    }
+
+    #[test]
+    fn test_set_rope_scaling_roundtrip() {
+        let mut cfg = ModelConfig::new(100, 64, 4, Some(2), 2, 32, 0.0, 0.0);
+        cfg.set_rope_scaling(RopeScalingKind::Yarn, 4.0);
+        assert_eq!(cfg.rope_kind(), RopeScalingKind::Yarn);
+        assert_eq!(cfg.rope_factor, 4.0);
+
+        let bytes = serde_json::to_vec(&cfg).unwrap();
+        let back: ModelConfig = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.rope_kind(), RopeScalingKind::Yarn);
+        assert_eq!(back.rope_factor, 4.0);
+
+        // None removes the key entirely and invalid factors reset to 1.0.
+        cfg.set_rope_scaling(RopeScalingKind::None, -2.0);
+        assert_eq!(cfg.rope_scaling, None);
+        assert_eq!(cfg.rope_factor, 1.0);
     }
 }

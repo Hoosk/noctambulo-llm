@@ -31,6 +31,9 @@ pub struct TrainParams {
     pub output_dir: String,
     pub device: String,
     pub early_stop_patience: usize,
+    pub weight_decay: f64,
+    pub label_smoothing: f32,
+    pub z_loss: f32,
 }
 
 /// Parse the machine-readable device selector (`DiscreteGpu(0)`, `Cpu`,
@@ -275,6 +278,11 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
                     &device,
                     &params.output_dir,
                     params.early_stop_patience,
+                    crate::train::LossOptions {
+                        weight_decay: params.weight_decay,
+                        label_smoothing: params.label_smoothing,
+                        z_loss: params.z_loss,
+                    },
                     &tx,
                     &worker_cancel,
                     Some(&worker_pause),

@@ -168,6 +168,9 @@ export interface TrainRequestBody {
   dropout: number;
   attnSoftcap: number;
   seqWarmupSteps: number;
+  weightDecay: number;
+  labelSmoothing: number;
+  zLoss: number;
   saveDir: string;
   outputDir: string;
   resume?: string;

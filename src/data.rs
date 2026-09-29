@@ -95,6 +95,30 @@ impl LlmTokenizer {
         file_path: P,
         max_tokens: Option<usize>,
     ) -> Result<(Vec<u32>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let (tokens, bytes, _duplicates) = self.encode_file_streaming_opts(file_path, max_tokens, false)?;
+        Ok((tokens, bytes))
+    }
+
+    /// Streaming text encoding with exact-duplicate removal (lines are hashed
+    /// and repeated ones skipped). Returns
+    /// `(tokens, bytes_read, duplicate_lines_skipped)`.
+    ///
+    /// `.bin` inputs cannot be deduped line by line: they load as-is with zero
+    /// duplicates reported.
+    pub fn encode_file_streaming_deduped<P: AsRef<Path>>(
+        &self,
+        file_path: P,
+        max_tokens: Option<usize>,
+    ) -> Result<(Vec<u32>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+        self.encode_file_streaming_opts(file_path, max_tokens, true)
+    }
+
+    fn encode_file_streaming_opts<P: AsRef<Path>>(
+        &self,
+        file_path: P,
+        max_tokens: Option<usize>,
+        dedupe: bool,
+    ) -> Result<(Vec<u32>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         let path = file_path.as_ref();
 
         if is_binary_file(path)? {
@@ -102,7 +126,7 @@ impl LlmTokenizer {
             let expected_hash = Some(tokenizer_vocab_hash(self));
             let (tokens, vocab_sz) = load_tokens_from_binary(path, max_tokens, expected_hash)?;
             println!("Loaded {} pre-tokenized tokens (Vocab size in header: {}).", tokens.len(), vocab_sz);
-            return Ok((tokens, 0));
+            return Ok((tokens, 0, 0));
         }
 
         let eos_id = self.end_of_text_id();
@@ -117,6 +141,8 @@ impl LlmTokenizer {
         };
         let mut all_tokens = Vec::with_capacity(estimated_tokens);
         let mut bytes_read = 0u64;
+        let mut duplicates = 0u64;
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         let start_time = Instant::now();
         let mut last_update = Instant::now();
@@ -152,7 +178,17 @@ impl LlmTokenizer {
                     trimmed.to_string()
                 };
 
-                line_batch.push(text_entry);
+                let is_duplicate = dedupe && {
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    text_entry.hash(&mut hasher);
+                    !seen.insert(hasher.finish())
+                };
+                if is_duplicate {
+                    duplicates += 1;
+                } else {
+                    line_batch.push(text_entry);
+                }
             }
 
             if line_batch.len() >= batch_line_capacity {
@@ -240,7 +276,7 @@ impl LlmTokenizer {
             all_tokens.len(),
             elapsed_secs,
         );
-        Ok((all_tokens, bytes_read))
+        Ok((all_tokens, bytes_read, duplicates))
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -464,6 +500,152 @@ pub fn download_dataset_streaming(
 /// Extrae documentos de texto de un archivo Parquet (columna `text` con fallbacks
 /// a `content`/`body`) y los escribe a un `.txt` destino, un documento por línea.
 /// Devuelve el número de documentos escritos.
+/// Pick the text column out of a Parquet schema (same fallback order as the
+/// extractor). Shared by extraction and direct tokenization.
+fn parquet_text_column(
+    schema: &arrow::datatypes::Schema,
+    parquet_path: &Path,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    for candidate in ["text", "content", "body", "raw"] {
+        if schema.fields().iter().any(|f| f.name() == candidate) {
+            return Ok(candidate.to_string());
+        }
+    }
+    let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    Err(format!(
+        "No text column found in parquet {:?}. Columns available: {:?}",
+        parquet_path, names
+    )
+    .into())
+}
+
+/// Encode one batch of documents into `tokens`, appending the EOS id when the
+/// tokenizer defines one.
+fn encode_doc_batch(
+    tokenizer: &LlmTokenizer,
+    batch: &mut Vec<String>,
+    tokens: &mut Vec<u32>,
+    eos_id: Option<u32>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let current = std::mem::take(batch);
+    match tokenizer.tokenizer.encode_batch(current, true) {
+        Ok(encodings) => {
+            for enc in encodings {
+                tokens.extend(enc.get_ids());
+                if let Some(eos) = eos_id {
+                    tokens.push(eos);
+                }
+            }
+        }
+        Err(e) => eprintln!("\nWarning: Tokenizer batch failed to encode: {e}"),
+    }
+}
+
+/// Tokenize a Parquet file's text column straight into token ids, skipping the
+/// intermediate `.txt` materialization. Returns
+/// `(tokens, documents, duplicates)`.
+pub fn encode_parquet_streaming(
+    parquet_path: &Path,
+    tokenizer: &LlmTokenizer,
+    max_tokens: Option<usize>,
+    dedupe: bool,
+) -> Result<(Vec<u32>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    use arrow::array::{Array, LargeStringArray, StringArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    println!("Tokenizing text column from Parquet {:?}...", parquet_path);
+
+    let file = File::open(parquet_path)
+        .map_err(|e| format!("Failed to open parquet file {:?}: {}", parquet_path, e))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("Failed to parse parquet {:?}: {}", parquet_path, e))?;
+    let text_col = parquet_text_column(&builder.schema().clone(), parquet_path)?;
+    let mut reader = builder
+        .build()
+        .map_err(|e| format!("Failed to build parquet reader: {}", e))?;
+
+    let eos_id = tokenizer.end_of_text_id();
+    let limit = max_tokens.filter(|l| *l > 0);
+    let mut tokens: Vec<u32> = Vec::new();
+    let mut docs = 0u64;
+    let mut duplicates = 0u64;
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut batch: Vec<String> = Vec::with_capacity(1024);
+    let start_time = Instant::now();
+    let mut last_report = Instant::now();
+    let mut limit_hit = false;
+
+    for batch_res in &mut reader {
+        let record = batch_res.map_err(|e| format!("Parquet read error: {}", e))?;
+        let Some(col) = record.column_by_name(&text_col) else { continue; };
+        let values: Vec<&str> = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| a.iter().flatten().collect())
+            .or_else(|| {
+                col.as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .map(|a| a.iter().flatten().collect())
+            })
+            .unwrap_or_default();
+
+        for value in values {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if dedupe {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                trimmed.hash(&mut hasher);
+                if !seen.insert(hasher.finish()) {
+                    duplicates += 1;
+                    continue;
+                }
+            }
+            batch.push(trimmed.to_string());
+            docs += 1;
+            if batch.len() >= 1024 {
+                encode_doc_batch(tokenizer, &mut batch, &mut tokens, eos_id);
+                if let Some(l) = limit {
+                    if tokens.len() >= l {
+                        limit_hit = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if last_report.elapsed().as_millis() >= 500 || limit_hit {
+            last_report = Instant::now();
+            print!(
+                "\r  {docs} documents, {} duplicate(s), {} tokens...",
+                duplicates,
+                tokens.len()
+            );
+            let _ = std::io::stdout().flush();
+        }
+        if limit_hit {
+            break;
+        }
+    }
+
+    encode_doc_batch(tokenizer, &mut batch, &mut tokens, eos_id);
+    if let Some(l) = limit {
+        tokens.truncate(l);
+    }
+
+    println!(
+        "\nParquet tokenization done: {docs} documents, {duplicates} duplicate(s), {} tokens in {:.1}s.",
+        tokens.len(),
+        start_time.elapsed().as_secs_f64()
+    );
+    Ok((tokens, docs, duplicates))
+}
+
 pub fn extract_parquet_text_column(
     parquet_path: &Path,
     output_txt_path: &Path,
@@ -479,24 +661,7 @@ pub fn extract_parquet_text_column(
         .map_err(|e| format!("Failed to parse parquet {:?}: {}", parquet_path, e))?;
 
     let schema = builder.schema().clone();
-    let mut text_col: Option<String> = None;
-    for candidate in ["text", "content", "body", "raw"] {
-        if schema.fields().iter().any(|f| f.name() == candidate) {
-            text_col = Some(candidate.to_string());
-            break;
-        }
-    }
-    let text_col = match text_col {
-        Some(col) => col,
-        None => {
-            let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-            return Err(format!(
-                "No text column found in parquet {:?}. Columns available: {:?}",
-                parquet_path, names
-            )
-            .into());
-        }
-    };
+    let text_col = parquet_text_column(&schema, parquet_path)?;
 
     let mut reader = builder.build()
         .map_err(|e| format!("Failed to build parquet reader: {}", e))?;
@@ -951,9 +1116,34 @@ pub fn prepare_binary_dataset<P1: AsRef<Path>, P2: AsRef<Path>>(
     output_path: P2,
     tokenizer: &LlmTokenizer,
     max_tokens: Option<usize>,
+    dedupe: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Preparing pre-tokenized binary dataset from {:?} to {:?}...", input_path.as_ref(), output_path.as_ref());
-    let (tokens, _bytes) = tokenizer.encode_file_streaming(input_path, max_tokens)?;
+
+    let is_parquet = input_path
+        .as_ref()
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("parquet"));
+
+    let tokens = if is_parquet {
+        // Parquet goes straight to tokens: no intermediate text materialization.
+        let (tokens, docs, duplicates) =
+            encode_parquet_streaming(input_path.as_ref(), tokenizer, max_tokens, dedupe)?;
+        if dedupe {
+            println!("Parquet ingest: {docs} documents, {duplicates} duplicate(s) skipped.");
+        }
+        tokens
+    } else if dedupe {
+        let (tokens, _bytes, duplicates) =
+            tokenizer.encode_file_streaming_deduped(input_path.as_ref(), max_tokens)?;
+        println!("Dropped {duplicates} duplicate line(s).");
+        tokens
+    } else {
+        let (tokens, _bytes) = tokenizer.encode_file_streaming(input_path.as_ref(), max_tokens)?;
+        tokens
+    };
+
     let vocab_size = tokenizer.vocab_size() as u32;
     let vocab_hash = tokenizer_vocab_hash(tokenizer);
     save_tokens_to_binary(output_path.as_ref(), &tokens, vocab_size, vocab_hash)?;
@@ -1060,6 +1250,87 @@ mod tests {
 
         let _ = std::fs::remove_file(&txt);
         let _ = std::fs::remove_file(&bin);
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kuro_data_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_tokenizer(dir: &Path) -> LlmTokenizer {
+        let corpus = "the quick brown fox jumps over the lazy dog. the cat sat on the mat and looked at the sun. ".repeat(40);
+        let corpus_path = dir.join("tokenizer_corpus.txt");
+        std::fs::write(&corpus_path, &corpus).unwrap();
+        let tokenizer_path = dir.join("tokenizer.json");
+        train_custom_tokenizer(
+            corpus_path.to_str().unwrap(),
+            tokenizer_path.to_str().unwrap(),
+            256,
+        )
+        .unwrap();
+        LlmTokenizer::from_file(&tokenizer_path).unwrap()
+    }
+
+    #[test]
+    fn test_encode_file_streaming_deduped() {
+        let dir = test_dir("dedupe");
+        let tokenizer = test_tokenizer(&dir);
+
+        let dup_path = dir.join("dups.txt");
+        std::fs::write(&dup_path, "hello world\nhello world\nanother line\nhello world\n").unwrap();
+        let unique_path = dir.join("unique.txt");
+        std::fs::write(&unique_path, "hello world\nanother line\n").unwrap();
+
+        let (dup_tokens, _bytes, duplicates) =
+            tokenizer.encode_file_streaming_deduped(&dup_path, None).unwrap();
+        let (unique_tokens, _) = tokenizer.encode_file_streaming(&unique_path, None).unwrap();
+
+        assert_eq!(duplicates, 2, "three copies of a line minus the first");
+        assert_eq!(dup_tokens, unique_tokens);
+        assert!(!dup_tokens.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_encode_parquet_streaming_and_dedupe() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+
+        let dir = test_dir("parquet");
+        let tokenizer = test_tokenizer(&dir);
+
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let array = StringArray::from(vec!["hello world", "hello world", "another line"]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![std::sync::Arc::new(array)]).unwrap();
+        let parquet_path = dir.join("docs.parquet");
+        let file = File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Direct parquet ingest removes the repeated document.
+        let (tokens, docs, duplicates) =
+            encode_parquet_streaming(&parquet_path, &tokenizer, None, true).unwrap();
+        assert_eq!((docs, duplicates), (2, 1));
+
+        // The result matches tokenizing the unique documents as text.
+        let unique_path = dir.join("unique.txt");
+        std::fs::write(&unique_path, "hello world\nanother line\n").unwrap();
+        let (unique_tokens, _) = tokenizer.encode_file_streaming(&unique_path, None).unwrap();
+        assert_eq!(tokens, unique_tokens);
+
+        // Without dedupe the repeated document is kept.
+        let (all_tokens, docs_all, dups_all) =
+            encode_parquet_streaming(&parquet_path, &tokenizer, None, false).unwrap();
+        assert_eq!((docs_all, dups_all), (3, 0));
+        assert!(all_tokens.len() > tokens.len());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

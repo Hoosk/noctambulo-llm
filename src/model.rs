@@ -1,4 +1,4 @@
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, RopeScalingKind};
 use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Embedding, Linear, LinearConfig};
 use burn::tensor::backend::Backend;
@@ -52,27 +52,136 @@ impl<B: Backend> RmsNorm<B> {
     }
 }
 
-pub fn precompute_rope_cache<B: Backend>(n_ctx: usize, head_dim: usize, device: &B::Device) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    let half_dim = head_dim / 2;
-    let rope_theta = 10000.0f32; // Standard RoPE base (optimal for n_ctx <= 8K)
-    let mut freqs = Vec::with_capacity(half_dim);
-    for i in 0..half_dim {
-        let exponent = (2 * i) as f32 / head_dim as f32;
-        let theta = 1.0 / rope_theta.powf(exponent);
-        freqs.push(theta);
+/// Standard RoPE base, optimal for contexts up to ~8K without scaling.
+pub const ROPE_BASE_THETA: f32 = 10000.0;
+const YARN_BETA_FAST: f32 = 32.0;
+const YARN_BETA_SLOW: f32 = 1.0;
+
+/// Upper bound for the RoPE cache when context scaling is enabled; keeps the
+/// per-layer cache tensors bounded for very large factors.
+pub const MAX_EXTENDED_CTX: usize = 16384;
+
+/// Effective number of positions covered by the RoPE cache. Scaling with
+/// `factor > 1` extends it up to [`MAX_EXTENDED_CTX`].
+pub fn extended_ctx_len(n_ctx: usize, kind: RopeScalingKind, factor: f32) -> usize {
+    if kind == RopeScalingKind::None || factor <= 1.0 || !factor.is_finite() {
+        return n_ctx;
     }
+    ((n_ctx as f32 * factor).ceil() as usize).clamp(n_ctx, MAX_EXTENDED_CTX)
+}
+
+/// Resolved RoPE frequencies for one head size.
+#[derive(Debug, Clone)]
+pub struct RopeSpec {
+    /// Inverse frequencies for the first half of the head dimension.
+    pub freqs: Vec<f32>,
+    /// Multiplier applied to cos/sin (YaRN attention scaling).
+    pub mscale: f32,
+}
+
+/// Build the inverse-frequency table for a context-extension strategy.
+///
+/// - `None`: the classic `1 / base^(2i/d)` table.
+/// - `Linear`: positions are divided by `factor`, equivalent to scaling every
+///   inverse frequency by `1/factor`.
+/// - `Ntk`: dynamic-NTK base adjustment `base' = base * factor^(d/(d-2))`.
+/// - `Yarn`: piecewise interpolation between the linear-scaled and original
+///   frequencies (ramp between the 1- and 32-rotation dimensions) plus the
+///   standard `mscale` attention factor.
+pub fn rope_spec(n_ctx: usize, head_dim: usize, kind: RopeScalingKind, factor: f32) -> RopeSpec {
+    let half = head_dim / 2;
+    let factor = if factor.is_finite() && factor > 1.0 { factor } else { 1.0 };
+    let base = ROPE_BASE_THETA;
+
+    let inv_freqs = |base: f32| -> Vec<f32> {
+        (0..half)
+            .map(|i| {
+                let exponent = (2 * i) as f32 / head_dim as f32;
+                1.0 / base.powf(exponent)
+            })
+            .collect()
+    };
+
+    match kind {
+        RopeScalingKind::None => RopeSpec {
+            freqs: inv_freqs(base),
+            mscale: 1.0,
+        },
+        RopeScalingKind::Linear => RopeSpec {
+            freqs: inv_freqs(base).into_iter().map(|f| f / factor).collect(),
+            mscale: 1.0,
+        },
+        RopeScalingKind::Ntk => {
+            let exponent = head_dim as f32 / (head_dim as f32 - 2.0).max(1.0);
+            let base = base * factor.powf(exponent);
+            RopeSpec {
+                freqs: inv_freqs(base),
+                mscale: 1.0,
+            }
+        }
+        RopeScalingKind::Yarn => {
+            let original = inv_freqs(base);
+            if factor <= 1.0 {
+                return RopeSpec {
+                    freqs: original,
+                    mscale: 1.0,
+                };
+            }
+            let interpolated: Vec<f32> = original.iter().map(|f| f / factor).collect();
+
+            // Dimension (in rotation cycles) at which a frequency completes
+            // `rotations` turns inside the original context window. `beta_fast`
+            // bounds the high-frequency end (kept as-is) and `beta_slow` the
+            // low-frequency end (interpolated), matching the YaRN paper.
+            let correction = |rotations: f32| -> f32 {
+                let dim = head_dim as f32;
+                (dim * ((n_ctx as f32) / (rotations * 2.0 * std::f32::consts::PI)).ln())
+                    / (2.0 * base.ln())
+            };
+            let low = correction(YARN_BETA_FAST).floor().clamp(0.0, (half - 1) as f32);
+            let high = correction(YARN_BETA_SLOW).ceil().clamp(0.0, (half - 1) as f32);
+
+            let freqs = (0..half)
+                .map(|i| {
+                    let ramp = if high > low {
+                        ((i as f32 - low) / (high - low)).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    // High frequencies (low i) keep the original table;
+                    // low frequencies are interpolated by `1/factor`.
+                    original[i] * (1.0 - ramp) + interpolated[i] * ramp
+                })
+                .collect();
+
+            RopeSpec {
+                freqs,
+                mscale: 0.1 * factor.ln() + 1.0,
+            }
+        }
+    }
+}
+
+pub fn precompute_rope_cache<B: Backend>(
+    n_ctx: usize,
+    head_dim: usize,
+    spec: &RopeSpec,
+    device: &B::Device,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    let half_dim = head_dim / 2;
+    debug_assert_eq!(spec.freqs.len(), half_dim);
 
     let mut angles_vec = Vec::with_capacity(n_ctx * half_dim);
     for pos in 0..n_ctx {
-        for &f in &freqs {
+        for &f in &spec.freqs {
             angles_vec.push(pos as f32 * f);
         }
     }
 
     let angles_data = TensorData::new(angles_vec, [1, 1, n_ctx, half_dim]);
     let angles = Tensor::<B, 4>::from_data(angles_data, device);
-    let cos = angles.clone().cos();
-    let sin = angles.sin();
+    let cos = angles.clone().cos() * spec.mscale;
+    let sin = angles.sin() * spec.mscale;
 
     let cos = Tensor::cat(vec![cos.clone(), cos], 3);
     let sin = Tensor::cat(vec![sin.clone(), sin], 3);
@@ -187,6 +296,14 @@ impl<B: Backend> CausalSelfAttention<B> {
             .reshape([batch_size, new_seq_len, self.n_kv_head, head_size])
             .swap_dims(1, 2);
 
+        // Within the cache, slice the precomputed (possibly context-extended)
+        // table. Generation paths enforce the limit with a clear error.
+        let cached_len = self.cos.dims()[2];
+        assert!(
+            start_pos + new_seq_len <= cached_len,
+            "context window exhausted: asked for positions {start_pos}..{} but the RoPE cache holds {cached_len} (increase --rope-factor)",
+            start_pos + new_seq_len
+        );
         let cos = self
             .cos
             .clone()
@@ -195,7 +312,6 @@ impl<B: Backend> CausalSelfAttention<B> {
             .sin
             .clone()
             .slice([0..1, 0..1, start_pos..(start_pos + new_seq_len), 0..head_size]);
-
         let q_rot = rotate_half(q.clone());
         let q_embed = (q * cos.clone()) + (q_rot * sin.clone());
 
@@ -265,13 +381,17 @@ pub struct CausalSelfAttentionConfig {
     pub n_ctx: usize,
     pub dropout: f64,
     pub attn_softcap: f32,
+    pub rope_kind: RopeScalingKind,
+    pub rope_factor: f32,
 }
 
 impl CausalSelfAttentionConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalSelfAttention<B> {
         let head_dim = self.n_embd / self.n_head;
         let kv_dim = self.n_kv_head * head_dim;
-        let (cos, sin) = precompute_rope_cache(self.n_ctx, head_dim, device);
+        let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
+        let cache_len = extended_ctx_len(self.n_ctx, self.rope_kind, self.rope_factor);
+        let (cos, sin) = precompute_rope_cache(cache_len, head_dim, &rope, device);
 
         CausalSelfAttention {
             q_proj: LinearConfig::new(self.n_embd, self.n_embd).with_bias(true).init(device),
@@ -360,6 +480,8 @@ pub struct BlockConfig {
     pub n_ctx: usize,
     pub dropout: f64,
     pub attn_softcap: f32,
+    pub rope_kind: RopeScalingKind,
+    pub rope_factor: f32,
 }
 
 impl BlockConfig {
@@ -372,6 +494,8 @@ impl BlockConfig {
                 n_ctx: self.n_ctx,
                 dropout: self.dropout,
                 attn_softcap: self.attn_softcap,
+                rope_kind: self.rope_kind,
+                rope_factor: self.rope_factor,
             }
             .init(device),
             mlp: SwiGluMlpConfig {
@@ -394,6 +518,15 @@ pub struct Llm<B: Backend> {
 }
 
 impl<B: Backend> Llm<B> {
+    /// Total number of positions the model can attend to (the config `n_ctx`
+    /// extended by the active RoPE scaling factor).
+    pub fn max_seq_len(&self) -> usize {
+        self.blocks
+            .first()
+            .map(|b| b.attn.cos.dims()[2])
+            .unwrap_or(self.n_ctx)
+    }
+
     pub fn forward(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let tok_emb = self.embed_tokens.forward(input);
 
@@ -431,6 +564,8 @@ impl<B: Backend> Llm<B> {
 impl ModelConfig {
     pub fn init_model<B: Backend>(&self, device: &B::Device) -> Llm<B> {
         let kv_head = self.get_n_kv_head();
+        let rope_kind = self.rope_kind();
+        let rope_factor = self.rope_factor;
         let blocks = (0..self.n_layer)
             .map(|_| {
                 BlockConfig {
@@ -440,6 +575,8 @@ impl ModelConfig {
                     n_ctx: self.n_ctx,
                     dropout: self.dropout,
                     attn_softcap: self.attn_softcap,
+                    rope_kind,
+                    rope_factor,
                 }
                 .init(device)
             })
@@ -470,6 +607,111 @@ mod tests {
     use super::*;
     use burn::backend::wgpu::WgpuDevice;
     use burn::backend::Wgpu;
+
+    #[test]
+    fn test_rope_spec_linear_scales_frequencies() {
+        let base = rope_spec(256, 64, RopeScalingKind::None, 1.0);
+        let linear = rope_spec(256, 64, RopeScalingKind::Linear, 4.0);
+        assert_eq!(base.freqs.len(), linear.freqs.len());
+        for (b, l) in base.freqs.iter().zip(linear.freqs.iter()) {
+            assert!((b / 4.0 - l).abs() < 1e-7, "linear scaling mismatch: {b} vs {l}");
+        }
+        assert_eq!(linear.mscale, 1.0);
+        // A factor <= 1 is a no-op.
+        let noop = rope_spec(256, 64, RopeScalingKind::Linear, 1.0);
+        assert_eq!(noop.freqs[1], base.freqs[1]);
+    }
+
+    #[test]
+    fn test_rope_spec_ntk_lowers_frequencies() {
+        let base = rope_spec(256, 64, RopeScalingKind::None, 1.0);
+        let ntk = rope_spec(256, 64, RopeScalingKind::Ntk, 4.0);
+        // The first frequency is 1.0 regardless of base; later ones shrink.
+        assert!((base.freqs[0] - 1.0).abs() < 1e-6);
+        assert!((ntk.freqs[0] - 1.0).abs() < 1e-6);
+        assert!(ntk.freqs[1] < base.freqs[1]);
+        assert!(ntk.freqs[ntk.freqs.len() - 2] < base.freqs[base.freqs.len() - 2]);
+    }
+
+    #[test]
+    fn test_rope_spec_yarn_ramp_and_mscale() {
+        let factor = 4.0;
+        let half = 32; // head_dim = 64
+        let original = rope_spec(256, 64, RopeScalingKind::None, 1.0);
+        let yarn = rope_spec(256, 64, RopeScalingKind::Yarn, factor);
+
+        // High frequencies (low dimensions) keep the original table; low
+        // frequencies (high dimensions) are interpolated by `1/factor`.
+        assert!((yarn.freqs[0] - original.freqs[0]).abs() < 1e-6);
+        assert!((yarn.freqs[half - 1] - original.freqs[half - 1] / factor).abs() < 1e-6);
+        assert!((yarn.mscale - (0.1 * factor.ln() + 1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_extended_ctx_len() {
+        assert_eq!(extended_ctx_len(256, RopeScalingKind::None, 4.0), 256);
+        assert_eq!(extended_ctx_len(256, RopeScalingKind::Linear, 1.0), 256);
+        assert_eq!(extended_ctx_len(256, RopeScalingKind::Linear, 2.0), 512);
+        assert_eq!(extended_ctx_len(256, RopeScalingKind::Yarn, 2.5), 640);
+        // Huge factors are clamped to the cache cap.
+        assert_eq!(extended_ctx_len(4096, RopeScalingKind::Ntk, 100.0), MAX_EXTENDED_CTX);
+    }
+
+    #[test]
+    fn test_attention_cache_extends_with_scaling() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+
+        let base = CausalSelfAttentionConfig {
+            n_embd: 32,
+            n_head: 4,
+            n_kv_head: 4,
+            n_ctx: 8,
+            dropout: 0.0,
+            attn_softcap: 0.0,
+            rope_kind: RopeScalingKind::None,
+            rope_factor: 1.0,
+        };
+        let attn = base.init::<NdArray<f32, i32>>(&device);
+        assert_eq!(attn.cos.dims()[2], 8);
+
+        let scaled = CausalSelfAttentionConfig {
+            rope_kind: RopeScalingKind::Linear,
+            rope_factor: 2.0,
+            ..base
+        };
+        let attn = scaled.init::<NdArray<f32, i32>>(&device);
+        assert_eq!(attn.cos.dims()[2], 16);
+    }
+
+    #[test]
+    fn test_forward_with_cache_past_n_ctx_with_scaling() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 8, 0.0, 0.0);
+        config.set_rope_scaling(RopeScalingKind::Linear, 2.0);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        assert_eq!(model.max_seq_len(), 16);
+        let mut caches: Vec<KvCache<NdArray<f32, i32>>> = vec![KvCache::new()];
+
+        let prefill = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(vec![1i32, 2, 3, 4, 5, 6], [1, 6]),
+            &device,
+        );
+        let out = model.forward_with_cache(prefill, 0, &mut caches);
+        assert_eq!(out.dims(), [1, 6, 50]);
+
+        // start_pos 6 + 6 tokens = 12, past the trained n_ctx (8) but within
+        // the extended cache (16).
+        let next = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(vec![7i32, 8, 9, 10, 11, 12], [1, 6]),
+            &device,
+        );
+        let out = model.forward_with_cache(next, 6, &mut caches);
+        assert_eq!(out.dims(), [1, 6, 50]);
+        assert_eq!(caches[0].k.as_ref().unwrap().dims()[2], 12);
+        assert!(12 <= model.max_seq_len());
+    }
 
     #[test]
     fn test_model_initialization_and_forward() {

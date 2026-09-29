@@ -15,6 +15,8 @@ const DEFAULT_FORM: GenForm = {
   topP: "0.9",
   minP: "0.05",
   rep: "1.2",
+  ropeScaling: "none",
+  ropeFactor: "1",
 };
 
 interface RunStatus {
@@ -92,6 +94,8 @@ export function GenerateView() {
           topP: Number(form.topP),
           minP: Number(form.minP),
           repetitionPenalty: Number(form.rep),
+          ropeScaling: form.ropeScaling,
+          ropeFactor: Number(form.ropeFactor) || 1,
         }),
         signal: controller.signal,
       });

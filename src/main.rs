@@ -8,9 +8,8 @@ mod serve;
 mod train;
 mod tui;
 
-use burn::tensor::f16;
 use clap::{Args, Parser, Subcommand};
-use config::{DType, ModelConfig};
+use config::{DType, ModelConfig, RopeScalingKind};
 use data::{combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf, extract_parquet_text_column, prepare_binary_dataset, train_custom_tokenizer, LlmTokenizer};
 use export::export_to_gguf_cli as export_to_gguf;
 use generate::generate;
@@ -20,8 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use train::{run_eval, train};
 
-use burn::backend::wgpu::WgpuDevice;
-use burn::backend::{Autodiff, Wgpu};
+use backend::{MainBackend, MainHalf};
+use burn::backend::Autodiff;
 use burn::module::Module;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 
@@ -193,6 +192,9 @@ struct PrepareDatasetArgs {
     /// Max characters to write for weighted mixing (0 = all available)
     #[arg(long, default_value_t = 0)]
     max_chars: usize,
+    /// Drop exact duplicate lines/documents before tokenizing (hashed lines)
+    #[arg(long)]
+    dedupe: bool,
 }
 
 #[derive(Args)]
@@ -218,6 +220,12 @@ struct EvalArgs {
     /// Max batches to evaluate (0 = all; the old hard cap was 100)
     #[arg(long, default_value_t = 0)]
     eval_batches: usize,
+    /// RoPE context-extension scaling: none, linear, ntk or yarn
+    #[arg(long, default_value = "none")]
+    rope_scaling: String,
+    /// RoPE scaling factor (e.g. 2.0 doubles the usable context)
+    #[arg(long, default_value_t = 1.0)]
+    rope_factor: f32,
 }
 
 #[derive(Args)]
@@ -294,6 +302,16 @@ struct TrainArgs {
     /// Stop early after N epochs without validation improvement (0 = disabled)
     #[arg(long, default_value_t = 0)]
     early_stop_patience: usize,
+    /// Decoupled weight decay for weight matrices/embeddings (norms and biases
+    /// are always excluded). 0 disables it.
+    #[arg(long, default_value_t = 0.1)]
+    weight_decay: f64,
+    /// Label smoothing factor (0.0 = disabled)
+    #[arg(long, default_value_t = 0.0)]
+    label_smoothing: f32,
+    /// Z-loss coefficient on logsumexp(logits)^2 (0.0 = disabled)
+    #[arg(long, default_value_t = 0.0)]
+    z_loss: f32,
 }
 
 #[derive(Args)]
@@ -321,6 +339,12 @@ struct GenerateArgs {
     /// Random seed
     #[arg(long)]
     seed: Option<u64>,
+    /// RoPE context-extension scaling: none, linear, ntk or yarn
+    #[arg(long, default_value = "none")]
+    rope_scaling: String,
+    /// RoPE scaling factor (e.g. 2.0 doubles the usable context)
+    #[arg(long, default_value_t = 1.0)]
+    rope_factor: f32,
 }
 
 #[derive(Args)]
@@ -334,7 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     let output_dir = "model_output";
     let custom_tokenizer_file = "custom_tokenizer.json";
-    let device = WgpuDevice::default();
+    let device = backend::default_device();
 
     match cli.command {
         Commands::TrainTokenizer(args) => {
@@ -428,6 +452,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
+            // Parquet is ingested straight to tokens, one file at a time: the
+            // mixers are line-based and would read binary parquet garbage.
+            let has_parquet = sources.iter().any(|s| {
+                s.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("parquet"))
+            });
+            if has_parquet && (!args.weights.is_empty() || sources.len() > 1) {
+                return Err(
+                    "Parquet sources cannot be mixed or combined: prepare each .parquet \
+                     individually (mixing works on line-based .txt or pre-tokenized .bin)"
+                        .into(),
+                );
+            }
+
             let corpus_path = if sources.is_empty() {
                 let default_file = Path::new("corpus.txt");
                 if !default_file.exists() {
@@ -469,7 +508,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
-            prepare_binary_dataset(&corpus_path, &args.output, &tokenizer, max_tokens)?;
+            prepare_binary_dataset(&corpus_path, &args.output, &tokenizer, max_tokens, args.dedupe)?;
         }
         Commands::Train(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();
@@ -571,6 +610,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &device,
                         output_dir,
                         args.early_stop_patience,
+                        train::LossOptions {
+                            weight_decay: args.weight_decay,
+                            label_smoothing: args.label_smoothing,
+                            z_loss: args.z_loss,
+                        },
                         Some(cancel),
                     )
                 };
@@ -578,9 +622,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let dtype = DType::parse(&args.dtype)?;
             tui::print_info(&format!("Compute precision: {}", dtype.as_str()));
+            tui::print_info(&format!("Backend: {}", backend::backend_label()));
             match dtype {
-                DType::F32 => run_training!(Autodiff<Wgpu>)?,
-                DType::F16 => run_training!(Autodiff<crate::backend::WgpuHalf<f16>>)?,
+                DType::F32 => run_training!(Autodiff<MainBackend>)?,
+                DType::F16 => run_training!(Autodiff<MainHalf>)?,
             };
         }
         Commands::Eval(args) => {
@@ -614,7 +659,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
             };
 
-            run_eval::<Wgpu>(
+            let rope_kind = RopeScalingKind::parse(&args.rope_scaling)?;
+            let rope_override = if rope_kind != RopeScalingKind::None
+                || (args.rope_factor - 1.0).abs() > f32::EPSILON
+            {
+                Some((rope_kind, args.rope_factor))
+            } else {
+                None
+            };
+
+            run_eval::<MainBackend>(
                 Path::new(&args.model_dir),
                 &dataset_path,
                 &tokenizer,
@@ -622,6 +676,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.eval_batch_size,
                 args.eval_batches,
                 &device,
+                rope_override,
             )?;
         }
         Commands::Generate(args) => {
@@ -634,7 +689,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             let config_str = std::fs::read_to_string(config_path)?;
-            let model_config: ModelConfig = serde_json::from_str(&config_str)?;
+            let mut model_config: ModelConfig = serde_json::from_str(&config_str)?;
+
+            let rope_kind = RopeScalingKind::parse(&args.rope_scaling)?;
+            if rope_kind != RopeScalingKind::None || (args.rope_factor - 1.0).abs() > f32::EPSILON {
+                model_config.set_rope_scaling(rope_kind, args.rope_factor);
+                println!(
+                    "RoPE scaling: {} (factor {})",
+                    rope_kind.as_str(),
+                    model_config.rope_factor
+                );
+            }
 
             let tokenizer = if Path::new(custom_tokenizer_file).exists() {
                 LlmTokenizer::from_file(custom_tokenizer_file)?
@@ -642,7 +707,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
             };
 
-            let model: Llm<Wgpu> = model_config.init_model(&device);
+            let model: Llm<MainBackend> = model_config.init_model(&device);
             let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
             let record = recorder
                 .load(weights_path, &device)
@@ -684,7 +749,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let config_str = std::fs::read_to_string(config_path)?;
             let model_config: ModelConfig = serde_json::from_str(&config_str)?;
 
-            let model: Llm<Wgpu> = model_config.init_model(&device);
+            let model: Llm<MainBackend> = model_config.init_model(&device);
             let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
             let record = recorder
                 .load(weights_path, &device)
