@@ -181,3 +181,28 @@ cargo run --release -- train \
   --attn-softcap 50.0 \
   --dropout 0.05
 ```
+
+### Optimizer and Loss Options
+
+`train` exposes the following regularization knobs:
+
+```bash
+cargo run --release -- train \
+  --file corpus.txt \
+  --weight-decay 0.1 \
+  --label-smoothing 0.05 \
+  --z-loss 0.001
+```
+
+- `--weight-decay` (default `0.1`) applies **decoupled** weight decay only to rank ≥ 2
+  parameters (projection matrices and embeddings); norms and biases are never decayed.
+- `--label-smoothing` (default `0.0`) mixes the negative log-likelihood with the uniform
+  distribution over the vocabulary.
+- `--z-loss` (default `0.0`) adds `coef · mean(logsumexp(logits)²)`, which keeps logits
+  from drifting when training with large vocabularies.
+
+All three are also available in the web Train form and the JSON API.
+
+Parquet corpora no longer need a manual extraction step: `prepare-dataset` tokenizes the
+text column directly to `.bin`, and `--dedupe` removes exact duplicate lines/documents
+before tokenizing.

@@ -102,3 +102,17 @@ Then run:
 ollama create kuro-neko -f Modelfile
 ollama run kuro-neko "Once upon a time"
 ```
+
+## RoPE Scaling Metadata
+
+When the checkpoint was trained or evaluated with context extension, the export adds the
+standard llama.cpp keys so runtimes can reproduce the same positions:
+
+| Key | Type | Value |
+| :--- | :--- | :--- |
+| `llama.rope.scaling.type` | string | `linear`, `yarn` or `ntk` (llama.cpp understands `linear`/`yarn`). |
+| `llama.rope.scaling.factor` | float32 | The extension factor, e.g. `2.0`. |
+| `llama.rope.scaling.original_context_length` | uint32 | The trained `n_ctx` before extension. |
+
+Unscaled exports (`rope_scaling = none`) keep the exact same key set as before: the three
+keys are only written when scaling is active in `config.json`.

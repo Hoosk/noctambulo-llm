@@ -21,6 +21,9 @@
   - **Sparse loss computation ($NLL$)** with `log_softmax` + `gather`.
   - **GPU loss accumulation** with no per-batch GPU $\to$ CPU synchronization stalls.
   - **Gradient accumulation**, **progressive sequence scaling** warmup and **early stopping**.
+  - **Decoupled weight decay** applied only to weight matrices/embeddings (norms and biases excluded), optional **label smoothing** and **z-loss**.
+- **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; generation and evaluation can run past the trained `n_ctx` and GGUF exports carry the `rope.scaling.*` metadata.
+- **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
 - **Full-state checkpoints and resume**: weights, AdamW moments, LR schedule and shuffler RNG; safe stop with Ctrl+C saves an interrupted checkpoint.
 - **Evaluation with BPB**: cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and bits-per-byte (comparable across tokenizers), over all batches by default.
 - **Native GGUF v3 exporter**: direct serialization of all weight and bias tensors aligned to 32 bytes with GGUF v3 headers and the `general.alignment` key.
@@ -35,7 +38,7 @@
 ## 🛠️ Requirements
 
 - **Rust**: 1.80+ on the **Stable** channel (`cargo` and `rustc`).
-- **GPU drivers**: Vulkan / Metal / DX12 support.
+- **GPU drivers**: Vulkan / Metal / DX12 support. For NVIDIA machines, build with `cargo build --release --features cuda` to use the CUDA backend in the CLI.
 - **Node.js 20+**: only needed to build the web console (`web/`).
 
 ---
@@ -78,6 +81,9 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--resume <path>` | Checkpoint to resume from (restores weights, AdamW, schedule and RNG; `--epochs` = additional epochs) | `None` |
 | `--seq-warmup-steps <n>` | Initial steps for **Progressive Sequence Scaling** (from $N/4$ to $N$) | `0` |
 | `--early-stop-patience <n>` | Stops training after `n` epochs without improving `val_loss` (`0` = disabled) | `0` |
+| `--weight-decay <float>` | Decoupled weight decay for rank ≥ 2 weights (norms/biases excluded) | `0.1` |
+| `--label-smoothing <float>` | Label-smoothing factor for the cross-entropy loss | `0.0` |
+| `--z-loss <float>` | Z-loss coefficient on `logsumexp(logits)²` | `0.0` |
 
 #### Custom Training Examples
 
@@ -107,6 +113,15 @@ cargo run --release -- prepare-dataset --file corpus.txt --output datasets/corpu
 
 > [!NOTE]
 > `.bin` v2 datasets embed a fingerprint of the tokenizer vocabulary. If you retrain the tokenizer, re-run `prepare-dataset`: loading a `.bin` tokenized with another vocabulary now fails with an explicit error instead of training on corrupt IDs.
+
+Parquet files are ingested directly (the `text`/`content`/`body` column is tokenized on the fly, no intermediate `.txt`), and `--dedupe` removes exact duplicate lines/documents before tokenizing:
+
+```bash
+cargo run --release -- prepare-dataset \
+  --file datasets/cosmopedia.parquet \
+  --output datasets/cosmopedia.bin \
+  --dedupe
+```
 
 Weighted mixing is also supported, so several sources can be blended by proportion while writing a single `.bin`:
 
@@ -185,6 +200,8 @@ cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p
 | `--rep-penalty <float>` | Repetition penalty factor for repeated tokens | `1.6` |
 | `--max-tokens <n>` | Maximum number of new tokens to generate | `50` |
 | `--seed <n>` | Pseudo-random generator seed for reproducibility | `None` |
+| `--rope-scaling <kind>` | Context extension: `none`, `linear`, `ntk` or `yarn` | `none` |
+| `--rope-factor <float>` | Extension factor (e.g. `2.0` doubles the usable context) | `1.0` |
 
 The web API additionally exposes `POST /api/generate/stream` (SSE), which streams tokens as they are generated and supports cancellation.
 

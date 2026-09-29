@@ -32,6 +32,9 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--resume` | `Option<String>`| `None` | Path to a checkpoint file or previous weights to resume training from. |
 | `--seq-warmup-steps` | `usize` | `0` | Initial steps for **Progressive Sequence Scaling** (grows the context window from $N/4$ to $N$). `0` disables it. |
 | `--early-stop-patience` | `usize` | `0` | Stops training after $N$ epochs without `val_loss` improvement. `0` disables it. |
+| `--weight-decay` | `f64` | `0.1` | Decoupled weight decay applied only to rank ≥ 2 parameters (weight matrices and embeddings); norms and biases are excluded. `0` disables it. |
+| `--label-smoothing` | `f32` | `0.0` | Label-smoothing factor for the cross-entropy loss. `0.0` disables it. |
+| `--z-loss` | `f32` | `0.0` | Z-loss coefficient applied to `logsumexp(logits)²`. `0.0` disables it. |
 
 ---
 
@@ -47,6 +50,9 @@ Pre-tokenizes a plain-text corpus or HF dataset to an ultra-compact binary `.bin
 | `--max-tokens` | `usize` | `0` | Maximum number of tokens to save (`0` = no limit). |
 | `--weights` | `Option<String>` | `None` | Mix weights per source (comma-separated, same order as `--dataset`/`--file`). When set, sources are mixed probabilistically by these proportions. |
 | `--max-chars` | `usize` | `0` | Maximum characters to write for weighted mixing (`0` = all available). |
+| `--dedupe` | `bool` (flag) | `false` | Drop exact duplicate lines/documents (hashed) before tokenizing. Works for text and Parquet inputs (`.bin` inputs are loaded as-is). |
+
+> Parquet files are ingested directly: the `text`/`content`/`body` column is tokenized on the fly into the `.bin`, without an intermediate `.txt`. Mixing or combining Parquet sources is rejected.
 
 ---
 
@@ -62,6 +68,8 @@ Evaluates the cross-entropy loss, perplexity ($PPL$) and bits per byte (BPB) of 
 | `--n-ctx` | `Option<usize>`| `None` | Overrides the context window for evaluation. |
 | `--eval-batch-size` | `usize` | `16` | Evaluation batch (lower it if there is OOM on small GPUs). |
 | `--eval-batches` | `usize` | `0` | Maximum number of batches to evaluate (`0` = all). There used to be a fixed limit of 100. BPB is not available for `.bin` datasets (they do not know their size in bytes). |
+| `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
+| `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
 
 ---
 
@@ -92,6 +100,8 @@ Performs autoregressive text inference using the model loaded from `model_output
 | `--rep-penalty` | `f32` | `1.6` | Repetition penalty. Discourages repeated tokens by dividing their logits. |
 | `--max-tokens` | `usize` | `50` | Maximum number of new tokens to generate. |
 | `--seed` | `Option<u64>` | `None` | Random seed of the Xorshift generator for reproducibility. |
+| `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
+| `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
 
 ---
 

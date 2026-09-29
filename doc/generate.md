@@ -135,3 +135,28 @@ The inference process is divided into two distinct phases:
    $$K_{\text{total}} = [K_{\text{previous}} \,;\, K_{\text{new}}]$$
    $$V_{\text{total}} = [V_{\text{previous}} \,;\, V_{\text{new}}]$$
 4. This reduces the computational complexity per generated token from $O(S^2)$ to **$O(1)$**, accelerating inference exponentially.
+
+## Context Extension (RoPE Scaling)
+
+By default the model can attend to at most `n_ctx` positions: once the prompt plus the
+generated tokens reach that limit, generation stops with a message. RoPE scaling extends
+the usable window:
+
+```bash
+# Generate up to twice the trained context with linear interpolation
+cargo run --release -- generate "Once upon a time" \
+  --max-tokens 400 \
+  --rope-scaling linear \
+  --rope-factor 2.0
+```
+
+| Strategy | Description |
+| :--- | :--- |
+| `none` | Classic RoPE; generation stops at `n_ctx`. |
+| `linear` | Positions are divided by the factor (all inverse frequencies scaled by `1/factor`). |
+| `ntk` | Dynamic-NTK: the RoPE base grows as `10000 · factor^(d/(d-2))`. |
+| `yarn` | YaRN: high frequencies keep the original table, low ones are interpolated, plus the standard `mscale` attention factor. |
+
+The effective window becomes `factor × n_ctx` (capped at 16384 positions to bound the
+per-layer cache), and the same flags are available on `eval`. The web Generate view
+exposes both fields, and GGUF exports record the strategy (see `doc/export.md`).

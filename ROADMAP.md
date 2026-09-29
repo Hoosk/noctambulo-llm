@@ -1,11 +1,11 @@
 # 🗺️ Kuro-Neko Roadmap
 
-Last updated: 2026-09-29 (after the Stage E web suite: model CRUD, background-operation progress, telemetry, run history and log streaming).
+Last updated: 2026-09-29 (after Stage D: RoPE scaling, direct Parquet ingest with dedupe, grouped weight decay plus label smoothing/z-loss, and the optional CUDA backend).
 
 ## Current Status
 
-- Complete engine: BPE tokenizer, datasets (txt/bin/parquet), `train` (real gradient accumulation, full-state resume, safe stop, f16), `eval` (BPB, all batches, early stopping), `generate`, GGUF `export` and the `serve` web suite.
-- 53 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
+- Complete engine: BPE tokenizer, datasets (txt/bin/parquet with direct ingest and dedupe), `train` (real gradient accumulation, full-state resume, safe stop, f16, RoPE context extension, label smoothing, z-loss, grouped weight decay), `eval` (BPB, all batches, early stopping), `generate` (CLI + SSE streaming, RoPE scaling flags), GGUF `export` (with `rope.scaling.*` keys) and the `serve` web suite.
+- 66 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
 - Web: React 19 + Vite + TypeScript + Tailwind v4 built locally (no CDN), English UI, HttpOnly-cookie auth, served from `web/dist` by Axum. Train/Datasets/Generate/Models/Export/Devices views plus run history and live telemetry.
 - Docs: English-only (README, `cli_parameters.md`, `doc/*.md`, ROADMAP and the auxiliary notes).
 
@@ -14,10 +14,10 @@ Last updated: 2026-09-29 (after the Stage E web suite: model CRUD, background-op
 1. ✅ **Token budget**: default 10M → 100M, Chinchilla-style warning (~20 tokens/parameter) and `nano`/`tiny`/`small`/`base` presets.
 2. ✅ **FP16**: `--dtype f32|f16` flag (non-fused backend for f16). `bf16` dropped: WGSL does not support it and cubecl crashes; an explicit error is returned instead. Records are always f32, so generate/export are unaffected.
 3. ✅ **Eval**: removed the fixed 100-batch cap (`--eval-batches`, 0 = all), added the BPB (bits-per-byte) metric and early stopping (`--early-stop-patience`).
-4. **RoPE scaling** (linear/NTK/YaRN) for inference beyond `n_ctx` + GGUF `rope.scaling.*` keys.
-5. **Datasets**: direct Parquet/HF ingestion to `.bin` in `prepare-dataset` and optional dedupe.
-6. **Optimizer**: weight-decay parameter groups (exclude norms/biases), optional z-loss/label smoothing.
-7. **Optional CUDA backend** as a feature.
+4. ✅ **RoPE scaling**: `linear`, `ntk` (dynamic NTK) and `yarn` strategies with a configurable factor. The per-layer RoPE cache extends to `factor × n_ctx` (capped), `generate`/`eval` take `--rope-scaling`/`--rope-factor`, the web Generate view exposes both, and GGUF exports carry `llama.rope.scaling.{type,factor,original_context_length}`.
+5. ✅ **Datasets**: `prepare-dataset` tokenizes Parquet text columns straight to `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents (hashed) for both text and Parquet; mixing Parquet sources is rejected with an explicit error.
+6. ✅ **Optimizer**: decoupled weight decay applied only to rank ≥ 2 parameters (norms and biases excluded) with `--weight-decay`, plus optional `--label-smoothing` and `--z-loss` (also in the web Train form and API).
+7. ✅ **Optional CUDA backend**: `cargo build --features cuda` swaps the CLI (train/eval/generate/export) to `burn::backend::Cuda` for f32 and f16; the web server keeps WGPU for adapter enumeration. Compile-checked with `cargo check --features cuda` (runtime requires an NVIDIA GPU).
 
 ## Stage E — Web Suite
 
@@ -44,4 +44,4 @@ Last updated: 2026-09-29 (after the Stage E web suite: model CRUD, background-op
 
 ## Suggested Order
 
-Remaining work is Stage D: **D4** (RoPE scaling) → **D5** (Parquet/HF → `.bin` + dedupe) → **D6** (optimizer groups, z-loss) → **D7** (optional CUDA). In parallel: version the UI smoke test in the repo and finish the English pass over code strings and `--help` text.
+Stages D and E are complete. Remaining work is technical debt: version the UI smoke test in the repo, and finish the English pass over code comments/strings plus the inaccurate `--help` texts (`serve --token` is optional, not auto-generated; `train --dtype` advertises `bf16` although runtime rejects it).
