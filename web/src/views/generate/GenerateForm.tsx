@@ -1,0 +1,102 @@
+import type { ModelInfo } from "../../api/types";
+import { Button } from "../../components/Button";
+import { Field, Input, Select, Textarea } from "../../components/ui";
+
+export interface GenForm {
+  prompt: string;
+  maxTokens: string;
+  temperature: string;
+  topK: string;
+  topP: string;
+  minP: string;
+  rep: string;
+}
+
+interface Props {
+  models: ModelInfo[];
+  modelDir: string;
+  onModelChange: (dir: string) => void;
+  form: GenForm;
+  onField: (key: keyof GenForm, value: string) => void;
+  busy: boolean;
+  onRun: () => void;
+  onStop: () => void;
+}
+
+export function GenerateForm({
+  models,
+  modelDir,
+  onModelChange,
+  form,
+  onField,
+  busy,
+  onRun,
+  onStop,
+}: Props) {
+  return (
+    <div className="glass-card rounded-2xl p-5 min-w-0">
+      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4">
+        Configuration
+      </h3>
+
+      <div className="mb-3">
+        <Field label="Model">
+          <Select value={modelDir} onChange={(e) => onModelChange(e.target.value)}>
+            {models.length === 0 ? (
+              <option value="">no models</option>
+            ) : (
+              models.map((m) => (
+                <option key={m.dir} value={m.dir}>
+                  {m.name} · {m.params_m.toFixed(1)}M
+                </option>
+              ))
+            )}
+          </Select>
+        </Field>
+      </div>
+
+      <div className="mb-3">
+        <Field label="Prompt">
+          <Textarea
+            rows={4}
+            placeholder="Once upon a time..."
+            value={form.prompt}
+            onChange={(e) => onField("prompt", e.target.value)}
+          />
+        </Field>
+      </div>
+
+      <div className="grid grid-cols-3 gap-3 mt-2">
+        <Field label="Max tokens">
+          <Input type="number" min={1} step={1} value={form.maxTokens} onChange={(e) => onField("maxTokens", e.target.value)} />
+        </Field>
+        <Field label="Temperature">
+          <Input type="number" min={0} step={0.05} value={form.temperature} onChange={(e) => onField("temperature", e.target.value)} />
+        </Field>
+        <Field label="Top-K">
+          <Input type="number" min={1} step={1} value={form.topK} onChange={(e) => onField("topK", e.target.value)} />
+        </Field>
+      </div>
+      <div className="grid grid-cols-3 gap-3 mt-3">
+        <Field label="Top-P">
+          <Input type="number" min={0} step={0.05} value={form.topP} onChange={(e) => onField("topP", e.target.value)} />
+        </Field>
+        <Field label="Min-P">
+          <Input type="number" min={0} step={0.01} value={form.minP} onChange={(e) => onField("minP", e.target.value)} />
+        </Field>
+        <Field label="Repetition">
+          <Input type="number" min={1} step={0.05} value={form.rep} onChange={(e) => onField("rep", e.target.value)} />
+        </Field>
+      </div>
+
+      <div className="mt-5 flex gap-3">
+        <Button variant="primary" disabled={busy || !modelDir} onClick={onRun}>
+          {busy ? "Generating…" : "Generate"}
+        </Button>
+        <Button variant="danger" disabled={!busy} onClick={onStop}>
+          Stop
+        </Button>
+      </div>
+    </div>
+  );
+}

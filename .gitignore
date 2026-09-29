@@ -27,9 +27,9 @@ sessions/
 .env.*.local
 !.env.example
 
-# Frontend (defensivo, aunque usemos CDN)
-frontend/node_modules/
-frontend/dist/
+# Frontend (React + Vite en web/)
+web/node_modules/
+web/dist/
 
 # IDE / editor
 .idea/

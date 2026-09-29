@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::http::{HeaderValue, header};
 use runner::JobRegistry;
+use tower::ServiceBuilder;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -27,19 +28,39 @@ pub async fn run(
 
     let (api_router, registry) = api::router(state.clone());
     let frontend_dir = frontend_dir();
-    let app = Router::new()
-        .merge(api_router)
-        .fallback_service(
-            ServeDir::new(&frontend_dir)
-                .not_found_service(ServeFile::new(frontend_dir.join("index.html"))),
-        )
-        // Revalidate static assets/API responses on every request: without this
-        // browsers heuristically cache the JS modules and keep running stale
-        // frontend code after an update.
+    let index_html = frontend_dir.join("index.html");
+    if !index_html.is_file() {
+        println!("   ⚠ Frontend not built: run `npm install && npm run build` inside web/.");
+    }
+
+    // Content-hashed Vite assets keep their name forever, so they are cached
+    // hard; everything else (including API responses) revalidates on every
+    // request so a rebuild or redeploy is picked up without manual cache
+    // busting.
+    let assets = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ))
+        .service(ServeDir::new(frontend_dir.join("assets")));
+
+    let spa = ServiceBuilder::new()
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
-        ));
+        ))
+        // `.fallback` keeps the fallback's 200 status; `not_found_service`
+        // would force 404 for every SPA route.
+        .service(ServeDir::new(&frontend_dir).fallback(ServeFile::new(&index_html)));
+
+    let app = Router::new()
+        .merge(api_router)
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
+        .nest_service("/assets", assets)
+        .fallback_service(spa);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("🐈‍⬛ Kuro-Neko serve listening on http://{bind}");
@@ -51,6 +72,7 @@ pub async fn run(
     }
     println!("   Datasets: {:?}", state.datasets_dir);
     println!("   Modelos:  {:?}", state.models_dir);
+    println!("   Web UI:   {:?}", frontend_dir);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state.clone(), registry))
         .await?;
@@ -70,12 +92,12 @@ async fn shutdown_signal(state: Arc<ServerState>, registry: Arc<JobRegistry>) {
     }
 }
 
-/// Locate the frontend directory (checked-out repo or compiled asset).
+/// Locate the built frontend (repo checkout or a `web/dist` next to the CWD).
 fn frontend_dir() -> PathBuf {
-    let candidate = PathBuf::from("frontend");
+    let candidate = PathBuf::from("web/dist");
     if candidate.join("index.html").exists() {
         candidate
     } else {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/frontend"))
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/web/dist"))
     }
 }
