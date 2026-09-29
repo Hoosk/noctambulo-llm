@@ -1,5 +1,10 @@
 import type { JobState, LossPoint, TrainingEvent, TrainStatus } from "../api/types";
 
+export interface LogEntry {
+  id: number;
+  text: string;
+}
+
 export interface JobInfo {
   status: JobState;
   paused: boolean;
@@ -19,10 +24,13 @@ export interface JobInfo {
   nCtx: number;
   valPpl: number | null;
   valLoss: number | null;
+  valPoints: LossPoint[];
   preview: string;
   jobId: string;
   message: string;
   lossPoints: LossPoint[];
+  logs: LogEntry[];
+  nextLogId: number;
 }
 
 export type Connection = "connecting" | "online" | "offline";
@@ -47,16 +55,31 @@ export const EMPTY_JOB: JobInfo = {
   nCtx: 0,
   valPpl: null,
   valLoss: null,
+  valPoints: [],
   preview: "",
   jobId: "",
   message: "",
   lossPoints: [],
+  logs: [],
+  nextLogId: 0,
 };
 
 // The trainer reports progress between loss-sync intervals. During that window
 // its provisional loss is zero, which is not a real metric.
 function metricOrNull(value: number): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/// Append worker log lines (SSE or backfill) with stable ids for React keys.
+export function appendLogLines(prev: JobInfo, lines: string[]): JobInfo {
+  if (lines.length === 0) return prev;
+  const entries = lines.map((text, i) => ({ id: prev.nextLogId + i, text }));
+  const logs = [...prev.logs, ...entries];
+  return {
+    ...prev,
+    logs: logs.length > 800 ? logs.slice(logs.length - 800) : logs,
+    nextLogId: prev.nextLogId + entries.length,
+  };
 }
 
 function pushLossPoint(points: LossPoint[], x: number, y: number | null): LossPoint[] {
@@ -120,10 +143,21 @@ export function applyTrainingEvent(prev: JobInfo, ev: TrainingEvent): JobInfo {
     };
   }
   if ("Val" in ev) {
-    return { ...prev, valPpl: ev.Val.ppl, valLoss: ev.Val.loss };
+    const v = ev.Val;
+    const loss = metricOrNull(v.loss);
+    const x = prev.step > 0 ? prev.step : prev.epoch;
+    return {
+      ...prev,
+      valPpl: v.ppl,
+      valLoss: v.loss,
+      valPoints: pushLossPoint(prev.valPoints, x, loss),
+    };
   }
   if ("Preview" in ev) {
     return { ...prev, preview: ev.Preview.text };
+  }
+  if ("LogEvent" in ev) {
+    return appendLogLines(prev, [ev.LogEvent.line]);
   }
   if ("Done" in ev) {
     return { ...prev, status: "done", stopping: false, message: "Training completed" };
@@ -151,6 +185,9 @@ export function mergeStatus(prev: JobInfo, s: TrainStatus): { job: JobInfo; even
   }
   if (Array.isArray(s.loss_points) && s.loss_points.length !== next.lossPoints.length) {
     next = { ...next, lossPoints: s.loss_points };
+  }
+  if (Array.isArray(s.val_points) && s.val_points.length !== next.valPoints.length) {
+    next = { ...next, valPoints: s.val_points };
   }
   // A restarted server reports running=false while its persisted snapshot still
   // holds the last event of a (dead) job. Never let a stale Progress/Started

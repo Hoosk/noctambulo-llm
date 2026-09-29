@@ -331,6 +331,136 @@ pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf
     Err(format!("Failed to download dataset from HF repo '{}': {:?}", repo_id, last_err.unwrap()).into())
 }
 
+/// Candidate file names tried in order for a requested HF dataset file.
+fn hf_candidates(filename: &str) -> Vec<String> {
+    let mut out = vec![filename.to_string()];
+    for cand in [
+        "TinyStories-train.txt",
+        "stories_00.json",
+        "tinystories.jsonl",
+        "spanish_stories.txt",
+        "train.txt",
+        "data.txt",
+    ] {
+        if cand != filename {
+            out.push(cand.to_string());
+        }
+    }
+    out
+}
+
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Streaming HF download with byte-level progress and cooperative
+/// cancellation. Keeps the same cache naming as `download_dataset_from_hf`, so
+/// files already cached by the CLI are reused.
+///
+/// `progress(phase, done_bytes, total_bytes)` is called while downloading
+/// (`total_bytes == 0` when the server does not send a content length);
+/// `cancelled()` is polled between chunks and aborts with a partial file
+/// removed.
+pub fn download_dataset_streaming(
+    repo_id: &str,
+    filename: &str,
+    progress: &dyn Fn(&str, u64, u64),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let candidates = hf_candidates(filename);
+
+    // 1. Local cache first (root, then datasets/) to avoid re-downloading.
+    for cand in &candidates {
+        let dataset_name = format!("dataset_{}_{}", repo_id.replace('/', "_"), cand.replace('/', "_"));
+        for base in [PathBuf::from("."), PathBuf::from("datasets")] {
+            let cached = base.join(&dataset_name);
+            if cached.is_file() {
+                return Ok(cached);
+            }
+        }
+    }
+
+    let datasets_dir = PathBuf::from("datasets");
+    std::fs::create_dir_all(&datasets_dir)?;
+
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("kuro-neko-llm/0.1")
+        .build()?;
+
+    let mut last_err: Option<String> = None;
+    for cand in candidates {
+        if cancelled() {
+            return Err("cancelled by user".into());
+        }
+        let dataset_name = format!("dataset_{}_{}", repo_id.replace('/', "_"), cand.replace('/', "_"));
+        let local_cache = datasets_dir.join(&dataset_name);
+        let encoded: Vec<String> = cand.split('/').map(encode_path_segment).collect();
+        let url = format!(
+            "https://huggingface.co/datasets/{}/resolve/main/{}",
+            repo_id,
+            encoded.join("/")
+        );
+
+        progress(&format!("requesting {cand}"), 0, 0);
+        let mut req = client.get(&url);
+        if let Some(t) = &token {
+            req = req.bearer_auth(t);
+        }
+        let mut resp = match req.send() {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(format!("{cand}: {e}"));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(format!("{cand}: HTTP {}", resp.status()));
+            continue;
+        }
+
+        let total = resp.content_length().unwrap_or(0);
+        let tmp = local_cache.with_extension("part");
+        let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
+        let mut buf = vec![0u8; 1 << 16];
+        let mut done = 0u64;
+        loop {
+            if cancelled() {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                return Err("cancelled by user".into());
+            }
+            let n = resp.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            file.write_all(&buf[..n])?;
+            done += n as u64;
+            progress(&format!("downloading {cand}"), done, total);
+        }
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&tmp, &local_cache)?;
+        return Ok(local_cache);
+    }
+
+    Err(format!(
+        "Failed to download dataset from HF repo '{}': {}",
+        repo_id,
+        last_err.unwrap_or_else(|| "no candidate file found".into())
+    )
+    .into())
+}
+
 /// Extrae documentos de texto de un archivo Parquet (columna `text` con fallbacks
 /// a `content`/`body`) y los escribe a un `.txt` destino, un documento por línea.
 /// Devuelve el número de documentos escritos.
@@ -386,14 +516,12 @@ pub fn extract_parquet_text_column(
                     .map(|a| a.iter().collect::<Vec<Option<&str>>>())
             });
         let Some(data) = data else { continue; };
-        for val in data {
-            if let Some(text) = val {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    writer.write_all(trimmed.as_bytes())?;
-                    writer.write_all(b"\n")?;
-                    docs += 1;
-                }
+        for text in data.into_iter().flatten() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                writer.write_all(trimmed.as_bytes())?;
+                writer.write_all(b"\n")?;
+                docs += 1;
             }
         }
     }
@@ -472,8 +600,36 @@ pub fn combine_and_mix_weighted(
     output_path: &Path,
     max_chars: usize,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    combine_and_mix_weighted_with(sources, output_path, max_chars, &|_, _| {}, &|| false)
+}
+
+/// Same as [`combine_and_mix_weighted`] with progress reporting (characters
+/// written) and cooperative cancellation, used by the web server.
+pub fn combine_and_mix_weighted_with(
+    sources: &[(PathBuf, f32)],
+    output_path: &Path,
+    max_chars: usize,
+    progress: &dyn Fn(u64, u64),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    // The mixer reads line by line; `.bin` files are raw token ids and would
+    // silently produce an empty (or corrupt) mix.
+    for (src, _) in sources {
+        let is_bin = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("bin"));
+        if is_bin {
+            return Err(format!(
+                "Refusing to mix binary dataset {:?}: weighted mixing reads line by line and would produce an empty mix. Convert it to .txt first.",
+                src
+            )
+            .into());
+        }
     }
 
     let total_weight: f32 = sources.iter().map(|(_, w)| w.max(0.0)).sum();
@@ -502,6 +658,9 @@ pub fn combine_and_mix_weighted(
     let mut total_lines = 0u64;
     let mut line_buf = String::new();
     let mut last_pct = -1i32;
+    let mut iterations: u64 = 0;
+    let mut last_report = std::time::Instant::now();
+    let progress_total: u64 = if max_chars == usize::MAX { 0 } else { max_chars as u64 };
 
     // Fuentes activas: (índice, peso). Se re-normaliza al agotar una fuente.
     let mut active: Vec<(usize, f32)> =
@@ -514,6 +673,13 @@ pub fn combine_and_mix_weighted(
         .unwrap_or(0xDEADBEEF);
 
     while !active.is_empty() && written_chars < max_chars {
+        iterations += 1;
+        if iterations.is_multiple_of(4096) && cancelled() {
+            writer.flush().ok();
+            drop(writer);
+            let _ = std::fs::remove_file(output_path);
+            return Err("cancelled by user".into());
+        }
         // Sortear una fuente activa proporcionalmente a su peso
         let total: f32 = active.iter().map(|(_, w)| w).sum();
         state ^= state >> 12;
@@ -550,6 +716,11 @@ pub fn combine_and_mix_weighted(
                     written_chars += bytes.len() + 1;
                     total_lines += 1;
 
+                    if last_report.elapsed() >= std::time::Duration::from_millis(200) {
+                        last_report = std::time::Instant::now();
+                        progress(written_chars as u64, progress_total);
+                    }
+
                     let pct = if max_chars == usize::MAX {
                         0
                     } else {
@@ -577,6 +748,8 @@ pub fn combine_and_mix_weighted(
 
     writer.flush()?;
     println!();
+    let final_total = if progress_total > 0 { progress_total } else { written_chars as u64 };
+    progress(written_chars as u64, final_total);
     println!(
         "Weighted mix ready: {} lines / {} chars written to {:?}.",
         total_lines, written_chars, output_path
@@ -670,10 +843,8 @@ pub fn is_binary_file<P: AsRef<Path>>(path: P) -> Result<bool, Box<dyn std::erro
         Err(_) => return Ok(false),
     };
     let mut magic = [0u8; 4];
-    if file.read_exact(&mut magic).is_ok() {
-        if &magic == BINARY_MAGIC {
-            return Ok(true);
-        }
+    if file.read_exact(&mut magic).is_ok() && &magic == BINARY_MAGIC {
+        return Ok(true);
     }
     Ok(false)
 }
@@ -868,6 +1039,27 @@ mod tests {
         assert_eq!(vocab, 100);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_combine_and_mix_weighted_rejects_bin_sources() {
+        let txt = std::env::temp_dir().join("test_kuro_mix_a.txt");
+        let bin = std::env::temp_dir().join("test_kuro_mix_b.bin");
+        let out = std::env::temp_dir().join("test_kuro_mix_out.txt");
+        std::fs::write(&txt, "hello\nworld\n").unwrap();
+        std::fs::write(&bin, b"not really tokens").unwrap();
+
+        let sources = vec![(txt.clone(), 1.0), (bin.clone(), 1.0)];
+        let err = combine_and_mix_weighted(&sources, &out, usize::MAX).unwrap_err();
+        assert!(
+            err.to_string().contains("Refusing to mix binary dataset"),
+            "expected .bin rejection, got: {err}"
+        );
+        // Nothing must be written when a source is rejected.
+        assert!(!out.exists());
+
+        let _ = std::fs::remove_file(&txt);
+        let _ = std::fs::remove_file(&bin);
     }
 }
 

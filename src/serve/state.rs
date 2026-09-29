@@ -4,6 +4,8 @@ use std::sync::RwLock;
 
 use crate::train::TrainingEvent;
 
+use super::runs::{RUNS_FILE, RunsStore};
+
 /// One captured diagnostic line from the training worker.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LogLine {
@@ -33,6 +35,8 @@ pub struct JobStatus {
 struct PersistedState {
     job: JobStatus,
     loss_points: Vec<LossPoint>,
+    #[serde(default)]
+    val_points: Vec<LossPoint>,
 }
 
 /// Minimum interval between `persist()` writes during a running job. Progress
@@ -64,6 +68,10 @@ pub struct ServerState {
     logs: RwLock<LogBuffer>,
     /// Loss history for chart backfill across reloads / restarts.
     loss_points: RwLock<Vec<LossPoint>>,
+    /// Validation-loss history, persisted alongside the training loss curve.
+    val_points: RwLock<Vec<LossPoint>>,
+    /// Persisted history of training runs (curves included).
+    pub runs: RunsStore,
 }
 
 #[derive(Default)]
@@ -87,6 +95,8 @@ impl ServerState {
             events: tx,
             logs: RwLock::new(LogBuffer::default()),
             loss_points: RwLock::new(Vec::new()),
+            val_points: RwLock::new(Vec::new()),
+            runs: RunsStore::load(PathBuf::from(RUNS_FILE)),
         };
         state.load_state();
         state
@@ -108,6 +118,7 @@ impl ServerState {
             job.message = None;
         }
         self.loss_points.write().unwrap().clear();
+        self.val_points.write().unwrap().clear();
         // Clear kept log lines but keep `total` monotonic so clients holding an
         // old cursor never re-receive the previous job's lines.
         self.logs.write().unwrap().lines.clear();
@@ -142,6 +153,12 @@ impl ServerState {
         (lines, buf.total)
     }
 
+    /// Monotonic count of log lines ever captured (survives buffer eviction and
+    /// job restarts), used by clients to backfill incrementally.
+    pub fn logs_total(&self) -> usize {
+        self.logs.read().unwrap().total
+    }
+
     /// Record a loss point (deduped by step). Provisional zeros and NaN/inf
     /// values from the trainer are not real metrics, so they are dropped.
     pub fn push_loss_point(&self, x: usize, y: f32) {
@@ -166,6 +183,30 @@ impl ServerState {
         self.loss_points.read().unwrap().clone()
     }
 
+    /// Record a validation-loss point (deduped by step, same filtering as the
+    /// training loss).
+    pub fn push_val_point(&self, x: usize, y: f32) {
+        if !y.is_finite() || y <= 0.0 {
+            return;
+        }
+        let mut pts = self.val_points.write().unwrap();
+        match pts.last_mut() {
+            Some(last) if last.x == x => last.y = y,
+            _ => {
+                let overflow = pts.len().saturating_sub(1999);
+                if overflow > 0 {
+                    pts.drain(0..overflow);
+                }
+                pts.push(LossPoint { x, y });
+            }
+        }
+    }
+
+    /// Snapshot of the validation-loss history for chart backfill.
+    pub fn val_points_snapshot(&self) -> Vec<LossPoint> {
+        self.val_points.read().unwrap().clone()
+    }
+
     /// Persist job status + loss history to `.kuro/state.json`.
     /// Written atomically (temp + rename) so a crash mid-write can never
     /// leave a truncated file that would wipe the state on next load.
@@ -173,12 +214,11 @@ impl ServerState {
         let state = PersistedState {
             job: self.job.read().unwrap().clone(),
             loss_points: self.loss_points_snapshot(),
+            val_points: self.val_points_snapshot(),
         };
         if let Ok(bytes) = serde_json::to_vec(&state) {
-            if std::fs::create_dir_all(".kuro").is_ok() {
-                if std::fs::write(STATE_TMP, bytes).is_ok() {
-                    let _ = std::fs::rename(STATE_TMP, STATE_FILE);
-                }
+            if std::fs::create_dir_all(".kuro").is_ok() && std::fs::write(STATE_TMP, bytes).is_ok() {
+                let _ = std::fs::rename(STATE_TMP, STATE_FILE);
             }
         }
     }
@@ -197,6 +237,7 @@ impl ServerState {
         job.stopping = false;
         *self.job.write().unwrap() = job;
         *self.loss_points.write().unwrap() = state.loss_points;
+        *self.val_points.write().unwrap() = state.val_points;
     }
 }
 
@@ -229,6 +270,7 @@ mod tests {
                 message: Some("ok".into()),
             },
             loss_points: vec![LossPoint { x: 1, y: 8.0 }, LossPoint { x: 2, y: 7.5 }],
+            val_points: vec![LossPoint { x: 2, y: 7.8 }],
         };
 
         let bytes = serde_json::to_vec(&state).unwrap();
@@ -237,6 +279,7 @@ mod tests {
         assert_eq!(back.job.job_id, "job-123");
         assert_eq!(back.loss_points.len(), 2);
         assert_eq!(back.loss_points[1].y, 7.5);
+        assert_eq!(back.val_points.len(), 1);
         match back.job.last_event {
             Some(TrainingEvent::Progress { step, .. }) => assert_eq!(step, 5),
             _ => panic!("expected Progress event"),

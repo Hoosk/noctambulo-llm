@@ -60,6 +60,8 @@ export interface TrainStatus {
   message: string | null;
   last_event: TrainingEvent | null;
   loss_points: LossPoint[];
+  val_points: LossPoint[];
+  logs_total: number;
 }
 
 export interface LogsResponse {
@@ -134,6 +136,19 @@ export interface ModelInfo {
   default: boolean;
 }
 
+export interface ModelFile {
+  name: string;
+  size_bytes: number;
+  modified_unix: number;
+  shared: boolean;
+}
+
+export interface ModelFilesResponse {
+  dir: string;
+  name: string;
+  files: ModelFile[];
+}
+
 export interface TrainRequestBody {
   file: string;
   device: string;
@@ -156,4 +171,82 @@ export interface TrainRequestBody {
   saveDir: string;
   outputDir: string;
   resume?: string;
+}
+
+export type OpEvent =
+  | { Started: { id: string; kind: string; label: string; started_unix: number } }
+  | { Progress: { id: string; kind: string; phase: string; done: number; total: number; unit: string } }
+  | { Done: { id: string; kind: string; message: string; result: Record<string, unknown> | null } }
+  | { Failed: { id: string; kind: string; error: string } }
+  | { Cancelled: { id: string; kind: string } };
+
+export interface OpStatus {
+  id: string;
+  kind: string;
+  label: string;
+  phase: string;
+  done: number;
+  total: number;
+  unit: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  message: string | null;
+  error: string | null;
+  result: Record<string, unknown> | null;
+  started_unix: number;
+  finished_unix: number | null;
+}
+
+export interface RunSummary {
+  id: string;
+  job_id: string;
+  dataset: string;
+  output_dir: string;
+  dtype: string;
+  device: string;
+  epochs: number;
+  batch_size: number;
+  lr: number;
+  n_ctx: number;
+  n_embd: number;
+  n_layer: number;
+  grad_accum: number;
+  status: string;
+  note: string | null;
+  started_unix: number;
+  finished_unix: number | null;
+  final_loss: number | null;
+  final_ppl: number | null;
+}
+
+export interface RunRecord extends RunSummary {
+  loss_points: LossPoint[];
+  val_points: LossPoint[];
+}
+
+export interface TelemetryMemory {
+  total_bytes: number;
+  available_bytes: number;
+  used_pct: number;
+}
+
+export interface TelemetryProcess {
+  rss_bytes: number;
+  cpu_pct: number | null;
+  threads: number;
+  uptime_secs: number;
+}
+
+export interface TelemetryGpu {
+  index: number;
+  name: string;
+  used_bytes: number;
+  total_bytes: number;
+  source: string;
+}
+
+export interface Telemetry {
+  memory: TelemetryMemory;
+  process: TelemetryProcess;
+  gpus: TelemetryGpu[];
+  notes: string[];
 }

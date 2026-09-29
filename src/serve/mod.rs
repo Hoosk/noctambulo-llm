@@ -2,7 +2,9 @@
 //! remote machine with a GPU (WGPU is local to the host running this binary).
 
 pub mod api;
+pub mod ops;
 pub mod runner;
+pub mod runs;
 pub mod state;
 
 use std::path::PathBuf;

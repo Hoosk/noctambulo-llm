@@ -4,6 +4,7 @@ import { CatLogo, Icon, type IconName } from "./components/Icon";
 import { useAppState } from "./state/appContext";
 import { AppStateProvider } from "./state/AppStateProvider";
 import { ModalProvider } from "./state/ModalProvider";
+import { opPercent } from "./state/opsModel";
 import { ToastProvider } from "./state/ToastProvider";
 
 const TrainView = lazy(() => import("./views/TrainView").then((m) => ({ default: m.TrainView })));
@@ -160,6 +161,42 @@ function GlobalProgress() {
   );
 }
 
+function GlobalOps() {
+  const { ops, cancelOp } = useAppState();
+  const running = ops.filter((o) => o.status === "running").slice(0, 3);
+  if (running.length === 0) return null;
+
+  return (
+    <div className="mt-3 space-y-2.5">
+      {running.map((op) => {
+        const pct = opPercent(op);
+        return (
+          <div key={op.id}>
+            <div className="flex items-center justify-between gap-2 text-[10px] mb-1">
+              <span className="text-slate-500 truncate">{op.label}</span>
+              <button
+                type="button"
+                onClick={() => cancelOp(op.id)}
+                className="text-rose-300/70 hover:text-rose-200 transition shrink-0"
+              >
+                cancel
+              </button>
+            </div>
+            <div className="h-1 rounded-full bg-slate-800 overflow-hidden">
+              <div
+                className={`h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 ${
+                  pct == null ? "progress-shimmer w-full" : ""
+                }`}
+                style={pct != null ? { width: `${pct}%` } : undefined}
+              />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Shell() {
   const { authState, logout } = useAppState();
   const [view, setView] = useState<ViewName>("train");
@@ -232,6 +269,7 @@ function Shell() {
 
         <div className="rounded-xl border border-slate-800/70 bg-slate-950/60 p-3">
           <GlobalProgress />
+          <GlobalOps />
           <div className="flex items-center justify-center">
             <ConnBadge />
           </div>

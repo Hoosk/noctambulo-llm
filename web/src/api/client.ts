@@ -6,7 +6,12 @@ import type {
   DatasetInfo,
   DeviceInfo,
   LogsResponse,
+  ModelFilesResponse,
   ModelInfo,
+  OpStatus,
+  RunRecord,
+  RunSummary,
+  Telemetry,
   TrainRequestBody,
   TrainStatus,
 } from "./types";
@@ -78,7 +83,7 @@ export const api = {
   searchDatasets: (q: string) =>
     request<DatasetHit[]>(`/api/datasets/search?q=${encodeURIComponent(q)}`),
   downloadDataset: (repoId: string, filename: string) =>
-    request<{ status: string; path: string; name: string }>("/api/datasets/download", {
+    request<{ opId: string; status: string }>("/api/datasets/download", {
       method: "POST",
       json: { repoId, filename },
     }),
@@ -89,11 +94,30 @@ export const api = {
       method: "DELETE",
     }),
   combineDatasets: (body: CombineRequest) =>
-    request<{ status: string; output: string }>("/api/datasets/combine", { method: "POST", json: body }),
+    request<{ opId: string; status: string }>("/api/datasets/combine", { method: "POST", json: body }),
   getDevices: () => request<DeviceInfo[]>("/api/devices"),
+  getTelemetry: () => request<Telemetry>("/api/telemetry"),
   getModels: () => request<ModelInfo[]>("/api/models"),
+  getModelFiles: (dir: string) =>
+    request<ModelFilesResponse>(`/api/models/files?dir=${encodeURIComponent(dir)}`),
+  modelFileUrl: (dir: string, file: string) =>
+    `/api/models/file?dir=${encodeURIComponent(dir)}&file=${encodeURIComponent(file)}`,
+  renameModel: (dir: string, newName: string) =>
+    request<{ status: string; dir: string; name?: string }>("/api/models/rename", {
+      method: "POST",
+      json: { dir, newName },
+    }),
+  deleteModel: (name: string) =>
+    request<{ status: string; deleted: string }>(`/api/models/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
   exportModel: (modelDir: string, modelName: string) =>
-    request<{ gguf: string }>("/api/export", { method: "POST", json: { modelDir, modelName } }),
+    request<{ opId: string; status: string }>("/api/export", { method: "POST", json: { modelDir, modelName } }),
+  getOps: () => request<OpStatus[]>("/api/ops"),
+  cancelOp: (id: string) =>
+    request<{ status: string; id: string }>(`/api/ops/${encodeURIComponent(id)}/cancel`, { method: "POST" }),
+  getRuns: () => request<RunSummary[]>("/api/runs"),
+  getRun: (id: string) => request<RunRecord>(`/api/runs/${encodeURIComponent(id)}`),
   getCheckpoints: (dir = "checkpoints_web") =>
     request<CheckpointInfo[]>(`/api/checkpoints?dir=${encodeURIComponent(dir)}`),
   startTrain: (body: TrainRequestBody) =>

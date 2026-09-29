@@ -161,3 +161,105 @@ fn test_resolve_model_dir_blocks_traversal() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(root.parent().unwrap().join("kuro_outside_models"));
 }
+
+#[test]
+fn test_resolve_model_child_dir_rejects_nested_and_outside() {
+    use super::paths::resolve_model_child_dir;
+
+    let root = std::env::temp_dir().join(format!("kuro_child_dir_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("model_output")).unwrap();
+    std::fs::create_dir_all(root.join("nested/inner")).unwrap();
+    let outside = root.parent().unwrap().join("kuro_child_dir_outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    assert!(resolve_model_child_dir(&root, "model_output").is_ok());
+    // Immediate children are accepted even without model files (checked later).
+    assert!(resolve_model_child_dir(&root, "nested").is_ok());
+    // Nested and outside paths must be rejected.
+    assert!(resolve_model_child_dir(&root, "nested/inner").is_err());
+    assert!(resolve_model_child_dir(&root, "../kuro_child_dir_outside").is_err());
+    assert!(resolve_model_child_dir(&root, outside.to_str().unwrap()).is_err());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[tokio::test]
+async fn test_model_files_rename_delete_routes() {
+    use tower::ServiceExt;
+
+    let dir = std::env::temp_dir().join(format!("kuro_models_routes_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("model_output")).unwrap();
+    std::fs::write(dir.join("model_output/config.json"), "{}").unwrap();
+    std::fs::write(dir.join("model_output/model_weights.bin"), b"weights").unwrap();
+    std::fs::create_dir_all(dir.join("not_a_model")).unwrap();
+    std::fs::write(dir.join("not_a_model/notes.txt"), "hi").unwrap();
+
+    let state = Arc::new(ServerState::new(Some("tok".into()), dir.clone(), dir.clone()));
+    let (router, _registry) = router(state);
+
+    let req = axum::http::Request::builder()
+        .uri("/api/models/files?dir=model_output")
+        .header("x-api-token", "tok")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = json["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"config.json") && names.contains(&"model_weights.bin"));
+
+    let req = axum::http::Request::builder()
+        .uri("/api/models/file?dir=model_output&file=config.json")
+        .header("x-api-token", "tok")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().get(header::CONTENT_DISPOSITION).is_some());
+
+    // Traversal in the file name must be rejected even with a valid model dir.
+    let req = axum::http::Request::builder()
+        .uri("/api/models/file?dir=model_output&file=..%2Fsecret")
+        .header("x-api-token", "tok")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // A directory without model files must not be listed or deleted.
+    let req = axum::http::Request::builder()
+        .uri("/api/models/files?dir=not_a_model")
+        .header("x-api-token", "tok")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/models/rename")
+        .header("x-api-token", "tok")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"dir":"model_output","newName":"renamed"}"#))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(dir.join("renamed/config.json").is_file());
+
+    let req = axum::http::Request::builder()
+        .method("DELETE")
+        .uri("/api/models/renamed")
+        .header("x-api-token", "tok")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = router.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(!dir.join("renamed").exists());
+    assert!(dir.join("not_a_model").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

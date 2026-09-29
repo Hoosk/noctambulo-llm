@@ -211,6 +211,9 @@ pub(super) struct StatusResponse {
     message: Option<String>,
     last_event: Option<TrainingEvent>,
     loss_points: Vec<crate::serve::state::LossPoint>,
+    val_points: Vec<crate::serve::state::LossPoint>,
+    /// Monotonic log cursor so clients can backfill missed lines without polling.
+    logs_total: usize,
 }
 
 #[allow(clippy::unused_async)]
@@ -228,6 +231,8 @@ pub(super) async fn train_status(
         message: job.message,
         last_event: job.last_event,
         loss_points: state.server.loss_points_snapshot(),
+        val_points: state.server.val_points_snapshot(),
+        logs_total: state.server.logs_total(),
     }))
 }
 

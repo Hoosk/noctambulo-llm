@@ -12,7 +12,7 @@ use burn::tensor::f16;
 use clap::{Args, Parser, Subcommand};
 use config::{DType, ModelConfig};
 use data::{combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf, extract_parquet_text_column, prepare_binary_dataset, train_custom_tokenizer, LlmTokenizer};
-use export::export_to_gguf;
+use export::export_to_gguf_cli as export_to_gguf;
 use generate::generate;
 use model::Llm;
 use std::path::{Path, PathBuf};

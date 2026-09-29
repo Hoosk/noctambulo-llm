@@ -1,12 +1,17 @@
 use std::path::Path;
 
-use axum::{Json, extract::State, http::HeaderMap};
-use serde::Serialize;
+use axum::{
+    Json,
+    extract::{Path as AxumPath, Query, State},
+    http::{HeaderMap, header},
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::auth::check_token;
 use super::error::ApiError;
-use super::paths::is_safe_rel_path;
+use super::paths::{is_safe_child_name, is_safe_rel_path, resolve_model_child_dir};
 
 #[derive(Serialize)]
 pub(super) struct ModelInfo {
@@ -123,4 +128,201 @@ pub(super) async fn checkpoints(
     }
     out.sort_by_key(|c| std::cmp::Reverse(c.modified_unix));
     Ok(Json(out))
+}
+
+/// Files downloadable from a model directory, plus the shared tokenizer when
+/// it exists next to the server.
+#[derive(Serialize)]
+pub(super) struct ModelFileInfo {
+    name: String,
+    size_bytes: u64,
+    modified_unix: u64,
+    /// True for files shared across models (e.g. `custom_tokenizer.json`).
+    shared: bool,
+}
+
+#[derive(Serialize)]
+pub(super) struct ModelFilesResponse {
+    dir: String,
+    name: String,
+    files: Vec<ModelFileInfo>,
+}
+
+fn file_info(path: &Path, shared: bool) -> Option<ModelFileInfo> {
+    let meta = path.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(ModelFileInfo {
+        name: path.file_name()?.to_string_lossy().to_string(),
+        size_bytes: meta.len(),
+        modified_unix: modified,
+        shared,
+    })
+}
+
+/// A model must at least carry weights and config, otherwise it is just a
+/// random directory and must not expose files (or be deleted by accident).
+fn ensure_model_dir(dir: &Path) -> Result<(), ApiError> {
+    if !dir.join("config.json").is_file() || !dir.join("model_weights.bin").is_file() {
+        return Err(ApiError::not_found("not a model directory (config.json + model_weights.bin required)"));
+    }
+    Ok(())
+}
+
+/// Model mutations are refused while training runs: the worker may be writing
+/// into one of these directories.
+fn ensure_idle(state: &AppState) -> Result<(), ApiError> {
+    if state.server.job.read().unwrap().running {
+        return Err(ApiError::conflict("cannot modify models while training is running"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct DirQuery {
+    #[serde(default)]
+    dir: String,
+}
+
+#[allow(clippy::unused_async)]
+pub(super) async fn model_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<DirQuery>,
+) -> Result<Json<ModelFilesResponse>, ApiError> {
+    check_token(&state.server, &headers, None)?;
+    let dir = resolve_model_child_dir(&state.server.models_dir, &q.dir)?;
+    ensure_model_dir(&dir)?;
+
+    let mut files = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if let Some(info) = file_info(&e.path(), false) {
+                files.push(info);
+            }
+        }
+    }
+    let shared = Path::new("custom_tokenizer.json");
+    let has_local_tokenizer = files.iter().any(|f| f.name == "custom_tokenizer.json");
+    if !has_local_tokenizer {
+        if let Some(info) = file_info(shared, true) {
+            files.push(info);
+        }
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(Json(ModelFilesResponse {
+        dir: dir.to_string_lossy().to_string(),
+        name: dir.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        files,
+    }))
+}
+
+#[derive(Deserialize)]
+pub(super) struct FileQuery {
+    #[serde(default)]
+    dir: String,
+    file: String,
+}
+
+/// Download a single file from a model directory (or the shared tokenizer).
+/// Exists separately from `/api/download` so that a models root pointing at the
+/// working directory can never expose arbitrary files.
+pub(super) async fn model_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<FileQuery>,
+) -> Result<Response, ApiError> {
+    check_token(&state.server, &headers, None)?;
+    if !is_safe_child_name(&q.file) {
+        return Err(ApiError::bad_request("invalid file name"));
+    }
+    let dir = resolve_model_child_dir(&state.server.models_dir, &q.dir)?;
+    ensure_model_dir(&dir)?;
+
+    let candidate = dir.join(&q.file);
+    let path = if candidate.is_file() {
+        candidate
+    } else if q.file == "custom_tokenizer.json" && Path::new("custom_tokenizer.json").is_file() {
+        std::path::PathBuf::from("custom_tokenizer.json")
+    } else {
+        return Err(ApiError::not_found(format!("file not found: {}", q.file)));
+    };
+
+    let bytes = tokio::fs::read(&path).await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{fname}\"")),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ModelRenameRequest {
+    dir: String,
+    new_name: String,
+}
+
+#[allow(clippy::unused_async)]
+pub(super) async fn model_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ModelRenameRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_token(&state.server, &headers, None)?;
+    ensure_idle(&state)?;
+
+    let new_name = req.new_name.trim().to_string();
+    if new_name.is_empty() || !is_safe_child_name(&new_name) || new_name.starts_with('.') {
+        return Err(ApiError::bad_request("invalid model name"));
+    }
+
+    let from = resolve_model_child_dir(&state.server.models_dir, &req.dir)?;
+    ensure_model_dir(&from)?;
+    if from.file_name().and_then(|n| n.to_str()) == Some(new_name.as_str()) {
+        return Ok(Json(serde_json::json!({ "status": "ok", "dir": from })));
+    }
+
+    let to = from
+        .parent()
+        .ok_or_else(|| ApiError::internal("model dir has no parent"))?
+        .join(&new_name);
+    if to.exists() {
+        return Err(ApiError::conflict("a model with that name already exists"));
+    }
+    std::fs::rename(&from, &to).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "dir": to.to_string_lossy(),
+        "name": new_name,
+    })))
+}
+
+#[allow(clippy::unused_async)]
+pub(super) async fn model_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_token(&state.server, &headers, None)?;
+    ensure_idle(&state)?;
+
+    let dir = resolve_model_child_dir(&state.server.models_dir, &name)?;
+    ensure_model_dir(&dir)?;
+    std::fs::remove_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "status": "ok", "deleted": name })))
 }

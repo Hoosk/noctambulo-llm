@@ -30,17 +30,39 @@ pub(super) async fn export_model(
         return Err(ApiError::bad_request("invalid model_name"));
     }
 
+    // Export runs as a background operation so the UI can show tensor-writing
+    // progress and cancel a long export.
     let name = req.model_name;
-    let result = tokio::task::spawn_blocking(move || run_export(model_dir, &name)).await;
+    let label = format!("{} → {}.gguf", model_dir.display(), name);
+    let op = state.ops.start("export", &label);
+    let op_id = op.id().to_string();
+    tokio::task::spawn_blocking(move || {
+        let progress = |phase: &str, done: u64, total: u64, unit: &str| op.progress(phase, done, total, unit);
+        let cancelled = || op.is_cancelled();
+        match run_export(model_dir, &name, &progress, &cancelled) {
+            Ok(path) => op.finish(
+                &format!("GGUF exported: {path}"),
+                Some(serde_json::json!({ "gguf": path })),
+            ),
+            Err(e) => {
+                if op.is_cancelled() {
+                    op.cancelled();
+                } else {
+                    op.fail(&e);
+                }
+            }
+        }
+    });
 
-    match result {
-        Ok(Ok(path)) => Ok(Json(serde_json::json!({ "gguf": path }))),
-        Ok(Err(e)) => Err(ApiError::internal(e)),
-        Err(e) => Err(ApiError::internal(format!("export task failed: {e}"))),
-    }
+    Ok(Json(serde_json::json!({ "opId": op_id, "status": "started" })))
 }
 
-fn run_export(model_dir: std::path::PathBuf, model_name: &str) -> Result<String, String> {
+fn run_export(
+    model_dir: std::path::PathBuf,
+    model_name: &str,
+    progress: &dyn Fn(&str, u64, u64, &str),
+    cancelled: &dyn Fn() -> bool,
+) -> Result<String, String> {
     use burn::backend::Wgpu;
     use burn::module::Module;
     use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
@@ -60,6 +82,6 @@ fn run_export(model_dir: std::path::PathBuf, model_name: &str) -> Result<String,
         .map_err(|e| format!("failed to load weights: {e:?}"))?;
     let model = model.load_record(record);
 
-    crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported")
+    crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported", progress, cancelled)
         .map_err(|e| format!("export error: {e}"))
 }

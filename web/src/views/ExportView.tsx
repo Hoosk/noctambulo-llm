@@ -3,19 +3,36 @@ import { api } from "../api/client";
 import type { ModelInfo } from "../api/types";
 import { Button } from "../components/Button";
 import { ExportResult } from "../components/ExportResult";
+import { OpProgress } from "../components/OpProgress";
 import { Field, Input, Select, ViewHeader } from "../components/ui";
 import { useAppState } from "../state/appContext";
 import { useToast } from "../state/toastContext";
+import { useOp, useOpOutcome } from "../state/useOp";
 
 export function ExportView() {
-  const { activeModel } = useAppState();
+  const { activeModel, cancelOp } = useAppState();
   const toast = useToast();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [modelDir, setModelDir] = useState(activeModel);
   const [name, setName] = useState("kuro-neko");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<string | null>(null);
+  const [opId, setOpId] = useState<string | null>(null);
+  const op = useOp(opId);
+  const running = op?.status === "running";
+
+  useOpOutcome(opId, (outcome) => {
+    if (outcome.status === "done") {
+      const gguf = typeof outcome.result?.gguf === "string" ? outcome.result.gguf : null;
+      toast.success(outcome.message ?? "GGUF exported");
+      if (gguf) setResult(gguf);
+    } else if (outcome.status === "cancelled") {
+      toast.info("Export cancelled");
+    } else {
+      setError(outcome.error ?? "unknown");
+    }
+    setOpId(null);
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -35,18 +52,14 @@ export function ExportView() {
   const selectedDir = modelDir || models.find((m) => m.default)?.dir || models[0]?.dir || "";
 
   const run = async () => {
-    if (busy || !selectedDir) return;
-    setBusy(true);
+    if (running || !selectedDir) return;
     setError("");
     setResult(null);
     try {
       const res = await api.exportModel(selectedDir, name || "kuro-neko");
-      setResult(res.gguf);
-      toast.success(`GGUF generated: ${res.gguf}`);
+      setOpId(res.opId);
     } catch (e) {
       setError(e instanceof Error ? e.message : "unknown");
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -80,9 +93,10 @@ export function ExportView() {
             <Input type="text" value={name} onChange={(e) => setName(e.target.value)} />
           </Field>
         </div>
-        <Button variant="primary" disabled={busy || !selectedDir} onClick={() => void run()}>
-          {busy ? "Exporting…" : "Export"}
+        <Button variant="primary" disabled={running || !selectedDir} onClick={() => void run()}>
+          {running ? "Exporting…" : "Export"}
         </Button>
+        {op && running ? <OpProgress op={op} onCancel={() => cancelOp(op.id)} /> : null}
         <p className="text-xs text-rose-400 mt-3">{error}</p>
         {result ? <ExportResult gguf={result} /> : null}
       </div>

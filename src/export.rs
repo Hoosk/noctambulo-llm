@@ -137,12 +137,40 @@ pub struct NamedTensor {
     pub data: Vec<f32>,
 }
 
+/// Writer closure for one GGUF metadata key/value pair.
+type GgufKvWriter<'a> = Box<dyn Fn(&mut BufWriter<File>) -> std::io::Result<u64> + 'a>;
+
+/// CLI entry point: exports with no progress reporting and no cancellation.
+pub fn export_to_gguf_cli<B: Backend>(
+    model: &Llm<B>,
+    config: &ModelConfig,
+    tokenizer_path: &str,
+    model_name: &str,
+    output_dir: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    export_to_gguf(
+        model,
+        config,
+        tokenizer_path,
+        model_name,
+        output_dir,
+        &|_, _, _, _| {},
+        &|| false,
+    )
+}
+
+/// Serialize the model to GGUF v3. `progress(phase, done, total, unit)`
+/// reports extraction/writing stages; `cancelled()` is polled between tensors
+/// and aborts leaving the partial file behind for inspection/removal.
+#[allow(clippy::too_many_arguments)]
 pub fn export_to_gguf<B: Backend>(
     model: &Llm<B>,
     config: &ModelConfig,
     tokenizer_path: &str,
     model_name: &str,
     output_dir: &str,
+    progress: &dyn Fn(&str, u64, u64, &str),
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(output_dir)?;
     let gguf_path = format!("{}/{}.gguf", output_dir, model_name);
@@ -173,6 +201,7 @@ pub fn export_to_gguf<B: Backend>(
     // 2. Transformer Blocks
     let raw_hidden = (8 * config.n_embd) / 3;
     let hidden_dim = raw_hidden.div_ceil(256) * 256;
+    progress("extracting tensors", 0, config.n_layer as u64, "layers");
 
     for (i, block) in model.blocks.iter().enumerate() {
         let prefix = format!("blk.{}", i);
@@ -292,6 +321,11 @@ pub fn export_to_gguf<B: Backend>(
             dims: vec![hidden_dim as u64, config.n_embd as u64],
             data: transpose_2d(&down, config.n_embd, hidden_dim),
         });
+
+        progress("extracting tensors", (i + 1) as u64, config.n_layer as u64, "layers");
+        if cancelled() {
+            return Err("cancelled by user".into());
+        }
     }
 
     // 3. Final Norm & Tied Output Head
@@ -325,7 +359,7 @@ pub fn export_to_gguf<B: Backend>(
     let types_clone = token_types.clone();
     let merges_clone = vocab_merges.clone();
 
-    let kv_pairs: Vec<(&str, u32, Box<dyn Fn(&mut BufWriter<File>) -> std::io::Result<u64>>)> = vec![
+    let kv_pairs: Vec<(&str, u32, GgufKvWriter<'_>)> = vec![
         ("general.architecture", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "llama")? as u64) })),
         ("general.name", GGUF_TYPE_STRING, Box::new(move |w| { Ok(write_gguf_string(w, model_name)? as u64) })),
         ("llama.context_length", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.n_ctx as u32).to_le_bytes())?; Ok(4) })),
@@ -431,7 +465,13 @@ pub fn export_to_gguf<B: Backend>(
     }
 
     // Write binary tensor data
-    for tensor in &named_tensors {
+    let tensor_total = named_tensors.len() as u64;
+    for (i, tensor) in named_tensors.iter().enumerate() {
+        if cancelled() {
+            drop(w);
+            let _ = std::fs::remove_file(&gguf_path);
+            return Err("cancelled by user".into());
+        }
         let current_file_pos = w.stream_position()?;
         let pad = (ALIGNMENT - (current_file_pos % ALIGNMENT)) % ALIGNMENT;
         if pad > 0 {
@@ -442,6 +482,7 @@ pub fn export_to_gguf<B: Backend>(
         for &val in &tensor.data {
             w.write_all(&val.to_le_bytes())?;
         }
+        progress("writing tensors", (i + 1) as u64, tensor_total, "tensors");
     }
 
     w.flush()?;

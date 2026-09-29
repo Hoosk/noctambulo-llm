@@ -76,3 +76,26 @@ pub(super) fn resolve_model_dir(root: &Path, requested: &str) -> Result<std::pat
     }
     Ok(canonical)
 }
+
+/// Resolve a model directory for mutating operations (rename/delete/files).
+/// Stricter than `resolve_model_dir`: the directory must be an immediate child
+/// of the models root, so routes can never touch nested paths (e.g. `src/` when
+/// the models dir happens to be the working directory).
+pub(super) fn resolve_model_child_dir(root: &Path, requested: &str) -> Result<std::path::PathBuf, ApiError> {
+    let candidate = if is_safe_child_name(requested) {
+        root.join(requested)
+    } else {
+        std::path::PathBuf::from(requested)
+    };
+    let canonical = std::fs::canonicalize(&candidate)
+        .map_err(|_| ApiError::not_found(format!("model dir not found: {requested}")))?;
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+
+    if canonical.parent() != Some(canonical_root.as_path()) {
+        return Err(ApiError::forbidden("model dir is not a direct child of the models directory"));
+    }
+    if !canonical.is_dir() {
+        return Err(ApiError::bad_request("model dir is not a directory"));
+    }
+    Ok(canonical)
+}

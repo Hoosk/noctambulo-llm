@@ -48,7 +48,7 @@ fn parse_device(selector: &str) -> burn::backend::wgpu::WgpuDevice {
         ("VirtualGpu(", WgpuDevice::VirtualGpu as fn(usize) -> WgpuDevice),
     ] {
         if let Some(rest) = s.strip_prefix(prefix) {
-            if let Some(idx) = rest.trim_end_matches(')').parse::<usize>().ok() {
+            if let Ok(idx) = rest.trim_end_matches(')').parse::<usize>() {
                 return mk(idx);
             }
         }
@@ -137,6 +137,9 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
         }
     };
 
+    // Register the run in the persisted history before any thread starts.
+    let run_id = state.runs.begin(&params, &job_id);
+
     let cancel = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     registry.start(JobHandle {
@@ -154,12 +157,14 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
     let forwarder_state = state.clone();
     let forwarder_events = state.events.clone();
     let job_id_fwd = job_id.clone();
+    let run_id_fwd = run_id.clone();
     let forwarder = std::thread::spawn(move || {
         let log_path = {
             std::fs::create_dir_all("logs").ok();
             PathBuf::from("logs").join(format!("train_{}.log", job_id_fwd))
         };
         let mut last_persist: Option<std::time::Instant> = None;
+        let mut last_step: usize = 0;
         while let Ok(event) = rx.recv() {
             {
                 let mut job = forwarder_state.job.write().unwrap();
@@ -188,6 +193,30 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
                 }
                 TrainingEvent::Progress { step, loss, .. } => {
                     forwarder_state.push_loss_point(*step, *loss);
+                    last_step = *step;
+                }
+                TrainingEvent::Val { loss, ppl, .. } => {
+                    forwarder_state.runs.val_point(&run_id_fwd, last_step, *loss, *ppl);
+                    forwarder_state.push_val_point(last_step, *loss);
+                }
+                TrainingEvent::Done { final_loss, .. } => {
+                    forwarder_state.runs.finish(
+                        &run_id_fwd,
+                        "done",
+                        None,
+                        Some(*final_loss),
+                        forwarder_state.loss_points_snapshot(),
+                    );
+                }
+                TrainingEvent::Stopped { reason, .. } => {
+                    let failed = reason.to_lowercase().contains("error");
+                    forwarder_state.runs.finish(
+                        &run_id_fwd,
+                        if failed { "failed" } else { "stopped" },
+                        Some(reason.clone()),
+                        None,
+                        forwarder_state.loss_points_snapshot(),
+                    );
                 }
                 _ => {}
             }
@@ -273,14 +302,29 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
     // Keep handles alive / reap threads lazily.
     let reap_state = worker_state;
     let reap_registry = registry.clone();
+    let run_id_reap = run_id.clone();
     std::thread::spawn(move || {
         let _ = worker.join();
         let _ = forwarder.join();
-        {
+        let unexpected = {
             let mut job = reap_state.job.write().unwrap();
-            if !matches!(job.last_event, Some(TrainingEvent::Done { .. }) | Some(TrainingEvent::Stopped { .. })) {
+            let terminal = matches!(
+                job.last_event,
+                Some(TrainingEvent::Done { .. }) | Some(TrainingEvent::Stopped { .. })
+            );
+            if !terminal {
                 job.message = Some("Worker exited without Done/Stopped event.".into());
             }
+            !terminal
+        };
+        if unexpected {
+            reap_state.runs.finish(
+                &run_id_reap,
+                "failed",
+                Some("worker exited before finishing".into()),
+                None,
+                reap_state.loss_points_snapshot(),
+            );
         }
         reap_registry.clear();
     });

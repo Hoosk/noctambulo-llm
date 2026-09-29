@@ -86,26 +86,38 @@ pub(super) async fn dataset_download(
     if repo_id.is_empty() {
         return Err(ApiError::bad_request("repoId is required"));
     }
-    let filename = req.filename.clone();
+    let filename = if req.filename.trim().is_empty() {
+        default_download_filename()
+    } else {
+        req.filename.clone()
+    };
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        tokio::task::spawn_blocking(move || {
-            crate::data::download_dataset_from_hf(&repo_id, &filename).map_err(|e| e.to_string())
-        }),
-    )
-    .await;
+    // Long downloads run as background operations so the UI can follow byte
+    // progress (and cancel) instead of holding a request open for minutes.
+    let op = state.ops.start("download", &format!("{repo_id} · {filename}"));
+    let op_id = op.id().to_string();
+    tokio::task::spawn_blocking(move || {
+        let progress = |phase: &str, done: u64, total: u64| op.progress(phase, done, total, "bytes");
+        let cancelled = || op.is_cancelled();
+        match crate::data::download_dataset_streaming(&repo_id, &filename, &progress, &cancelled) {
+            Ok(path) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                op.finish(
+                    &format!("Downloaded {name}"),
+                    Some(serde_json::json!({ "path": path.to_string_lossy(), "name": name })),
+                );
+            }
+            Err(e) => {
+                if op.is_cancelled() {
+                    op.cancelled();
+                } else {
+                    op.fail(&e.to_string());
+                }
+            }
+        }
+    });
 
-    match result {
-        Ok(Ok(Ok(path))) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "path": path.to_string_lossy(),
-            "name": path.file_name().unwrap_or_default().to_string_lossy(),
-        }))),
-        Ok(Ok(Err(e))) => Err(ApiError::internal(e)),
-        Ok(Err(e)) => Err(ApiError::internal(format!("download task failed: {e}"))),
-        Err(_) => Err(ApiError::gateway_timeout("download timed out")),
-    }
+    Ok(Json(serde_json::json!({ "opId": op_id, "status": "started" })))
 }
 
 #[derive(Deserialize)]
@@ -327,23 +339,26 @@ pub(super) async fn dataset_combine(
     let max_chars = req.max_chars.unwrap_or(usize::MAX);
     let output_clone = output_path.clone();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(600),
-        tokio::task::spawn_blocking(move || {
-            crate::data::combine_and_mix_weighted(&sources, &output_clone, max_chars)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        }),
-    )
-    .await;
+    // Long mix runs as a background operation with char-level progress.
+    let op = state.ops.start("combine", &format!("{} sources → {}", sources.len(), req.output));
+    let op_id = op.id().to_string();
+    tokio::task::spawn_blocking(move || {
+        let progress = |done: u64, total: u64| op.progress("mixing", done, total, "chars");
+        let cancelled = || op.is_cancelled();
+        match crate::data::combine_and_mix_weighted_with(&sources, &output_clone, max_chars, &progress, &cancelled) {
+            Ok(path) => op.finish(
+                &format!("Mix created: {}", path.display()),
+                Some(serde_json::json!({ "output": path.to_string_lossy() })),
+            ),
+            Err(e) => {
+                if op.is_cancelled() {
+                    op.cancelled();
+                } else {
+                    op.fail(&e.to_string());
+                }
+            }
+        }
+    });
 
-    match result {
-        Ok(Ok(Ok(()))) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "output": output_path.to_string_lossy(),
-        }))),
-        Ok(Ok(Err(e))) => Err(ApiError::internal(e)),
-        Ok(Err(e)) => Err(ApiError::internal(format!("combine task failed: {e}"))),
-        Err(_) => Err(ApiError::gateway_timeout("combine timed out")),
-    }
+    Ok(Json(serde_json::json!({ "opId": op_id, "status": "started" })))
 }

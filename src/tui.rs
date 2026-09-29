@@ -247,6 +247,7 @@ pub fn print_training_header(
     println!();
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn print_training_progress(
     epoch: usize,
     epochs: usize,

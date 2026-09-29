@@ -1,16 +1,10 @@
-import { useEffect, useRef, useState } from "react";
-import { api } from "../../api/client";
+import { useEffect, useRef } from "react";
 import type { JobInfo } from "../../state/jobModel";
-import { LossChart } from "../../components/LossChart";
+import { LineChart, type ChartSeries } from "../../components/LineChart";
 import { Badge, StatCard, type Tone } from "../../components/ui";
 import type { IconName } from "../../components/Icon";
 import { fmtDur } from "../../lib/format";
 import { useAppState } from "../../state/appContext";
-
-interface LogEntry {
-  id: number;
-  text: string;
-}
 
 interface BadgeInfo {
   tone: Tone;
@@ -100,39 +94,15 @@ function PreviewPane({ text }: { text: string }) {
 }
 
 function LogPanel() {
-  const [lines, setLines] = useState<LogEntry[]>([]);
-  const since = useRef(0);
+  const { job } = useAppState();
   const nodeRef = useRef<HTMLPreElement | null>(null);
 
-  // Worker log tail: incremental fetch with a server-side cursor.
-  useEffect(() => {
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const res = await api.getLogs(since.current);
-        if (cancelled || !Array.isArray(res.lines) || res.lines.length === 0) return;
-        const firstId = res.total - res.lines.length;
-        since.current = res.total;
-        setLines((prev) => {
-          const next = [...prev, ...res.lines.map((l, i) => ({ id: firstId + i, text: l.line }))];
-          return next.length > 800 ? next.slice(next.length - 800) : next;
-        });
-      } catch {
-        /* ignore transient errors */
-      }
-    };
-    void tick();
-    const timer = window.setInterval(() => void tick(), 1000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-
+  // Lines arrive live over SSE (plus backfill on reconnect), so the panel only
+  // needs to keep itself scrolled to the bottom.
   useEffect(() => {
     const node = nodeRef.current;
     if (node) node.scrollTop = node.scrollHeight;
-  }, [lines]);
+  }, [job.logs]);
 
   return (
     <details className="mt-5 group" open>
@@ -143,7 +113,7 @@ function LogPanel() {
         ref={nodeRef}
         className="mt-2 p-3 rounded-xl bg-black/40 border border-slate-800/70 text-[11px] font-mono leading-relaxed whitespace-pre-wrap h-44 overflow-y-auto"
       >
-        {lines.map((entry) => (
+        {job.logs.map((entry) => (
           <span key={entry.id} className={`block ${lineClass(entry.text)}`}>
             {entry.text}
           </span>
@@ -151,6 +121,16 @@ function LogPanel() {
       </pre>
     </details>
   );
+}
+
+function lossSeries(job: JobInfo): ChartSeries[] {
+  const series: ChartSeries[] = [
+    { label: "train loss", points: job.lossPoints, color: "#8b5cf6" },
+  ];
+  if (job.valPoints.length > 0) {
+    series.push({ label: "val loss", points: job.valPoints, color: "#f59e0b", dashed: true });
+  }
+  return series;
 }
 
 export function TrainMetrics() {
@@ -166,7 +146,7 @@ export function TrainMetrics() {
         </Badge>
       </div>
       <StatsGrid job={job} />
-      <LossChart points={job.lossPoints} />
+      <LineChart series={lossSeries(job)} />
       <ProgressBar job={job} />
       <PreviewPane text={job.preview} />
       <LogPanel />
