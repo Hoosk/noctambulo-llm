@@ -1,103 +1,103 @@
-# 📦 Kuro-Neko — Exportación GGUF v3 (`export`)
+# 📦 Kuro-Neko — GGUF v3 Export (`export`)
 
-El subcomando `export` convierte los pesos del modelo guardados en el directorio `model_output/` junto con la información del tokenizador BPE a un archivo binario único en formato **GGUF v3**.
+The `export` subcommand converts the model weights saved in the `model_output/` directory together with the BPE tokenizer information into a single binary file in **GGUF v3** format.
 
-GGUF (GGML Unified Format) es el estándar universal adoptado por la comunidad para empaquetar modelos de lenguaje e hiperparámetros de arquitectura en un solo archivo binario de alto rendimiento, optimizado para inferencia en CPU y GPU.
+GGUF (GGML Unified Format) is the universal standard adopted by the community to package language models and architecture hyperparameters into a single high-performance binary file, optimized for CPU and GPU inference.
 
 ---
 
-## ⚙️ Tabla Completa de Parámetros CLI
+## ⚙️ Complete CLI Parameters Table
 
-| Flag | Tipo | Valor por Defecto | Descripción Detallada |
+| Flag | Type | Default Value | Detailed Description |
 | :--- | :--- | :--- | :--- |
-| `--model-name <name>` | `String` | `kuro-neko-qwen` | Nombre base del modelo binario exportado. Define el nombre del archivo resultante dentro del directorio de salida. |
+| `--model-name <name>` | `String` | `kuro-neko-qwen` | Base name of the exported binary model. Defines the name of the resulting file inside the output directory. |
 
 ---
 
-## 🛠️ El Formato Binario GGUF v3
+## 🛠️ The GGUF v3 Binary Format
 
-El formato **GGUF v3** está diseñado para permitir una lectura secuencial rápida y asignación de memoria mapeada (`mmap`):
+The **GGUF v3** format is designed to allow fast sequential reading and memory-mapped (`mmap`) allocation:
 
-1. **Cabecera Magic de 4 Bytes**: Contiene el número mágico `0x46554747` (`GGUF` en ASCII).
-2. **Versión de Formato**: Entero de 32 bits con valor `3`.
-3. **Contador de Tensores y Pares KV**: Declara cuántos tensores de pesos y cuántos pares clave-valor de metadatos contiene el archivo.
-4. **Metadatos KV Estruturados**: Claves tipo cadena con valores tipados (enteros, flotantes, arreglos de cadenas).
-5. **Alineación Directa de Tensores**: La sección de datos binarios de los tensores comienza inmediatamente después de la cabecera de metadatos, alineada a bloques estrictos.
+1. **4-Byte Magic Header**: Contains the magic number `0x46554747` (`GGUF` in ASCII).
+2. **Format Version**: 32-bit integer with value `3`.
+3. **Tensor and KV Pair Counter**: Declares how many weight tensors and how many key-value metadata pairs the file contains.
+4. **Structured KV Metadata**: String keys with typed values (integers, floats, arrays of strings).
+5. **Direct Tensor Alignment**: The binary data section of the tensors begins immediately after the metadata header, aligned to strict blocks.
 
 ---
 
-## 📐 Alineación de Tensores a 32 Bytes (`general.alignment`)
+## 📐 Tensor Alignment to 32 Bytes (`general.alignment`)
 
-Kuro-Neko escribe la clave de metadatos especial:
+Kuro-Neko writes the special metadata key:
 $$\text{general.alignment} = 32$$
 
-- **Beneficio**: Garantiza que el desplazamiento (*offset*) de byte de inicio de cada tensor dentro del binario sea un múltiplo exacto de 32.
-- **Rendimiento GPU**: Esta alineación es un requisito indispensable para la aceleración SIMD en CPU (AVX-512, ARM Neon) y para la carga directa en memoria GPU sin re-alineación previa en memoria principal.
+- **Benefit**: Guarantees that the byte start offset of each tensor inside the binary is an exact multiple of 32.
+- **GPU Performance**: This alignment is an indispensable requirement for SIMD acceleration on CPU (AVX-512, ARM Neon) and for direct loading into GPU memory without prior re-alignment in main memory.
 
 ---
 
-## 🏛️ Metadatos de Arquitectura Mapeados
+## 🏛️ Mapped Architecture Metadata
 
-Durante la exportación, Kuro-Neko mapea la configuración interna `ModelConfig` a las claves universales de la arquitectura `"llama"` en GGUF para garantizar máxima compatibilidad con runtime externos:
+During export, Kuro-Neko maps the internal `ModelConfig` configuration to the universal `"llama"` architecture keys in GGUF to guarantee maximum compatibility with external runtimes:
 
-| Clave GGUF KV | Valor / Origen en Kuro-Neko | Descripción |
+| GGUF KV Key | Value / Source in Kuro-Neko | Description |
 | :--- | :--- | :--- |
-| `general.architecture` | `"llama"` | Tipo de arquitectura base reconocida universalmente. |
-| `general.name` | `<model-name>` | Nombre del modelo exportado. |
-| `general.alignment` | `32` | Alineación de memoria en bytes. |
-| `llama.context_length` | `model_config.n_ctx` | Longitud máxima de ventana de contexto. |
-| `llama.embedding_length` | `model_config.n_embd` | Dimensión de embedding $D$. |
-| `llama.block_count` | `model_config.n_layer` | Número de capas/bloques Transformer. |
-| `llama.attention.head_count` | `model_config.n_head` | Número de cabezas de atención Query. |
-| `llama.attention.head_count_kv` | `model_config.n_kv_head` | Número de cabezas KV para GQA. |
-| `llama.rope.freq_base` | `10000.0` | Base de frecuencia RoPE ($\theta$). |
-| `tokenizer.ggml.model` | `"gpt2"` / `"bpe"` | Tipo de modelo de tokenización. |
-| `tokenizer.ggml.tokens` | `Vec<String>` | Lista de todos los tokens del vocabulario. |
-| `tokenizer.ggml.scores` | `Vec<f32>` | Puntuaciones o log-probabilidades BPE. |
-| `tokenizer.ggml.token_type` | `Vec<i32>` | Tipo de token (Normal, Control, Desconocido). |
+| `general.architecture` | `"llama"` | Base architecture type universally recognized. |
+| `general.name` | `<model-name>` | Name of the exported model. |
+| `general.alignment` | `32` | Memory alignment in bytes. |
+| `llama.context_length` | `model_config.n_ctx` | Maximum context window length. |
+| `llama.embedding_length` | `model_config.n_embd` | Embedding dimension $D$. |
+| `llama.block_count` | `model_config.n_layer` | Number of Transformer layers/blocks. |
+| `llama.attention.head_count` | `model_config.n_head` | Number of Query attention heads. |
+| `llama.attention.head_count_kv` | `model_config.n_kv_head` | Number of KV heads for GQA. |
+| `llama.rope.freq_base` | `10000.0` | RoPE frequency base ($\theta$). |
+| `tokenizer.ggml.model` | `"gpt2"` / `"bpe"` | Tokenization model type. |
+| `tokenizer.ggml.tokens` | `Vec<String>` | List of all tokens in the vocabulary. |
+| `tokenizer.ggml.scores` | `Vec<f32>` | BPE scores or log-probabilities. |
+| `tokenizer.ggml.token_type` | `Vec<i32>` | Token type (Normal, Control, Unknown). |
 
 ---
 
-## 🎯 Ubicación del Archivo Exportado
+## 🎯 Location of the Exported File
 
-El binario exportado se guarda automáticamente en la ruta:
+The exported binary is automatically saved at the path:
 ```text
 exported/<model-name>/model.gguf
 ```
-*(O `exported/<model-name>.gguf` según la versión de ejecución).*
+*(Or `exported/<model-name>.gguf` depending on the execution version).*
 
 ---
 
-## 🧩 Compatibilidad de Ecosistema
+## 🧩 Ecosystem Compatibility
 
-Los binarios `.gguf` generados por Kuro-Neko son 100% compatibles con los motores de inferencia más populares del mercado:
+The `.gguf` binaries generated by Kuro-Neko are 100% compatible with the most popular inference engines on the market:
 
-- 🦙 **llama.cpp**: Permite ejecutar inferencia en terminal o servidor HTTP.
-- 💻 **LM Studio**: Permite cargar el modelo mediante la opción *Import local model* y chatear con él de forma visual.
-- 🦙 **Ollama**: Permite crear un `Modelfile` apuntando al binario exportado y desplegarlo como microservicio local.
+- 🦙 **llama.cpp**: Allows running inference in the terminal or an HTTP server.
+- 💻 **LM Studio**: Allows loading the model through the *Import local model* option and chatting with it visually.
+- 🦙 **Ollama**: Allows creating a `Modelfile` pointing to the exported binary and deploying it as a local microservice.
 
 ---
 
-## 💻 Ejemplos de Exportación y Despliegue
+## 💻 Export and Deployment Examples
 
-### 1. Exportar el Modelo
+### 1. Export the Model
 ```bash
 cargo run --release -- export --model-name kuro-neko-v1
 ```
 
-### 2. Ejecutar con llama.cpp
+### 2. Run with llama.cpp
 ```bash
 ./llama-cli -m exported/kuro-neko-v1/model.gguf -p "Once upon a time" -n 100
 ```
 
-### 3. Crear un Modelo en Ollama
-Crea un archivo llamado `Modelfile`:
+### 3. Create a Model in Ollama
+Create a file named `Modelfile`:
 ```dockerfile
 FROM ./exported/kuro-neko-v1/model.gguf
 PARAMETER temperature 0.7
 PARAMETER top_p 0.9
 ```
-Luego ejecuta:
+Then run:
 ```bash
 ollama create kuro-neko -f Modelfile
 ollama run kuro-neko "Once upon a time"

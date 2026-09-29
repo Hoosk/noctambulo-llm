@@ -1,33 +1,33 @@
-# 📱 Post para LinkedIn (`post.md`)
+# 📱 LinkedIn Post (`post.md`)
 
-*Copia y pega este texto directamente en LinkedIn:*
+*Copy and paste this text directly into LinkedIn:*
 
 ---
 
-¿Por qué usar PyTorch y Python cuando puedes construir tu propio motor de LLM desde cero en Rust?
+Why use PyTorch and Python when you can build your own LLM engine from scratch in Rust?
 
-Llevo un tiempo desarrollando Kuro-Neko, un motor de entrenamiento e inferencia de Modelos de Lenguaje creado en Rust puro, acelerado por GPU con Burn 0.21 y WGPU, capaz de exportar directamente a paquetes GGUF v3.
+I have been developing Kuro-Neko for a while, a Language Model training and inference engine built in pure Rust, GPU-accelerated with Burn 0.21 and WGPU, capable of exporting directly to GGUF v3 packages.
 
-Nada de llamar a la API de OpenAI ni de hacer wrappers. Es la implementación matemática completa de la arquitectura Transformer de 2026, escrita línea a línea:
+No calling the OpenAI API and no wrappers. It is the complete mathematical implementation of the 2026 Transformer architecture, written line by line:
 
-Arquitectura de Última Generación:
-- RoPE (Rotary Position Embeddings) para una memoria posicional dinámica y sin tablas fijas.
-- RMSNorm para normalización ultrarrápida sin sesgo.
-- SwiGLU FFN para la capa de avance gating con activación SiLU.
-- Muestreo moderno: Top-K, Top-P Nucleus y Repetition Penalty.
+State-of-the-Art Architecture:
+- RoPE (Rotary Position Embeddings) for dynamic positional memory without fixed tables.
+- RMSNorm for ultra-fast normalization without bias.
+- SwiGLU FFN for the gated feed-forward layer with SiLU activation.
+- Modern sampling: Top-K, Top-P Nucleus and Repetition Penalty.
 
-Los retos reales de ingeniería de sistemas:
-- Tokenización en streaming sin copia de memoria: De 11 a 40 MB/s procesados en paralelo, manteniendo el consumo por debajo de 2.4 GB de RAM.
-- Optimización salvaje de VRAM: De gastar 262 MB por batch pasamos a solo 32 KB por paso (8.000 veces menos asignación en memoria) al sustituir matrices one-hot densas por cálculo esparso de pérdida NLL.
-- Cero cuellos de botella PCIe: Precálculo de frecuencias RoPE directamente en la VRAM de la tarjeta gráfica.
+The real systems engineering challenges:
+- Streaming tokenization without memory copies: From 11 to 40 MB/s processed in parallel, keeping consumption below 2.4 GB of RAM.
+- Wild VRAM optimization: From spending 262 MB per batch we went to only 32 KB per step (8,000 times less memory allocation) by replacing dense one-hot matrices with sparse NLL loss computation.
+- Zero PCIe bottlenecks: Precomputation of RoPE frequencies directly in the graphics card's VRAM.
 
-Exportación nativa a GGUF v3:
-Programé un serializador binario nativo que empaqueta los tensores alineados a 32 bytes con la cabecera LLaMA y el diccionario BPE embebido. Para resolver el choque de diseño entre la rotación RoPE por mitades (estilo Hugging Face/Python) y la rotación intercalada (estilo llama.cpp/C++), implementé la función de permutación de pesos oficial en Rust.
+Native export to GGUF v3:
+I programmed a native binary serializer that packs the tensors aligned to 32 bytes with the LLaMA header and the embedded BPE dictionary. To resolve the design clash between half-split RoPE rotation (Hugging Face/Python style) and interleaved rotation (llama.cpp/C++ style), I implemented the official weight permutation function in Rust.
 
-¿El resultado? El modelo se ejecuta de forma nativa en llama.cpp procesando prompts a 2.600 tokens/s y generando texto a 200 tokens/s, además de abrirse directamente en LM Studio u Ollama sin configurar nada.
+The result? The model runs natively in llama.cpp processing prompts at 2,600 tokens/s and generating text at 200 tokens/s, besides opening directly in LM Studio or Ollama without configuring anything.
 
-Picar un LLM "desde el metal" te enseña sobre atención, memoria de GPU e ingeniería de sistemas más que años consumiendo APIs de terceros.
+Hacking an LLM "from the metal" teaches you about attention, GPU memory and systems engineering more than years of consuming third-party APIs.
 
-¡Todo el código y la documentación están disponibles en el repositorio!
+All the code and documentation are available in the repository!
 
 #Rust #ArtificialIntelligence #MachineLearning #DeepLearning #LLM #GGUF #LlamaCPP #SystemsEngineering #HuggingFace

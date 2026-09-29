@@ -1,100 +1,133 @@
-# 🐈‍⬛ Kuro-Neko — Diccionario de Parámetros de la Línea de Comandos (CLI)
+# 🐈‍⬛ Kuro-Neko — Command-Line Interface (CLI) Parameters Dictionary
 
-Este archivo contiene el diccionario de todos los parámetros aceptados por los diferentes subcomandos de la CLI de **Kuro-Neko**.
-
----
-
-## 🏋️ 1. Parámetros del Subcomando `train`
-Ejecuta el pipeline de entrenamiento de la red neuronal en la GPU usando WGPU.
-
-| Parámetro | Tipo | Por Defecto | Descripción Técnica / Función |
-| :--- | :--- | :--- | :--- |
-| `--dataset` | `Vec<String>` | `[]` | ID de dataset(s) en Hugging Face Hub (separados por comas, ej. `roneneldan/TinyStories`). |
-| `--file` | `Option<String>`| `None` | Ruta a un archivo de texto plano local o binario (`.bin`) para entrenar. |
-| `--dataset-file` | `String` | `"TinyStories-train.txt"` | Nombre del archivo objetivo dentro del repositorio del dataset de HF. |
-| `--preset` | `Option<String>` | `None` | Preset de arquitectura: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M). Los flags explícitos tienen prioridad. |
-| `--dtype` | `String` | `"f32"` | Precisión de cómputo: `f32` o `f16`. `bf16` no está soportado por el backend WGPU/WGSL (error explícito). Los records se guardan siempre en f32. |
-| `--batch-size` | `usize` | `128` | Tamaño del lote (batch size) a procesar en la GPU antes de la actualización de pesos. |
-| `--epochs` | `usize` | `3` | Número de pasadas completas a través del conjunto de datos. Con `--resume`, épocas **adicionales**. |
-| `--max-tokens` | `usize` | `100000000` | Límite máximo de tokens a cargar desde el corpus. Un valor de `0` entrena con el archivo completo. La referencia Chinchilla es ~20 tokens/parámetro. |
-| `--step` | `Option<usize>`| `None` | Desplazamiento de la ventana deslizante (sliding window step). Si es menor que `n_ctx` genera solapamiento (overlap). `None` equivale a `n_ctx`. |
-| `--n-ctx` | `Option<usize>` | `None` → preset/`256` | Longitud máxima de la ventana de contexto del modelo en tokens. |
-| `--n-embd` | `Option<usize>` | `None` → preset/`256` | Dimensión de embedding y estados ocultos. Debe ser divisible entre `n-head`. |
-| `--n-head` | `Option<usize>` | `None` → preset/`4` | Cantidad de cabezas de atención Query ($Q$). |
-| `--n-kv-head` | `Option<usize>`| `None` | Cantidad de cabezas Key/Value ($K, V$). Activa GQA si es menor que `n-head`. `None` o `0` activa MHA estándar. Si hay preset, usa su valor. |
-| `--n-layer` | `Option<usize>` | `None` → preset/`4` | Número de bloques Transformer apilados. |
-| `--lr` | `f64` | `0.0003` | Tasa de aprendizaje máxima (peak learning rate) para AdamW. |
-| `--dropout` | `f64` | `0.1` | Probabilidad de desactivación de neuronas para la regularización de la atención y MLP. |
-| `--attn-softcap` | `f32` | `0.0` | Umbral para acotamiento suave de puntuaciones de atención mediante $\tanh$. `0.0` lo desactiva. |
-| `--val-split` | `f32` | `0.1` | Porcentaje del dataset reservado para validación y cálculo de perplejidad ($\text{PPL} = e^{\text{loss}}$). |
-| `--grad-accum` | `usize` | `1` | Pasos de acumulación de gradientes antes de ejecutar el paso de AdamW. |
-| `--save-dir` | `Option<String>`| `None` | Directorio para guardar checkpoints automáticos del modelo al final de cada época. |
-| `--resume` | `Option<String>`| `None` | Ruta a un archivo de checkpoint o pesos previos para reanudar el entrenamiento. |
-| `--seq-warmup-steps` | `usize` | `0` | Pasos iniciales para **Progressive Sequence Scaling** (hace crecer la ventana de contexto desde $N/4$ hasta $N$). `0` lo desactiva. |
-| `--early-stop-patience` | `usize` | `0` | Detiene el entrenamiento tras $N$ épocas sin mejora de `val_loss`. `0` lo desactiva. |
+This file contains the dictionary of all parameters accepted by the different subcommands of the **Kuro-Neko** CLI.
 
 ---
 
-## ⚡ 2. Parámetros del Subcomando `prepare-dataset`
-Pre-tokeniza un corpus de texto plano o dataset de HF a un formato binario ultracompacto `.bin` con cabecera de metadatos `KNKB`.
+## 🏋️ 1. `train` Subcommand Parameters
+Runs the neural network training pipeline on the GPU using WGPU.
 
-| Parámetro | Tipo | Por Defecto | Descripción Técnica / Función |
+| Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
-| `--dataset` | `Vec<String>` | `[]` | ID de dataset(s) de HF a descargar y pre-tokenizar. |
-| `--file` | `Option<String>`| `None` | Ruta al archivo de texto local a convertir. |
-| `--dataset-file`| `String` | `"TinyStories-train.txt"` | Nombre del archivo dentro del repo de HF. |
-| `--output` | `String` | `"datasets/dataset.bin"` | Ruta del archivo binario de salida resultante (`.bin`). |
-| `--max-tokens` | `usize` | `0` | Límite máximo de tokens a guardar (`0` = sin límite). |
+| `--dataset` | `Vec<String>` | `[]` | Dataset ID(s) on Hugging Face Hub (comma-separated, e.g. `roneneldan/TinyStories`). |
+| `--file` | `Option<String>`| `None` | Path to a local plain-text or binary (`.bin`) file to train on. |
+| `--dataset-file` | `String` | `"TinyStories-train.txt"` | Target file name inside the HF dataset repository. |
+| `--preset` | `Option<String>` | `None` | Architecture preset: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M). Explicit flags take precedence. |
+| `--dtype` | `String` | `"f32"` | Compute precision: `f32` or `f16`. `bf16` is not supported by the WGPU/WGSL backend (explicit error). Records are always stored in f32. |
+| `--batch-size` | `usize` | `128` | Batch size to process on the GPU before the weight update. |
+| `--epochs` | `usize` | `3` | Number of complete passes through the dataset. With `--resume`, **additional** epochs. |
+| `--max-tokens` | `usize` | `100000000` | Maximum number of tokens to load from the corpus. A value of `0` trains on the full file. The Chinchilla reference is ~20 tokens/parameter. |
+| `--step` | `Option<usize>`| `None` | Sliding window step. If it is smaller than `n_ctx` it generates overlap. `None` is equivalent to `n_ctx`. |
+| `--n-ctx` | `Option<usize>` | `None` → preset/`256` | Maximum length of the model's context window in tokens. |
+| `--n-embd` | `Option<usize>` | `None` → preset/`256` | Embedding dimension and hidden states. Must be divisible by `n-head`. |
+| `--n-head` | `Option<usize>` | `None` → preset/`4` | Number of Query attention heads ($Q$). |
+| `--n-kv-head` | `Option<usize>`| `None` | Number of Key/Value heads ($K, V$). Enables GQA if it is smaller than `n-head`. `None` or `0` enables standard MHA. If there is a preset, it uses its value. |
+| `--n-layer` | `Option<usize>` | `None` → preset/`4` | Number of stacked Transformer blocks. |
+| `--lr` | `f64` | `0.0003` | Maximum learning rate (peak learning rate) for AdamW. |
+| `--dropout` | `f64` | `0.1` | Neuron dropout probability for attention and MLP regularization. |
+| `--attn-softcap` | `f32` | `0.0` | Threshold for soft-capping attention scores via $\tanh$. `0.0` disables it. |
+| `--val-split` | `f32` | `0.1` | Percentage of the dataset reserved for validation and perplexity computation ($\text{PPL} = e^{\text{loss}}$). |
+| `--grad-accum` | `usize` | `1` | Gradient accumulation steps before running the AdamW step. |
+| `--save-dir` | `Option<String>`| `None` | Directory to save automatic model checkpoints at the end of each epoch. |
+| `--resume` | `Option<String>`| `None` | Path to a checkpoint file or previous weights to resume training from. |
+| `--seq-warmup-steps` | `usize` | `0` | Initial steps for **Progressive Sequence Scaling** (grows the context window from $N/4$ to $N$). `0` disables it. |
+| `--early-stop-patience` | `usize` | `0` | Stops training after $N$ epochs without `val_loss` improvement. `0` disables it. |
 
 ---
 
-## 📊 3. Parámetros del Subcomando `eval`
-Evalúa la pérdida de entropía cruzada, la perplejidad ($PPL$) y los bits por byte (BPB) de un modelo guardado sobre un dataset.
+## ⚡ 2. `prepare-dataset` Subcommand Parameters
+Pre-tokenizes a plain-text corpus or HF dataset to an ultra-compact binary `.bin` format with a `KNKB` metadata header.
 
-| Parámetro | Tipo | Por Defecto | Descripción Técnica / Función |
+| Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
-| `--model-dir` | `String` | `"model_output"` | Directorio que contiene `config.json` y `model_weights.bin`. |
-| `--dataset` | `Vec<String>` | `[]` | ID de dataset(s) de HF para evaluar. |
-| `--file` | `Option<String>`| `None` | Ruta al archivo de texto o binario `.bin` de evaluación. |
-| `--dataset-file`| `String` | `"TinyStories-train.txt"` | Nombre del archivo objetivo en HF. |
-| `--n-ctx` | `Option<usize>`| `None` | Sobrescribe la ventana de contexto para la evaluación. |
-| `--eval-batch-size` | `usize` | `16` | Batch de evaluación (bájalo si hay OOM en GPUs pequeñas). |
-| `--eval-batches` | `usize` | `0` | Máximo de batches a evaluar (`0` = todos). Antes había un límite fijo de 100. El BPB no está disponible para datasets `.bin` (no conocen su tamaño en bytes). |
+| `--dataset` | `Vec<String>` | `[]` | HF dataset ID(s) to download and pre-tokenize. |
+| `--file` | `Vec<String>` | `[]` | Path to the local text file(s) to convert. |
+| `--dataset-file`| `String` | `"TinyStories-train.txt"` | File name inside the HF repo. |
+| `--output` | `String` | `"datasets/dataset.bin"` | Path of the resulting output binary file (`.bin`). |
+| `--max-tokens` | `usize` | `0` | Maximum number of tokens to save (`0` = no limit). |
+| `--weights` | `Option<String>` | `None` | Mix weights per source (comma-separated, same order as `--dataset`/`--file`). When set, sources are mixed probabilistically by these proportions. |
+| `--max-chars` | `usize` | `0` | Maximum characters to write for weighted mixing (`0` = all available). |
 
 ---
 
-## 🔤 4. Parámetros del Subcomando `train-tokenizer`
-Entrena un tokenizador BPE a nivel de bytes en base a un corpus de texto.
+## 📊 3. `eval` Subcommand Parameters
+Evaluates the cross-entropy loss, perplexity ($PPL$) and bits per byte (BPB) of a saved model over a dataset.
 
-| Parámetro | Tipo | Por Defecto | Descripción Técnica / Función |
+| Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
-| `--dataset` | `Vec<String>` | `[]` | ID de dataset(s) de HF a descargar para usarse como corpus base. |
-| `--file` | `Option<String>`| `None` | Ruta a un archivo de texto local para entrenar el vocabulario. |
-| `--dataset-file`| `String` | `"TinyStories-train.txt"` | Nombre del archivo a extraer del dataset de HF. |
-| `--vocab-size` | `usize` | `8000` | Tamaño total de la tabla de vocabulario resultante del tokenizador. |
+| `--model-dir` | `String` | `"model_output"` | Directory containing `config.json` and `model_weights.bin`. |
+| `--dataset` | `Vec<String>` | `[]` | HF dataset ID(s) to evaluate. |
+| `--file` | `Option<String>`| `None` | Path to the evaluation text or `.bin` file. |
+| `--dataset-file`| `String` | `"TinyStories-train.txt"` | Target file name in HF. |
+| `--n-ctx` | `Option<usize>`| `None` | Overrides the context window for evaluation. |
+| `--eval-batch-size` | `usize` | `16` | Evaluation batch (lower it if there is OOM on small GPUs). |
+| `--eval-batches` | `usize` | `0` | Maximum number of batches to evaluate (`0` = all). There used to be a fixed limit of 100. BPB is not available for `.bin` datasets (they do not know their size in bytes). |
 
 ---
 
-## 🔮 5. Parámetros del Subcomando `generate`
-Realiza inferencia autorregresiva de texto usando el modelo cargado en `model_output/`.
+## 🔤 4. `train-tokenizer` Subcommand Parameters
+Trains a byte-level BPE tokenizer based on a text corpus.
 
-| Parámetro | Tipo | Por Defecto | Descripción Técnica / Función |
+| Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
-| `<prompt>` | `String` | *Requerido* | Texto semilla inicial a partir del cual el modelo continuará la generación. |
-| `--temp` | `f32` | `0.9` | Temperatura de muestreo. Controla la aleatoriedad de la predicción. |
-| `--top-k` | `usize` | `60` | Muestreo Top-K. Limita la selección a los $K$ tokens más probables. |
-| `--top-p` | `f32` | `0.9` | Muestreo Top-P (Nucleus Sampling). Limita la selección a tokens cuya probabilidad acumulada alcanza $P$. |
-| `--min-p` | `f32` | `0.1` | Muestreo Min-P. Excluye tokens con probabilidad menor a $\text{min\_p} \times P_{\max}$. |
-| `--rep-penalty` | `f32` | `1.6` | Penalización por repetición. Desincentiva tokens repetidos dividiendo sus logits. |
-| `--max-tokens` | `usize` | `50` | Cantidad máxima de nuevos tokens a generar. |
-| `--seed` | `Option<u64>` | `None` | Semilla aleatoria del generador Xorshift para reproducibilidad. |
+| `--dataset` | `Vec<String>` | `[]` | HF dataset ID(s) to download and use as the base corpus. |
+| `--file` | `Vec<String>` | `[]` | Path to a local text file(s) for training the vocabulary. |
+| `--dataset-file`| `String` | `"TinyStories-train.txt"` | Name of the file to extract from the HF dataset. |
+| `--vocab-size` | `usize` | `8000` | Total size of the resulting tokenizer vocabulary table. |
+| `--weights` | `Option<String>` | `None` | Mix weights per source (comma-separated, same order as `--file`). When set, sources are mixed probabilistically by these proportions. |
+| `--max-chars` | `usize` | `0` | Maximum characters of mixed corpus to train the tokenizer on (`0` = all available). |
 
 ---
 
-## 📦 6. Parámetros del Subcomando `export`
-Exporta los pesos a formato binario GGUF v3 para inferencia externa.
+## 🔮 5. `generate` Subcommand Parameters
+Performs autoregressive text inference using the model loaded from `model_output/`.
 
-| Parámetro | Tipo | Por Defecto | Descripción Técnica / Función |
+| Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
-| `--model-name` | `String` | `"kuro-neko-qwen"` | Nombre base del archivo `.gguf` que se guardará en `exported/`. |
+| `<prompt>` | `String` | *Required* | Initial seed text from which the model will continue the generation. |
+| `--temp` | `f32` | `0.9` | Sampling temperature. Controls the randomness of the prediction. |
+| `--top-k` | `usize` | `60` | Top-K sampling. Limits the selection to the $K$ most probable tokens. |
+| `--top-p` | `f32` | `0.9` | Top-P sampling (Nucleus Sampling). Limits the selection to tokens whose cumulative probability reaches $P$. |
+| `--min-p` | `f32` | `0.1` | Min-P sampling. Excludes tokens with probability lower than $\text{min\_p} \times P_{\max}$. |
+| `--rep-penalty` | `f32` | `1.6` | Repetition penalty. Discourages repeated tokens by dividing their logits. |
+| `--max-tokens` | `usize` | `50` | Maximum number of new tokens to generate. |
+| `--seed` | `Option<u64>` | `None` | Random seed of the Xorshift generator for reproducibility. |
+
+---
+
+## 📦 6. `export` Subcommand Parameters
+Exports weights to GGUF v3 binary format for external inference.
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `--model-name` | `String` | `"kuro-neko-qwen"` | Base name of the `.gguf` file that will be saved in `exported/`. |
+
+---
+
+## ⬇️ 7. `download` Subcommand Parameters
+Downloads a dataset file from Hugging Face Hub; Parquet files are automatically text-extracted.
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `--repo` | `String` | *Required* | HF dataset repo ID (e.g. `HuggingFaceTB/cosmopedia-100k`). |
+| `--file` | `String` | *Required* | File name inside the repo (e.g. `data/train-00000-of-00001.parquet`). |
+| `--out-dir` | `String` | `"datasets"` | Output directory for the downloaded file. |
+| `--extract-text` | `bool` (flag) | `true` | Extract the text column to `.txt` when the file is Parquet. |
+
+---
+
+## 📈 8. `stats` Subcommand Parameters
+Prints the model parameter count, VRAM footprint, and FLOPs statistics. It takes no parameters.
+
+---
+
+## 🌐 9. `serve` Subcommand Parameters
+Serves the web console (React build in `web/dist`) and the JSON/SSE API to control training, generation, and export from the browser.
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `--bind` | `String` | `"127.0.0.1:8080"` | Address and port to bind (e.g. `0.0.0.0:8080` for remote access). |
+| `--token` | `Option<String>` | `None` | API token required in the `X-API-Token` header (also accepted as a login cookie). If omitted, the server runs without authentication: only use it on a trusted local network. |
+| `--datasets-dir` | `String` | `"datasets"` | Directory containing datasets to list/train on. |
+| `--models-dir` | `String` | `"model_output"` | Directory containing model outputs and checkpoints. |
 

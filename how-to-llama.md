@@ -1,61 +1,61 @@
-# 🦙 La Aventura de Hacer Funcionar Kuro-Neko en `llama.cpp` (`how-to-llama.md`)
+# 🦙 The Adventure of Making Kuro-Neko Work in `llama.cpp` (`how-to-llama.md`)
 
-Este documento relata el proceso técnico, los obstáculos superados y las especificaciones exactas del estándar **GGUF v3** necesarias para lograr que un modelo entrenado desde cero en Rust con **Burn 0.21** se ejecute de forma nativa en **`llama.cpp`** (`llama-cli`) y **LM Studio** a **200 tokens/segundo**.
-
----
-
-## 🎯 El Objetivo
-
-Lograr que nuestro motor escrito en Rust (**Kuro-Neko**) exportase su arquitectura moderna de 2026 (RoPE, RMSNorm, SwiGLU) en un único archivo binario `.gguf` que pudiese ser ejecutado directamente por la herramienta estándar de la industria: **`llama.cpp`**.
+This document recounts the technical process, the obstacles overcome, and the exact specifications of the **GGUF v3** standard required to get a model trained from scratch in Rust with **Burn 0.21** to run natively in **`llama.cpp`** (`llama-cli`) and **LM Studio** at **200 tokens/second**.
 
 ---
 
-## 🏔️ Los Cuatro Obstaculos de la Especificacion GGUF v3
+## 🎯 The Goal
 
-### 1. El Error de Hiperparametros de LLaMA
-- **El Fallo**:
+Getting our engine written in Rust (**Kuro-Neko**) to export its modern 2026 architecture (RoPE, RMSNorm, SwiGLU) into a single binary `.gguf` file that could be executed directly by the industry-standard tool: **`llama.cpp`**.
+
+---
+
+## 🏔️ The Four Obstacles of the GGUF v3 Specification
+
+### 1. The LLaMA Hyperparameter Error
+- **The Failure**:
   ```text
   error loading model hyperparameters: key not found in model: llama.attention.layer_norm_rms_epsilon
   ```
-- **Causa Tecnica**:
-  Al declarar en los metadatos de cabecera `"general.architecture" = "llama"`, el parser de `llama.cpp` valida de forma estricta que existan los hiperparametros especificos de la familia LLaMA.
-- **La Solucion**:
-  En `src/export.rs`, se definio la constante de tipo Float32 `GGUF_TYPE_FLOAT32 = 6` y se añadieron las claves requeridas:
+- **Technical Cause**:
+  When declaring `"general.architecture" = "llama"` in the header metadata, the `llama.cpp` parser strictly validates that the specific hyperparameters of the LLaMA family exist.
+- **The Solution**:
+  In `src/export.rs`, the Float32 type constant `GGUF_TYPE_FLOAT32 = 6` was defined and the required keys were added:
   - `llama.attention.layer_norm_rms_epsilon` (Float32 = `1e-6`)
-  - `llama.feed_forward_length` (UInt32 = $\frac{8}{3} n_{embd}$ alineado a 256)
+  - `llama.feed_forward_length` (UInt32 = $\frac{8}{3} n_{embd}$ aligned to 256)
   - `llama.attention.head_count_kv` (UInt32 = `n_kv_head`)
 
 ---
 
-### 2. El Error de Vocabulario Ausente
-- **El Fallo**:
+### 2. The Missing Vocabulary Error
+- **The Failure**:
   ```text
   error loading model vocabulary: key not found in model: tokenizer.ggml.model
   ```
-- **Causa Tecnica**:
-  `llama.cpp` no depende de archivos JSON externos para leer las palabras; exige que todo el vocabulario del tokenizador este serializado **dentro de la propia cabecera del archivo binario `.gguf`**.
-- **La Solucion**:
-  Se creo la funcion `load_vocab_tokens` en `src/export.rs` para leer los tokens del tokenizador, ordenarlos por ID y escribirlos en los metadatos GGUF usando tipos array (`GGUF_TYPE_ARRAY`):
+- **Technical Cause**:
+  `llama.cpp` does not rely on external JSON files to read the words; it requires the entire tokenizer vocabulary to be serialized **inside the header of the binary `.gguf` file itself**.
+- **The Solution**:
+  The function `load_vocab_tokens` was created in `src/export.rs` to read the tokenizer tokens, sort them by ID, and write them into the GGUF metadata using array types (`GGUF_TYPE_ARRAY`):
   - `tokenizer.ggml.model` = `"llama"`
-  - `tokenizer.ggml.tokens` = Array de strings con los tokens correspondientes al vocabulario.
+  - `tokenizer.ggml.tokens` = Array of strings with the tokens corresponding to the vocabulary.
 
 ---
 
-### 3. Mapeo de Vocabulario Simplificado
-- **Causa Tecnica**:
-  Nuestro tokenizador BPE entrenado en Rust (`tokenizers` crate) produce un vocabulario byte-level compatible con el modelo `gpt2` de `llama.cpp` (pre-tokenizador byte-level, decoder byte-level, normalizador NFKC). Declaramos el modelo de tokenización como `"gpt2"` con pre-tokenizer `"gpt-2"`, lo que evita la necesidad de serializar manualmente merges y scores en metadatos GGUF y garantiza compatibilidad directa y libre de fallos de carga con `llama-cli` y LM Studio.
+### 3. Simplified Vocabulary Mapping
+- **Technical Cause**:
+  Our BPE tokenizer trained in Rust (`tokenizers` crate) produces a byte-level vocabulary compatible with the `gpt2` model of `llama.cpp` (byte-level pre-tokenizer, byte-level decoder, NFKC normalizer). We declare the tokenization model as `"gpt2"` with pre-tokenizer `"gpt-2"`, which avoids the need to manually serialize merges and scores into GGUF metadata and guarantees direct, load-failure-free compatibility with `llama-cli` and LM Studio.
 
 ---
 
-### 4. Permutacion de Pesos RoPE (Hugging Face vs C++ `llama.cpp`)
-- **El Fallo**:
-  El modelo cargaba en `llama.cpp`, pero el texto generado comenzaba a perder coherencia ("gibberish") tras los primeros tokens, mientras que en Rust (`cargo generate`) la historia era 100% clara.
-- **Causa Tecnica**:
-  Existen dos estilos de implementar RoPE (Rotary Position Embeddings):
-  - **Split (Hugging Face / Python / Rust)**: Rota dividir la dimension en dos mitades $[-x_2, x_1]$.
-  - **Interleaved (LLaMA C++ / llama.cpp)**: Rota intercalando dimensiones de dos en dos $[-x_1, x_0, -x_3, x_2]$.
-- **La Solucion Oficial de Hugging Face**:
-  Basandonos en el script oficial de Hugging Face `convert_llama_weights_to_hf.py`, implementamos la funcion `permute_rope_weight` en `src/export.rs` para reordenar las filas de los tensores de $Q$ y $K$ al exportar a `.gguf`:
+### 4. RoPE Weight Permutation (Hugging Face vs C++ `llama.cpp`)
+- **The Failure**:
+  The model loaded in `llama.cpp`, but the generated text began to lose coherence ("gibberish") after the first tokens, while in Rust (`cargo generate`) the story was 100% clear.
+- **Technical Cause**:
+  There are two styles of implementing RoPE (Rotary Position Embeddings):
+  - **Split (Hugging Face / Python / Rust)**: Rotates by splitting the dimension into two halves $[-x_2, x_1]$.
+  - **Interleaved (LLaMA C++ / llama.cpp)**: Rotates by interleaving dimensions two by two $[-x_1, x_0, -x_3, x_2]$.
+- **Hugging Face's Official Solution**:
+  Based on Hugging Face's official script `convert_llama_weights_to_hf.py`, we implemented the function `permute_rope_weight` in `src/export.rs` to reorder the rows of the $Q$ and $K$ tensors when exporting to `.gguf`:
 
 ```rust
 fn permute_rope_weight(data: &[f32], n_head: usize, n_embd: usize) -> Vec<f32> {
@@ -82,15 +82,15 @@ fn permute_rope_weight(data: &[f32], n_head: usize, n_embd: usize) -> Vec<f32> {
 
 ---
 
-## 🏆 El Resultado Final
+## 🏆 The Final Result
 
-Tras aplicar la transposicion de matrices 2D y la permutacion de pesos de RoPE junto con los metadatos GGUF v3 completos, ejecutamos:
+After applying the 2D matrix transposition and the RoPE weight permutation together with the complete GGUF v3 metadata, we ran:
 
 ```bash
 llama-cli -m exported/kuro-neko-2026.gguf -p "There was a little cat named" -n 50
 ```
 
-### Log de Inferencia Real obtenido:
+### Actual Inference Log obtained:
 
 ```text
 build      : b0-
@@ -104,21 +104,21 @@ modalities : text
 [ Prompt: 2603,6 t/s | Generation: 199,8 t/s ]
 ```
 
-- **Compatibilidad**: 100% Nativa en `llama.cpp`, `llama-server` y **LM Studio**.
-- **Procesamiento de Prompt**: **2,603.6 tokens por segundo**.
-- **Velocidad de Generacion**: **199.8 tokens por segundo**.
+- **Compatibility**: 100% Native in `llama.cpp`, `llama-server` and **LM Studio**.
+- **Prompt Processing**: **2,603.6 tokens per second**.
+- **Generation Speed**: **199.8 tokens per second**.
 
 ---
 
-## 🛠️ Tutorial: Como Exportar y Ejecutar en `llama.cpp`
+## 🛠️ Tutorial: How to Export and Run in `llama.cpp`
 
-### Paso 1: Exportar el Paquete
-Desde la raiz de nuestro proyecto en Rust:
+### Step 1: Export the Package
+From the root of our Rust project:
 ```bash
 cargo run --release -- export --model-name mi-modelo-llama
 ```
 
-### Paso 2: Ejecutar con `llama.cpp`
+### Step 2: Run with `llama.cpp`
 ```bash
 llama-cli -m exported/mi-modelo-llama.gguf -p "Once upon a time" -n 100
 ```

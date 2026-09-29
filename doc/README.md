@@ -1,48 +1,48 @@
-# 📖 Kuro-Neko — Documentación
+# 📖 Kuro-Neko — Documentation
 
-Bienvenido a la documentación oficial de **Kuro-Neko** (`kuro-neko-llm`), un motor de entrenamiento e inferencia de Modelos de Lenguaje de Gran Escala (LLM) de arquitectura **Qwen (Qwen2.5 / Qwen3)** desarrollado íntegramente en **Rust** y acelerado por GPU mediante **Burn 0.21** y **WGPU**.
+Welcome to the official documentation of **Kuro-Neko** (`kuro-neko-llm`), a training and inference engine for Large Language Models (LLM) with a **Qwen (Qwen2.5 / Qwen3)** architecture developed entirely in **Rust** and GPU-accelerated through **Burn 0.21** and **WGPU**.
 
-Este conjunto de documentos proporciona una guía detallada sobre la arquitectura del sistema, el uso de la interfaz de línea de comandos (CLI), las estrategias de muestreo de texto, el entrenamiento de tokenizadores y la exportación de modelos al formato estándar **GGUF v3**.
+This set of documents provides a detailed guide on the system architecture, the use of the command-line interface (CLI), text sampling strategies, tokenizer training and model export to the standard **GGUF v3** format.
 
 ---
 
-## 📚 Índice de Documentación
+## 📚 Documentation Index
 
-| Documento | Descripción |
+| Document | Description |
 | :--- | :--- |
-| 🏋️ **[Entrenamiento (train.md)](train.md)** | Manual completo del subcomando `train`. Explicación detallada de los 15 parámetros de configuración, optimizador AdamW, schedule de tasa de aprendizaje coseno con warmup, gradient clipping y ejemplos prácticos. |
-| 🔤 **[Generación e Inferencia (generate.md)](generate.md)** | Guía de uso del subcomando `generate`. Explicación de estrategias de muestreo (Temperature, Top-K, Top-P, Min-P, Repetition Penalty) y funcionamiento de la Caché KV (Prefill & Decode). |
-| 🧩 **[Tokenizador Custom (train-tokenizer.md)](train-tokenizer.md)** | Guía de entrenamiento del tokenizador BPE a nivel de bytes mediante el subcomando `train-tokenizer`, normalización Unicode NFKC y manejo de tokens especiales. |
-| 📦 **[Exportación GGUF v3 (export.md)](export.md)** | Manual de conversión del modelo al formato estándar `GGUF v3` mediante el subcomando `export`, alineación de tensores a 32 bytes e integración con Ollama, LM Studio y llama.cpp. |
-| 📊 **[Estadísticas del Modelo (stats.md)](stats.md)** | Manual del subcomando `stats` para calcular el número total de parámetros, huella de memoria FP32, estimación de FLOPs por token y ahorro de memoria GQA. |
-| 🧠 **[Arquitectura Técnica (architecture.md)](architecture.md)** | Especificación técnica profunda de la arquitectura Qwen Transformer: RoPE ($\theta=10.000$), SwiGLU alineado a 256, GQA, RMSNorm ($\epsilon=10^{-6}$), Tied Embeddings y Attention Softcapping. |
+| 🏋️ **[Training (train.md)](train.md)** | Complete manual of the `train` subcommand. Detailed explanation of the 15 configuration parameters, AdamW optimizer, cosine learning rate schedule with warmup, gradient clipping and practical examples. |
+| 🔤 **[Generation and Inference (generate.md)](generate.md)** | Usage guide for the `generate` subcommand. Explanation of sampling strategies (Temperature, Top-K, Top-P, Min-P, Repetition Penalty) and how the KV Cache works (Prefill & Decode). |
+| 🧩 **[Custom Tokenizer (train-tokenizer.md)](train-tokenizer.md)** | Training guide for the byte-level BPE tokenizer through the `train-tokenizer` subcommand, NFKC Unicode normalization and handling of special tokens. |
+| 📦 **[GGUF v3 Export (export.md)](export.md)** | Manual for converting the model to the standard `GGUF v3` format through the `export` subcommand, 32-byte tensor alignment and integration with Ollama, LM Studio and llama.cpp. |
+| 📊 **[Model Statistics (stats.md)](stats.md)** | Manual of the `stats` subcommand to calculate the total number of parameters, FP32 memory footprint, FLOPs per token estimate and GQA memory savings. |
+| 🧠 **[Technical Architecture (architecture.md)](architecture.md)** | In-depth technical specification of the Qwen Transformer architecture: RoPE ($\theta=10.000$), SwiGLU aligned to 256, GQA, RMSNorm ($\epsilon=10^{-6}$), Tied Embeddings and Attention Softcapping. |
 
 ---
 
-## ⚡ Flujo de Trabajo Rápido (Quickstart)
+## ⚡ Quick Workflow (Quickstart)
 
-El ciclo de vida completo del desarrollo de un modelo en Kuro-Neko consta de los siguientes 5 pasos:
+The complete model development lifecycle in Kuro-Neko consists of the following 5 steps:
 
 ```bash
-# 1. Entrenar un tokenizador BPE custom de 8,000 tokens
+# 1. Train a custom 8,000-token BPE tokenizer
 cargo run --release -- train-tokenizer --dataset roneneldan/TinyStories --vocab-size 8000
 
-# 2. Entrenar el modelo causal Transformer con aceleración GPU (WGPU)
+# 2. Train the causal Transformer model with GPU acceleration (WGPU)
 cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 10000000 --batch-size 128 --epochs 3
 
-# 3. Generar texto autorregresivo desde una semilla
+# 3. Generate autoregressive text from a seed
 cargo run --release -- generate "Once upon a time" --temp 0.7 --top-k 40 --top-p 0.9 --min-p 0.05
 
-# 4. Inspeccionar la arquitectura y consumo de memoria del modelo
+# 4. Inspect the model architecture and memory usage
 cargo run --release -- stats
 
-# 5. Exportar el modelo entrenado a formato GGUF v3 para inferencia externa
+# 5. Export the trained model to GGUF v3 format for external inference
 cargo run --release -- export --model-name kuro-neko-v1
 ```
 
 ---
 
-## 🔗 Referencias Cruzadas
+## 🔗 Cross References
 
-- Para consultar el manual principal del repositorio, revisa el [README.md raíz](../README.md).
-- Si deseas entender la estructura del código fuente, revisa el apartado de módulos en [architecture.md](architecture.md).
+- To check the repository's main manual, see the [root README.md](../README.md).
+- If you want to understand the source code structure, check the modules section in [architecture.md](architecture.md).

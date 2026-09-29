@@ -1,12 +1,12 @@
-# 📊 Kuro-Neko — Estadísticas del Modelo (`stats`)
+# 📊 Kuro-Neko — Model Statistics (`stats`)
 
-El subcomando `stats` proporciona un diagnóstico exhaustivo sobre la arquitectura del modelo, la cantidad exacta de parámetros entrenables, el consumo de memoria en precisión simple FP32, la intensidad computacional estimada en FLOPs por token y la compresión de VRAM lograda mediante **Grouped Query Attention (GQA)**.
+The `stats` subcommand provides a comprehensive diagnosis of the model architecture, the exact number of trainable parameters, the memory consumption in single precision FP32, the estimated computational intensity in FLOPs per token, and the VRAM compression achieved through **Grouped Query Attention (GQA)**.
 
 ---
 
-## ⚙️ Uso del Subcomando
+## ⚙️ Subcommand Usage
 
-El subcomando `stats` **no requiere ningún parámetro** en la línea de comandos:
+The `stats` subcommand **requires no parameters** on the command line:
 
 ```bash
 cargo run --release -- stats
@@ -14,56 +14,56 @@ cargo run --release -- stats
 
 ---
 
-## 📂 Origen de los Datos de Configuración
+## 📂 Source of Configuration Data
 
-Al ejecutarse, el subcomando realiza el siguiente procedimiento:
-1. Busca el archivo de configuración del modelo en `model_output/config.json`.
-2. Si el archivo existe, lee los hiperparámetros del modelo entrenado (`n_embd`, `n_head`, `n_kv_head`, `n_layer`, `vocab_size`, `n_ctx`, `attn_softcap`).
-3. Si el archivo no existe, utiliza los valores por defecto del sistema (`vocab_size=8000`, `n_embd=256`, `n_head=4`, `n_kv_head=4`, `n_layer=4`, `n_ctx=256`).
+When executed, the subcommand performs the following procedure:
+1. It looks for the model configuration file at `model_output/config.json`.
+2. If the file exists, it reads the hyperparameters of the trained model (`n_embd`, `n_head`, `n_kv_head`, `n_layer`, `vocab_size`, `n_ctx`, `attn_softcap`).
+3. If the file does not exist, it uses the system default values (`vocab_size=8000`, `n_embd=256`, `n_head=4`, `n_kv_head=4`, `n_layer=4`, `n_ctx=256`).
 
 ---
 
-## 📐 Métricas Calculadas y Fórmulas Matemáticas
+## 📐 Calculated Metrics and Mathematical Formulas
 
-### 1. Desglose de Parámetros por Bloque Transformer
-Para una dimensión de embedding $D = \text{n\_embd}$, número de capas $L = \text{n\_layer}$, vocabulario $V = \text{vocab\_size}$, cabezas $H = \text{n\_head}$ y cabezas KV $H_{\text{kv}} = \text{n\_kv\_head}$:
+### 1. Parameter Breakdown per Transformer Block
+For an embedding dimension $D = \text{n\_embd}$, number of layers $L = \text{n\_layer}$, vocabulary $V = \text{vocab\_size}$, heads $H = \text{n\_head}$, and KV heads $H_{\text{kv}} = \text{n\_kv\_head}$:
 
-- **Dimensión por Cabeza**: $d_k = D / H$.
-- **Dimensión de Key/Value**: $D_{\text{kv}} = H_{\text{kv}} \times d_k$.
-- **Dimensión Oculta SwiGLU** (Alineada a múltiplos de 256):
+- **Dimension per Head**: $d_k = D / H$.
+- **Key/Value Dimension**: $D_{\text{kv}} = H_{\text{kv}} \times d_k$.
+- **SwiGLU Hidden Dimension** (Aligned to multiples of 256):
   $$D_{\text{hidden}} = \left\lceil \frac{\lfloor 8D / 3 \rfloor}{256} \right\rceil \times 256$$
-- **Parámetros por Capa/Bloque**:
-  - Proyección $Q$ (con bias): $D \times D + D$
-  - Proyecciones $K, V$ (con bias): $2 \times (D \times D_{\text{kv}} + D_{\text{kv}})$
-  - Proyección $O$ (sin bias): $D \times D$
-  - Capas SwiGLU MLP (Gate, Up, Down): $2 \times (D \times D_{\text{hidden}}) + (D_{\text{hidden}} \times D)$
-  - RMSNorms de la capa: $2 \times D$
-- **Total de Parámetros**:
-  $$N_{\text{total}} = (V \times D) + L \times \text{Parámetros\_por\_Bloque} + D_{\text{norm\_final}}$$
+- **Parameters per Layer/Block**:
+  - Projection $Q$ (with bias): $D \times D + D$
+  - Projections $K, V$ (with bias): $2 \times (D \times D_{\text{kv}} + D_{\text{kv}})$
+  - Projection $O$ (without bias): $D \times D$
+  - SwiGLU MLP layers (Gate, Up, Down): $2 \times (D \times D_{\text{hidden}}) + (D_{\text{hidden}} \times D)$
+  - Layer RMSNorms: $2 \times D$
+- **Total Parameters**:
+  $$N_{\text{total}} = (V \times D) + L \times \text{Parameters\_per\_Block} + D_{\text{norm\_final}}$$
 
 ---
 
-### 2. Consumo de Memoria en FP32
-Cada parámetro en precisión flotante de 32 bits (FP32) requiere 4 bytes de almacenamiento:
-$$\text{Memoria FP32 (MB)} = \frac{N_{\text{total}} \times 4}{1024 \times 1024}$$
+### 2. FP32 Memory Consumption
+Each parameter in 32-bit floating point precision (FP32) requires 4 bytes of storage:
+$$\text{FP32 Memory (MB)} = \frac{N_{\text{total}} \times 4}{1024 \times 1024}$$
 
 ---
 
-### 3. Operaciones de Punto Flotante por Token (FLOPs/Token)
-En un pase hacia adelante (*forward pass*) autorregresivo, cada parámetro participa aproximadamente en 2 operaciones de punto flotante (una multiplicación y una adición):
-$$\text{FLOPs por Token} = 2 \times N_{\text{total}}$$
+### 3. Floating Point Operations per Token (FLOPs/Token)
+In an autoregressive forward pass, each parameter participates in approximately 2 floating point operations (one multiplication and one addition):
+$$\text{FLOPs per Token} = 2 \times N_{\text{total}}$$
 
 ---
 
-### 4. Ahorro de Memoria de Caché KV con GQA
-Mide el porcentaje de reducción en el tamaño de los tensores de Clave ($K$) y Valor ($V$) en VRAM gracias al uso de Grouped Query Attention en lugar de Multi-Head Attention convencional:
-$$\text{Ahorro GQA (\%)} = \left(1 - \frac{H_{\text{kv}}}{H}\right) \times 100\%$$
+### 4. KV Cache Memory Savings with GQA
+It measures the percentage reduction in the size of the Key ($K$) and Value ($V$) tensors in VRAM thanks to the use of Grouped Query Attention instead of conventional Multi-Head Attention:
+$$\text{GQA Saving (\%)} = \left(1 - \frac{H_{\text{kv}}}{H}\right) \times 100\%$$
 
 ---
 
-## 🖥️ Ejemplo de Salida del Comando
+## 🖥️ Example Command Output
 
-Al ejecutar `cargo run --release -- stats` con la configuración base, el subcomando genera un informe formateado en consola como el siguiente:
+When running `cargo run --release -- stats` with the base configuration, the subcommand generates a formatted report on the console like the following:
 
 ```text
 ===============================================================================

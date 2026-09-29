@@ -1,79 +1,79 @@
-# 🔤 Kuro-Neko — Entrenamiento del Tokenizador (`train-tokenizer`)
+# 🔤 Kuro-Neko — Tokenizer Training (`train-tokenizer`)
 
-El subcomando `train-tokenizer` permite entrenar un tokenizador **BPE a Nivel de Bytes (Byte-Level Byte-Pair Encoding)** adaptado al vocabulario y dominio específico de tu conjunto de datos de entrenamiento.
+The `train-tokenizer` subcommand allows training a **Byte-Level Byte-Pair Encoding (BPE)** tokenizer adapted to the specific vocabulary and domain of your training dataset.
 
-Al finalizar el entrenamiento, el subcomando guarda el modelo de tokenización en el archivo `custom_tokenizer.json`, el cual es consumido automáticamente por los subcomandos `train`, `generate` y `export`.
+When training finishes, the subcommand saves the tokenization model to the `custom_tokenizer.json` file, which is automatically consumed by the `train`, `generate` and `export` subcommands.
 
 ---
 
-## ⚙️ Tabla Completa de Parámetros CLI
+## ⚙️ Full CLI Parameter Table
 
-| Flag | Tipo | Valor por Defecto | Descripción Detallada |
+| Flag | Type | Default Value | Detailed Description |
 | :--- | :--- | :--- | :--- |
-| `--dataset <repo>` | `Vec<String>` (separados por coma) | `[]` | Identificador(es) del repositorio de Hugging Face (ej. `roneneldan/TinyStories`). Múltiples repositorios pueden combinarse para construir el corpus. |
-| `--file <path>` | `Option<String>` | `None` | Ruta a un archivo de texto local en el sistema para utilizarlo como fuente del corpus de entrenamiento del tokenizador. |
-| `--dataset-file <filename>` | `String` | `TinyStories-train.txt` | Nombre del archivo objetivo a descargar del repositorio de Hugging Face. |
-| `--vocab-size <n>` | `usize` | `8000` | Tamaño total del vocabulario a generar (número total de subpalabras y tokens aprendidos). |
+| `--dataset <repo>` | `Vec<String>` (comma-separated) | `[]` | Hugging Face repository identifier(s) (e.g. `roneneldan/TinyStories`). Multiple repositories can be combined to build the corpus. |
+| `--file <path>` | `Option<String>` | `None` | Path to a local text file on the system to use as the corpus source for tokenizer training. |
+| `--dataset-file <filename>` | `String` | `TinyStories-train.txt` | Name of the target file to download from the Hugging Face repository. |
+| `--vocab-size <n>` | `usize` | `8000` | Total size of the vocabulary to generate (total number of subwords and learned tokens). |
 
 ---
 
-## 🧩 ¿Qué es la Tokenización BPE Byte-Level?
+## 🧩 What Is Byte-Level BPE Tokenization?
 
-El algoritmo **Byte-Level Byte-Pair Encoding (BPE)** opera directamente sobre los bytes UTF-8 sin procesar en lugar de subpalabrasUnicode explícitas:
+The **Byte-Level Byte-Pair Encoding (BPE)** algorithm operates directly on raw UTF-8 bytes instead of explicit Unicode subwords:
 
-1. **Representación Base de 256 Bytes**: Inicialmente, los 256 bytes individuales (`0x00` a `0xFF`) forman la base del vocabulario.
-2. **Fusión Iterativa de Pares Frecuentes**: El algoritmo analiza el corpus de texto y encuentra repetidamente el par de bytes o tokens contiguos más frecuente, fusionándolo en un nuevo token único.
-3. **Cero Tokens Desconocidos (`<unk>`)**: Dado que cualquier carácter o secuencia Unicode en cualquier idioma (incluyendo emojis, símbolos matemáticos o código binario) puede descomponerse en sus bytes UTF-8 constitutivos, un tokenizador Byte-Level **nunca falla ni genera tokens `<unk>`**.
-
----
-
-## 🔠 Normalización Unicode NFKC
-
-Antes de proceder con el cálculo de frecuencias BPE, Kuro-Neko aplica un pipeline de normalización Unicode estricto utilizando el estándar **NFKC (Normalization Form KC - Compatibility Decomposition followed by Canonical Composition)**:
-
-- **Unificación de Caracteres**: Convierte caracteres visualmente similares o variantes de compatibilidad (como ligaduras, superíndices, variantes de ancho completo) a una representación canónica normalizada.
-- **Consistencia en el Modelo**: Asegura que variantes del mismo carácter no consuman múltiples entradas en la tabla de vocabulario de forma redundante.
+1. **256-Byte Base Representation**: Initially, the 256 individual bytes (`0x00` to `0xFF`) form the base of the vocabulary.
+2. **Iterative Merging of Frequent Pairs**: The algorithm analyzes the text corpus and repeatedly finds the most frequent pair of contiguous bytes or tokens, merging it into a new single token.
+3. **Zero Unknown Tokens (`<unk>`)**: Since any Unicode character or sequence in any language (including emojis, mathematical symbols or binary code) can be decomposed into its constituent UTF-8 bytes, a Byte-Level tokenizer **never fails or produces `<unk>` tokens**.
 
 ---
 
-## 🏷️ Tokens Especiales
+## 🔠 NFKC Unicode Normalization
 
-El tokenizador entrenado incluye y reserva dos tokens especiales fundamentales para la gestión de secuencias en modelos de lenguaje:
+Before proceeding with the BPE frequency computation, Kuro-Neko applies a strict Unicode normalization pipeline using the **NFKC (Normalization Form KC - Compatibility Decomposition followed by Canonical Composition)** standard:
 
-| Token Especial | Función |
+- **Character Unification**: Converts visually similar characters or compatibility variants (such as ligatures, superscripts, full-width variants) to a normalized canonical representation.
+- **Consistency in the Model**: Ensures that variants of the same character do not redundantly consume multiple entries in the vocabulary table.
+
+---
+
+## 🏷️ Special Tokens
+
+The trained tokenizer includes and reserves two special tokens fundamental to sequence management in language models:
+
+| Special Token | Function |
 | :--- | :--- |
-| `<|endoftext|>` | Indica la frontera de fin de documento o de secuencia. Utilizado durante el entrenamiento para separar historias o documentos independientes y durante la inferencia para detener la generación autorregresiva. |
-| `<|padding|>` | Token utilizado para rellenar (*pad*) lotes de secuencias de longitud impar cuando se procesan en la GPU. |
+| `<|endoftext|>` | Indicates the end-of-document or end-of-sequence boundary. Used during training to separate independent stories or documents and during inference to stop autoregressive generation. |
+| `<|padding|>` | Token used to pad (*pad*) batches of odd-length sequences when processed on the GPU. |
 
 ---
 
-## 💾 Archivo de Salida: `custom_tokenizer.json`
+## 💾 Output File: `custom_tokenizer.json`
 
-Al completar el proceso, Kuro-Neko serializa la estructura completa del tokenizador en formato JSON en el archivo `custom_tokenizer.json` en la raíz del proyecto. Este archivo contiene:
+When the process completes, Kuro-Neko serializes the complete tokenizer structure in JSON format to the `custom_tokenizer.json` file at the project root. This file contains:
 
-- El mapa de fusiones BPE (*merges*).
-- La tabla de vocabulario token-a-ID e ID-a-token.
-- Las reglas de pre-tokenización (división por espacios en blanco y puntuación).
-- La configuración de normalización NFKC y de tokens especiales.
+- The BPE merge map (*merges*).
+- The token-to-ID and ID-to-token vocabulary table.
+- The pre-tokenization rules (splitting on whitespace and punctuation).
+- The NFKC normalization and special token configuration.
 
 ---
 
-## 💻 Ejemplos de Uso
+## 💻 Usage Examples
 
-### Ejemplo 1: Entrenar Tokenizador desde un Repositorio de Hugging Face
-Entrena un tokenizador de 8,000 tokens sobre el dataset `roneneldan/TinyStories`:
+### Example 1: Train Tokenizer from a Hugging Face Repository
+Trains an 8,000-token tokenizer on the `roneneldan/TinyStories` dataset:
 ```bash
 cargo run --release -- train-tokenizer --dataset roneneldan/TinyStories --vocab-size 8000
 ```
 
-### Ejemplo 2: Entrenar Tokenizador sobre un Archivo Local
-Entrena un tokenizador más compacto (vocabulario de 4,096 tokens) a partir de un archivo local:
+### Example 2: Train Tokenizer on a Local File
+Trains a more compact tokenizer (vocabulary of 4,096 tokens) from a local file:
 ```bash
-cargo run --release -- train-tokenizer --file ./mi_corpus_local.txt --vocab-size 4096
+cargo run --release -- train-tokenizer --file ./my_local_corpus.txt --vocab-size 4096
 ```
 
-### Ejemplo 3: Entrenar Tokenizador Gran Vocabulario para Corpus Combinado
-Entrena un tokenizador amplio (vocabulario de 16,384 tokens) combinando múltiples datasets:
+### Example 3: Train Large-Vocabulary Tokenizer for a Combined Corpus
+Trains a large tokenizer (vocabulary of 16,384 tokens) by combining multiple datasets:
 ```bash
 cargo run --release -- train-tokenizer \
   --dataset roneneldan/TinyStories,wikitext \

@@ -1,18 +1,18 @@
-# 🧠 Kuro-Neko — Arquitectura del Modelo
+# 🧠 Kuro-Neko — Model Architecture
 
-Este documento ofrece una especificación técnica detallada sobre la arquitectura interna de red neuronal implementada en **Kuro-Neko**.
+This document provides a detailed technical specification of the neural network architecture implemented in **Kuro-Neko**.
 
-La arquitectura está inspirada en la familia de modelos **Qwen2.5 / Qwen3**, construida como un Transformer Causal (*Decoder-Only*) de alto rendimiento optimizado para entrenamiento e inferencia masivamente paralela en GPU mediante el framework **Burn 0.21** y **WGPU**.
+The architecture is inspired by the **Qwen2.5 / Qwen3** model family, built as a high-performance Causal Transformer (*Decoder-Only*) optimized for massively parallel training and inference on GPU using the **Burn 0.21** and **WGPU** frameworks.
 
 ---
 
-## 🏛️ Diagrama General de la Arquitectura
+## 🏛️ General Architecture Diagram
 
 ```mermaid
 graph TD
     Input[Input Tokens: B x S] --> Embed[Embedding Matrix: V x D]
     Embed --> Block1[Block 1]
-    subgraph Block [Bloque Transformer Capa i]
+    subgraph Block [Transformer Block Layer i]
         PreNorm1[RMSNorm] --> Attn[Causal Self-Attention + RoPE + GQA]
         Attn --> Drop1[Dropout]
         Drop1 --> Res1((+ Residual))
@@ -30,38 +30,38 @@ graph TD
 
 ---
 
-## 🔬 Componentes Técnicos Detallados
+## 🔬 Detailed Technical Components
 
-### 1. Embedded Word Tying e Inicialización Gaussian Normal $\mathcal{N}(0, 0.02)$
+### 1. Embedded Word Tying and Gaussian Normal Initialization $\mathcal{N}(0, 0.02)$
 
-Kuro-Neko implementa **Tied Word Embeddings** (`tie_word_embeddings = true`). 
+Kuro-Neko implements **Tied Word Embeddings** (`tie_word_embeddings = true`).
 
-- **Compartición de Pesos**: La matriz de entrada de embedding `embed_tokens` con forma $[V, D]$ se transpone y se reutiliza directamente como la matriz de proyección final para calcular los logits sobre el vocabulario:
+- **Weight Sharing**: The embedding input matrix `embed_tokens` with shape $[V, D]$ is transposed and reused directly as the final projection matrix to compute the logits over the vocabulary:
   $$\text{logits} = X \times W_{\text{embed}}^T$$
-- **Estrategia de Inicialización**: Para evitar la saturación rápida de los logits y explosión de gradientes en las fases iniciales del entrenamiento con pesos compartidos, la matriz `embed_tokens` se inicializa con una distribución gaussiana normal de media $0.0$ y desviación estándar de $0.02$:
+- **Initialization Strategy**: To avoid rapid logit saturation and gradient explosion in the early phases of training with shared weights, the `embed_tokens` matrix is initialized with a Gaussian normal distribution with mean $0.0$ and standard deviation $0.02$:
   $$W_{\text{embed}} \sim \mathcal{N}(0.0,\, 0.02)$$
 
 ---
 
-### 2. RoPE (Rotary Position Embedding) con $\theta = 1.000.000$ / $10.000,0$
+### 2. RoPE (Rotary Position Embedding) with $\theta = 1.000.000$ / $10.000,0$
 
-La información posicional no se suma a los embeddings de entrada, sino que se incorpora mediante rotaciones complejas sobre los vectores de Query ($Q$) y Key ($K$) dentro de cada cabeza de atención.
+Positional information is not added to the input embeddings; instead, it is incorporated through complex rotations on the Query ($Q$) and Key ($K$) vectors within each attention head.
 
-- **Base de Frecuencia**: $\theta = 10.000,0$ (o $1.000.000$ para contextos extensos).
-- **Frecuencias Posicionales**: Para cada dimensión par $2i \in [0, d_k)$:
+- **Frequency Base**: $\theta = 10.000,0$ (or $1.000.000$ for long contexts).
+- **Positional Frequencies**: For each even dimension $2i \in [0, d_k)$:
   $$\theta_i = \frac{1}{\theta^{2i / d_k}}$$
-- **Rotación en el Plano 2D**:
+- **2D Plane Rotation**:
   $$R_{\Theta, m}^d x_m = \begin{pmatrix} x_m^{(1)} \cos(m\theta_1) - x_m^{(2)} \sin(m\theta_1) \\ x_m^{(1)} \sin(m\theta_1) + x_m^{(2)} \cos(m\theta_1) \\ \vdots \end{pmatrix}$$
-- **Precálculo de Caché**: Las matrices de seno y coseno ($\cos, \sin$) para toda la ventana de contexto `n_ctx` se precalculan al instanciar el modelo (`precompute_rope_cache`), evitando cálculos redundantes durante las pasadas forward.
+- **Cache Precomputation**: The sine and cosine matrices ($\cos, \sin$) for the entire `n_ctx` context window are precomputed when instantiating the model (`precompute_rope_cache`), avoiding redundant computations during forward passes.
 
 ---
 
 ### 3. Grouped Query Attention (GQA)
 
-Para equilibrar la calidad de representación con la eficiencia en VRAM de la **Caché KV**, Kuro-Neko soporta **Grouped Query Attention (GQA)**:
+To balance representation quality with the VRAM efficiency of the **KV Cache**, Kuro-Neko supports **Grouped Query Attention (GQA)**:
 
-- **Proporción de Cabezas**: Se definen $H$ cabezas para Query y $H_{\text{kv}}$ cabezas para Key y Value, donde $H$ debe ser divisible entre $H_{\text{kv}}$.
-- **Repetición KV**: Cada cabeza $KV$ se expande y se comparte entre $N_{\text{rep}} = H / H_{\text{kv}}$ cabezas $Q$ mediante la función `repeat_kv`:
+- **Head Ratio**: $H$ heads are defined for Query and $H_{\text{kv}}$ heads for Key and Value, where $H$ must be divisible by $H_{\text{kv}}$.
+- **KV Repetition**: Each $KV$ head is expanded and shared across $N_{\text{rep}} = H / H_{\text{kv}}$ $Q$ heads via the `repeat_kv` function:
 
 ```rust
 fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
@@ -76,17 +76,17 @@ fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 }
 ```
 
-- **Sesgo en Proyecciones QKV**: Siguiendo el estándar Qwen, las proyecciones `q_proj`, `k_proj` y `v_proj` incluyen sesgo activo (`with_bias(true)`).
+- **Bias in QKV Projections**: Following the Qwen standard, the `q_proj`, `k_proj`, and `v_proj` projections include an active bias (`with_bias(true)`).
 
 ---
 
-### 4. SwiGLU MLP Alineado a Múltiples de 256
+### 4. SwiGLU MLP Aligned to Multiples of 256
 
-El bloque de Feed-Forward Network (FFN) utiliza la activación **SwiGLU (Swish-Gated Linear Unit)**:
+The Feed-Forward Network (FFN) block uses the **SwiGLU (Swish-Gated Linear Unit)** activation:
 
-- **Ecuación Operativa**:
+- **Operational Equation**:
   $$\text{SwiGLU}(x) = \left( \text{SiLU}(x W_{\text{gate}}) \odot (x W_{\text{up}}) \right) W_{\text{down}}$$
-- **Cálculo de Dimensión Oculta Alineada**: La dimensión oculta raw $\lfloor \frac{8D}{3} \rfloor$ se redondea superiormente al múltiplo de 256 más cercano para maximizar la alineación con los núcleos SIMD/Tensor Cores de la GPU:
+- **Aligned Hidden Dimension Calculation**: The raw hidden dimension $\lfloor \frac{8D}{3} \rfloor$ is rounded up to the nearest multiple of 256 to maximize alignment with the GPU's SIMD/Tensor Cores:
 
 ```rust
 let raw_hidden_dim = (8 * self.n_embd) / 3;
@@ -95,36 +95,36 @@ let hidden_dim = ((raw_hidden_dim + 255) / 256) * 256;
 
 ---
 
-### 5. RMSNorm (Root Mean Square Normalization) con $\epsilon = 10^{-6}$
+### 5. RMSNorm (Root Mean Square Normalization) with $\epsilon = 10^{-6}$
 
-Tanto las normalizaciones previas a la atención (*Pre-Attention Norm*) como las previas a la MLP (*Pre-FFN Norm*) emplean **RMSNorm** en lugar de LayerNorm estándar:
+Both the pre-attention normalizations (*Pre-Attention Norm*) and the pre-MLP normalizations (*Pre-FFN Norm*) use **RMSNorm** instead of standard LayerNorm:
 
-- **Ecuación**:
+- **Equation**:
   $$\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d} \sum_{i=1}^d x_i^2 + \epsilon}} \odot \gamma$$
-- **Parámetro Epsilon**: $\epsilon = 10^{-6}$ (Estándar Qwen2.5 / Qwen3).
-- **Eficiencia**: Omite el cálculo de la media poblacional, reduciendo las pasadas por memoria en la GPU en un 50% con respecto a LayerNorm.
+- **Epsilon Parameter**: $\epsilon = 10^{-6}$ (Qwen2.5 / Qwen3 standard).
+- **Efficiency**: It skips the population mean computation, reducing memory passes on the GPU by 50% compared to LayerNorm.
 
 ---
 
-### 6. Attention Softcapping (Opcional, Estilo Gemma 4)
+### 6. Attention Softcapping (Optional, Gemma 4 Style)
 
-Para estabilizar la magnitud de las puntuaciones de atención durante el entrenamiento de modelos profundos, Kuro-Neko admite la aplicación opcional de **Attention Softcapping**:
+To stabilize the magnitude of attention scores during the training of deep models, Kuro-Neko supports the optional application of **Attention Softcapping**:
 
-- **Fórmula**:
+- **Formula**:
   $$\text{scores} = \text{softcap} \times \tanh\left( \frac{Q K^T}{\sqrt{d_k} \times \text{softcap}} \right)$$
-- **Comportamiento**: Si `attn_softcap = 0.0` (por defecto), la operación se omite. Si se configura a un valor como `50.0`, acota suavemente los scores de atención en el rango $[-50.0, 50.0]$, impidiendo gradientes infinitos o desbordamientos numéricos.
+- **Behavior**: If `attn_softcap = 0.0` (default), the operation is skipped. If set to a value such as `50.0`, it smoothly bounds the attention scores to the range $[-50.0, 50.0]$, preventing infinite gradients or numerical overflows.
 
 ---
 
-## 📊 Resumen de Hiperparámetros de la Arquitectura
+## 📊 Architecture Hyperparameter Summary
 
-| Parámetro | Símbolo | Tipo | Función |
+| Parameter | Symbol | Type | Function |
 | :--- | :--- | :--- | :--- |
-| `vocab_size` | $V$ | `usize` | Tamaño total del vocabulario BPE |
-| `n_embd` | $D$ | `usize` | Dimensión de embedding y del estado oculto principal |
-| `n_head` | $H$ | `usize` | Número de cabezas de atención Query |
-| `n_kv_head` | $H_{\text{kv}}$ | `usize` | Número de cabezas KV para GQA ($H_{\text{kv}} \le H$) |
-| `n_layer` | $L$ | `usize` | Número de bloques Transformer |
-| `n_ctx` | $N_{\text{ctx}}$ | `usize` | Longitud máxima de la ventana de contexto |
-| `dropout` | $P_{\text{drop}}$ | `f64` | Probabilidad de regularización por dropout |
-| `attn_softcap` | $C_{\text{soft}}$ | `f32` | Umbral de acotamiento de puntuaciones de atención |
+| `vocab_size` | $V$ | `usize` | Total BPE vocabulary size |
+| `n_embd` | $D$ | `usize` | Embedding and main hidden state dimension |
+| `n_head` | $H$ | `usize` | Number of Query attention heads |
+| `n_kv_head` | $H_{\text{kv}}$ | `usize` | Number of KV heads for GQA ($H_{\text{kv}} \le H$) |
+| `n_layer` | $L$ | `usize` | Number of Transformer blocks |
+| `n_ctx` | $N_{\text{ctx}}$ | `usize` | Maximum context window length |
+| `dropout` | $P_{\text{drop}}$ | `f64` | Dropout regularization probability |
+| `attn_softcap` | $C_{\text{soft}}$ | `f32` | Attention score bounding threshold |

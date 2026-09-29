@@ -1,27 +1,27 @@
-# 🔤 Kuro-Neko — Generación e Inferencia (`generate`)
+# 🔤 Kuro-Neko — Generation and Inference (`generate`)
 
-El subcomando `generate` permite realizar inferencia autorregresiva de texto a partir de un texto semilla (*prompt*). Carga los pesos entrenados guardados en `model_output/` junto con la configuración de la arquitectura (`config.json`) y el tokenizador BPE (`custom_tokenizer.json`), generando tokens consecutivamente mediante un pipeline optimizado con **Caché KV** (Key-Value Cache) y muestreo estocástico avanzado.
+The `generate` subcommand allows performing autoregressive text inference from a seed text (*prompt*). It loads the trained weights saved in `model_output/` together with the architecture configuration (`config.json`) and the BPE tokenizer (`custom_tokenizer.json`), generating tokens consecutively through a pipeline optimized with **KV Cache** (Key-Value Cache) and advanced stochastic sampling.
 
 ---
 
-## ⚙️ Tabla Completa de Parámetros CLI
+## ⚙️ Complete CLI Parameters Table
 
-| Flag / Argumento | Tipo | Valor por Defecto | Descripción Detallada |
+| Flag / Argument | Type | Default Value | Detailed Description |
 | :--- | :--- | :--- | :--- |
-| `<prompt>` *(Posicional)* | `String` | **Requerido** | Texto semilla de entrada a partir del cual el modelo continuará la generación de texto. |
-| `--temp <float>` | `f32` | `0.9` | Temperatura de muestreo ($T$). Escala los logits antes del softmax. Valores mayores aumentan la diversidad/creatividad, mientras que valores cercanos a `0.0` hacen el resultado determinista. |
-| `--top-k <n>` | `usize` | `60` | Muestreo Top-K. Restringe la selección a únicamente los $K$ tokens con mayor probabilidad desestimando el resto. |
-| `--top-p <float>` | `f32` | `0.9` | Muestreo Nucleus (Top-P). Conserva el conjunto mínimo de tokens cuya suma de probabilidades acumuladas alcanza o supera el umbral $p$. |
-| `--min-p <float>` | `f32` | `0.1` | Umbral Min-P. Excluye cualquier token cuya probabilidad sea inferior a $\text{min\_p} \times P_{\max}$, eliminando la "cola ruidosa" de distribuciones planas. |
-| `--rep-penalty <float>` | `f32` | `1.6` | Penalización por repetición. Aplica un factor divisor sobre los logits de los tokens que ya han sido generados previamente en la secuencia. `1.0` la desactiva. |
-| `--max-tokens <n>` | `usize` | `50` | Número máximo de nuevos tokens a generar de manera autorregresiva. |
-| `--seed <n>` | `Option<u64>` | `None` *(Tiempo de sistema)* | Semilla aleatoria para el generador `XorshiftRng`. Permite reproducir exactamente la misma salida de texto. |
+| `<prompt>` *(Positional)* | `String` | **Required** | Input seed text from which the model will continue generating text. |
+| `--temp <float>` | `f32` | `0.9` | Sampling temperature ($T$). Scales the logits before softmax. Higher values increase diversity/creativity, while values close to `0.0` make the result deterministic. |
+| `--top-k <n>` | `usize` | `60` | Top-K sampling. Restricts the selection to only the $K$ tokens with the highest probability, discarding the rest. |
+| `--top-p <float>` | `f32` | `0.9` | Nucleus sampling (Top-P). Keeps the minimal set of tokens whose cumulative probability sum reaches or exceeds the threshold $p$. |
+| `--min-p <float>` | `f32` | `0.1` | Min-P threshold. Excludes any token whose probability is lower than $\text{min\_p} \times P_{\max}$, eliminating the "noisy tail" of flat distributions. |
+| `--rep-penalty <float>` | `f32` | `1.6` | Repetition penalty. Applies a dividing factor to the logits of tokens that have already been generated previously in the sequence. `1.0` disables it. |
+| `--max-tokens <n>` | `usize` | `50` | Maximum number of new tokens to generate autoregressively. |
+| `--seed <n>` | `Option<u64>` | `None` *(System time)* | Random seed for the `XorshiftRng` generator. Allows reproducing exactly the same text output. |
 
 ---
 
-## 🎯 Explicación Detallada de las Estrategias de Muestreo
+## 🎯 Detailed Explanation of Sampling Strategies
 
-Kuro-Neko aplica un pipeline secuencial de filtrado y transformación sobre el vector de logits desnormalizados $z \in \mathbb{R}^{V}$ para seleccionar el siguiente token:
+Kuro-Neko applies a sequential pipeline of filtering and transformation on the unnormalized logits vector $z \in \mathbb{R}^{V}$ to select the next token:
 
 ```mermaid
 graph LR
@@ -33,32 +33,32 @@ graph LR
     MinP --> Softmax[Softmax & Weighted Sample]
 ```
 
-### 1. Penalización por Repetición (Repetition Penalty)
-Para cada token $i$ que ya está presente en el contexto o en el texto generado previamente, su logit $z_i$ se ajusta según:
-$$z_i \leftarrow \begin{cases} z_i / \text{rep\_penalty} & \text{si } z_i > 0 \\ z_i \times \text{rep\_penalty} & \text{si } z_i \le 0 \end{cases}$$
-Un valor como `1.5` o `1.6` desincentiva fuertemente los bucles de repetición infinita (esencial en SLMs entrenados con mucho texto repetitivo).
+### 1. Repetition Penalty
+For each token $i$ that is already present in the context or in the previously generated text, its logit $z_i$ is adjusted according to:
+$$z_i \leftarrow \begin{cases} z_i / \text{rep\_penalty} & \text{if } z_i > 0 \\ z_i \times \text{rep\_penalty} & \text{if } z_i \le 0 \end{cases}$$
+A value such as `1.5` or `1.6` strongly discourages infinite repetition loops (essential in SLMs trained with a lot of repetitive text).
 
-### 2. Escala de Temperatura (Temperature Scaling)
-Los logits modificados se dividen por la temperatura $T$:
+### 2. Temperature Scaling
+The modified logits are divided by temperature $T$:
 $$z_i' = \frac{z_i}{T}$$
-- Si $T \to 0$, la distribución se concentra en el token con la mayor probabilidad (búsqueda codiciosa / *greedy search*).
-- Si $T > 1.0$, la distribución de probabilidad se aplana, otorgando mayor oportunidad a tokens menos frecuentes.
+- If $T \to 0$, the distribution concentrates on the token with the highest probability (greedy search).
+- If $T > 1.0$, the probability distribution flattens, giving more opportunity to less frequent tokens.
 
-### 3. Muestreo Top-K
-Se ordenan los logits descendentemente y se conservan únicamente las $K$ mejores posiciones. Todas las demás posiciones en el vector de logits reciben un valor de $-\infty$ (o $-10^4$), eliminándolas del cálculo de probabilidades.
+### 3. Top-K Sampling
+The logits are sorted in descending order and only the top $K$ positions are kept. All other positions in the logits vector receive a value of $-\infty$ (or $-10^4$), removing them from the probability calculation.
 
-### 4. Muestreo Nucleus (Top-P)
-Tras aplicar Softmax a los logits filtrados, se acumulan las probabilidades en orden descendente. Se conserva el subconjunto más pequeño de tokens $\mathcal{S}$ tal que:
+### 4. Nucleus Sampling (Top-P)
+After applying Softmax to the filtered logits, probabilities are accumulated in descending order. The smallest subset of tokens $\mathcal{S}$ is kept such that:
 $$\sum_{j \in \mathcal{S}} P(j) \ge p$$
-Los tokens fuera de este conjunto acumulado son descartados. Esto adapta dinámicamente la cantidad de candidatos según la incertidumbre del modelo.
+Tokens outside this accumulated set are discarded. This dynamically adapts the number of candidates according to the model's uncertainty.
 
-### 5. Umbral Min-P (Min-P Thresholding)
-Min-P es una técnica moderna de filtrado estocástico. Sea $P_{\max} = \max_i P(i)$ la probabilidad del token más probable. Un token $k$ solo se conserva si cumple:
+### 5. Min-P Thresholding
+Min-P is a modern stochastic filtering technique. Let $P_{\max} = \max_i P(i)$ be the probability of the most probable token. A token $k$ is kept only if it satisfies:
 $$P(k) \ge \text{min\_p} \times P_{\max}$$
-Si el token candidato principal tiene un 80% de probabilidad y `min_p = 0.05`, solo se considerarán tokens con al menos $4\%$ de probabilidad ($0.05 \times 0.80$).
+If the main candidate token has an 80% probability and `min_p = 0.05`, only tokens with at least $4\%$ probability will be considered ($0.05 \times 0.80$).
 
-### 6. Muestreo con Generador XorshiftRng
-Finalmente, las probabilidades resultantes se re-normalizan y se muestrea el token seleccionado mediante un generador pseudoaleatorio ultra-rápido `XorshiftRng`:
+### 6. Sampling with the XorshiftRng Generator
+Finally, the resulting probabilities are re-normalized and the selected token is sampled using an ultra-fast pseudo-random generator `XorshiftRng`:
 
 ```rust
 let mut rng = XorshiftRng::new(seed);
@@ -67,13 +67,13 @@ let r = rng.next_f32();
 
 ---
 
-## ⚙️ Perfiles de Generación Recomendados
+## ⚙️ Recommended Generation Profiles
 
 > [!NOTE]
-> Los modelos pequeños (SLM) como Kuro-Neko asignan probabilidades muy concentradas a los tokens más frecuentes. Con temperaturas bajas o penalizaciones débiles el modelo puede caer en bucles de repetición. Para SLMs se recomienda `temp >= 0.8` y `rep_penalty >= 1.5`.
+> Small models (SLM) such as Kuro-Neko assign highly concentrated probabilities to the most frequent tokens. With low temperatures or weak penalties the model can fall into repetition loops. For SLMs, `temp >= 0.8` and `rep_penalty >= 1.5` are recommended.
 
-### 🎨 Perfil Creativo (Escritura de historias, poesía, ideas)
-Maximiza la variabilidad y el vocabulario sin perder coherencia gramatical:
+### 🎨 Creative Profile (Story writing, poetry, ideas)
+Maximizes variability and vocabulary without losing grammatical coherence:
 ```bash
 cargo run --release -- generate "In a distant galaxy" \
   --temp 0.9 \
@@ -84,8 +84,8 @@ cargo run --release -- generate "In a distant galaxy" \
   --max-tokens 100
 ```
 
-### 🎯 Perfil Determinista / Técnico (Código, hechos, resúmenes)
-Respuestas concisas y directas enfocadas en el token con mayor probabilidad:
+### 🎯 Deterministic / Technical Profile (Code, facts, summaries)
+Concise and direct answers focused on the token with the highest probability:
 ```bash
 cargo run --release -- generate "The function of RMSNorm is" \
   --temp 0.5 \
@@ -96,8 +96,8 @@ cargo run --release -- generate "The function of RMSNorm is" \
   --max-tokens 50
 ```
 
-### ⚖️ Perfil Balanceado (Uso General)
-Equilibrio óptimo entre diversidad y precisión (defaults del CLI):
+### ⚖️ Balanced Profile (General Use)
+Optimal balance between diversity and precision (CLI defaults):
 ```bash
 cargo run --release -- generate "Once upon a time" \
   --temp 0.9 \
@@ -110,9 +110,9 @@ cargo run --release -- generate "Once upon a time" \
 
 ---
 
-## ⚡ Funcionamiento de la Caché KV (Prefill & Decode)
+## ⚡ How the KV Cache Works (Prefill & Decode)
 
-Para lograr una generación de texto extremadamente rápida en GPU sin recalcular los tensores de clave y valor para tokens pasados en cada paso, Kuro-Neko utiliza una estructura **`KvCache`**:
+To achieve extremely fast text generation on GPU without recomputing the key and value tensors for past tokens at each step, Kuro-Neko uses a **`KvCache`** structure:
 
 ```rust
 pub struct KvCache<B: Backend> {
@@ -121,17 +121,17 @@ pub struct KvCache<B: Backend> {
 }
 ```
 
-El proceso de inferencia se divide en dos fases distintas:
+The inference process is divided into two distinct phases:
 
-### Fase 1: Prefill (Evaluación del Prompt)
-1. El texto inicial (*prompt*) de longitud $S$ se convierte a tokens e ingresa al modelo en una sola pasada paralela.
-2. Cada bloque de atención calcula las matrices $K \in \mathbb{R}^{B \times H_{\text{kv}} \times S \times D}$ y $V \in \mathbb{R}^{B \times H_{\text{kv}} \times S \times D}$.
-3. Estas matrices iniciales se almacenan dentro de la estructura `KvCache` correspondiente a cada capa del Transformer.
+### Phase 1: Prefill (Prompt Evaluation)
+1. The initial text (*prompt*) of length $S$ is converted to tokens and fed into the model in a single parallel pass.
+2. Each attention block computes the matrices $K \in \mathbb{R}^{B \times H_{\text{kv}} \times S \times D}$ and $V \in \mathbb{R}^{B \times H_{\text{kv}} \times S \times D}$.
+3. These initial matrices are stored inside the `KvCache` structure corresponding to each Transformer layer.
 
-### Fase 2: Decode (Generación Autorregresiva Paso a Paso)
-1. Para generar el token $N+1$, únicamente se pasa al modelo el **último token generado** (longitud $S = 1$).
-2. El modelo calcula únicamente las proyecciones $K_{\text{nuevo}}$ y $V_{\text{nuevo}}$ para ese token individual.
-3. Mediante `Tensor::cat`, la nueva clave y valor se concatenan al tensor preexistente en la memoria de la GPU:
-   $$K_{\text{total}} = [K_{\text{previo}} \,;\, K_{\text{nuevo}}]$$
-   $$V_{\text{total}} = [V_{\text{previo}} \,;\, V_{\text{nuevo}}]$$
-4. Esto reduce la complejidad computacional por token generado de $O(S^2)$ a **$O(1)$**, acelerando la inferencia de manera exponencial.
+### Phase 2: Decode (Step-by-Step Autoregressive Generation)
+1. To generate token $N+1$, only the **last generated token** (length $S = 1$) is passed to the model.
+2. The model computes only the projections $K_{\text{new}}$ and $V_{\text{new}}$ for that individual token.
+3. Using `Tensor::cat`, the new key and value are concatenated to the preexisting tensor in GPU memory:
+   $$K_{\text{total}} = [K_{\text{previous}} \,;\, K_{\text{new}}]$$
+   $$V_{\text{total}} = [V_{\text{previous}} \,;\, V_{\text{new}}]$$
+4. This reduces the computational complexity per generated token from $O(S^2)$ to **$O(1)$**, accelerating inference exponentially.
