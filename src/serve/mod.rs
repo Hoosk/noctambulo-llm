@@ -68,12 +68,12 @@ pub async fn run(
     println!("🐈‍⬛ Kuro-Neko serve listening on http://{bind}");
     if let Some(t) = &*state.token.read().unwrap() {
         println!("   API token: {}", t);
-        println!("   Envía el header `X-API-Token: {t}` en cada petición.");
+        println!("   Send the `X-API-Token: {t}` header with every request.");
     } else {
-        println!("   ⚠ Sin token configurado (solo para red local de confianza).");
+        println!("   ⚠ No token configured (trusted local networks only).");
     }
     println!("   Datasets: {:?}", state.datasets_dir);
-    println!("   Modelos:  {:?}", state.models_dir);
+    println!("   Models:   {:?}", state.models_dir);
     println!("   Web UI:   {:?}", frontend_dir);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state.clone(), registry))

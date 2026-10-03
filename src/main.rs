@@ -118,7 +118,8 @@ struct ServeArgs {
     /// Address and port to bind (e.g. 0.0.0.0:8080 for remote access)
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: String,
-    /// API token required in the X-API-Token header (auto-generated if omitted)
+    /// API token required in the X-API-Token header. If omitted the server
+    /// runs without authentication (trusted local networks only).
     #[arg(long)]
     token: Option<String>,
     /// Directory containing datasets to list/train on
@@ -243,8 +244,9 @@ struct TrainArgs {
     /// Explicit --n-embd/--n-head/--n-kv-head/--n-layer/--n-ctx override it.
     #[arg(long)]
     preset: Option<String>,
-    /// Compute precision: f32 (default), bf16 or f16 (faster on GPUs that
-    /// support them; records are always stored as f32 for portable inference).
+    /// Compute precision: f32 (default) or f16 (faster on GPUs that support
+    /// it); bf16 is rejected by the WGPU backend. Records are always stored
+    /// as f32 for portable inference.
     #[arg(long, default_value = "f32")]
     dtype: String,
     /// Batch size

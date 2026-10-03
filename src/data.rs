@@ -497,9 +497,9 @@ pub fn download_dataset_streaming(
     .into())
 }
 
-/// Extrae documentos de texto de un archivo Parquet (columna `text` con fallbacks
-/// a `content`/`body`) y los escribe a un `.txt` destino, un documento por línea.
-/// Devuelve el número de documentos escritos.
+/// Extracts text documents from a Parquet file (column `text`, falling back
+/// to `content`/`body`) and writes them to a destination `.txt`, one document
+/// per line. Returns the number of documents written.
 /// Pick the text column out of a Parquet schema (same fallback order as the
 /// extractor). Shared by extraction and direct tokenization.
 fn parquet_text_column(
@@ -757,9 +757,9 @@ pub fn combine_and_mix_datasets(
     Ok(output_path.to_path_buf())
 }
 
-/// Mezcla ponderada de datasets (uno por línea) respetando las proporciones
-/// `weights` y un presupuesto máximo de caracteres `max_chars`.
-/// Selección probabilística por peso en cada paso (sin sesgo de orden).
+/// Weighted dataset mix (one item per line) honoring the `weights`
+/// proportions and a maximum character budget `max_chars`. Probabilistic
+/// per-weight selection on every step (no order bias).
 pub fn combine_and_mix_weighted(
     sources: &[(PathBuf, f32)],
     output_path: &Path,
@@ -827,7 +827,7 @@ pub fn combine_and_mix_weighted_with(
     let mut last_report = std::time::Instant::now();
     let progress_total: u64 = if max_chars == usize::MAX { 0 } else { max_chars as u64 };
 
-    // Fuentes activas: (índice, peso). Se re-normaliza al agotar una fuente.
+    // Active sources: (index, weight). Re-normalized when a source is exhausted.
     let mut active: Vec<(usize, f32)> =
         sources.iter().enumerate().map(|(i, (_, w))| (i, w.max(0.0))).collect();
 
@@ -845,7 +845,7 @@ pub fn combine_and_mix_weighted_with(
             let _ = std::fs::remove_file(output_path);
             return Err("cancelled by user".into());
         }
-        // Sortear una fuente activa proporcionalmente a su peso
+        // Draw an active source proportionally to its weight
         let total: f32 = active.iter().map(|(_, w)| w).sum();
         state ^= state >> 12;
         state ^= state << 25;
