@@ -208,6 +208,7 @@ cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p
 | `--max-tokens <n>` | Maximum number of new tokens to generate | `50` |
 | `--seed <n>` | Pseudo-random generator seed for reproducibility | `None` |
 | `--dtype <kind>` | Compute precision: `f32` or `f16` (KV cache follows it) | `f32` |
+| `--kv-cache-dtype <kind>` | KV cache precision: `f32` or `f16` (halves cache memory) | `f32` |
 | `--rope-scaling <kind>` | Context extension: `none`, `linear`, `ntk` or `yarn` | `none` |
 | `--rope-factor <float>` | Extension factor (e.g. `2.0` doubles the usable context) | `1.0` |
 
