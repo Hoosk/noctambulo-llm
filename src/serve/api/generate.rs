@@ -235,6 +235,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
             s.min_p,
             s.repetition_penalty,
             seed,
+            false,
             &device,
             |chunk| tx.blocking_send(chunk.to_string()).is_ok(),
         )
@@ -253,6 +254,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
         s.min_p,
         s.repetition_penalty,
         seed,
+        false,
         &device,
     )
     .map_err(|e| format!("generate error: {e}"))

@@ -2,7 +2,7 @@ use crate::config::{ModelConfig, RopeScalingKind};
 use burn::module::Module;
 use burn::nn::{Dropout, DropoutConfig, Embedding, Linear, LinearConfig};
 use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{FloatDType, Int, Tensor, TensorData};
 
 /// Preallocated per-layer KV cache.
 ///
@@ -21,6 +21,9 @@ pub struct KvCache<B: Backend> {
     pub capacity: usize,
     /// Absolute position stored in each ring slot (`usize::MAX` = empty).
     pub positions: Vec<usize>,
+    /// Whether K/V rows are stored as f16 (half the cache memory; cast back
+    /// to the compute dtype on read).
+    pub f16: bool,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -30,15 +33,19 @@ impl<B: Backend> KvCache<B> {
         n_kv_head: usize,
         head_dim: usize,
         capacity: usize,
+        f16: bool,
         device: &B::Device,
     ) -> Self {
         let shape = [batch, n_kv_head, capacity, head_dim];
+        let k: Tensor<B, 4> = Tensor::zeros(shape, device);
+        let v: Tensor<B, 4> = Tensor::zeros(shape, device);
         Self {
-            k: Some(Tensor::zeros(shape, device)),
-            v: Some(Tensor::zeros(shape, device)),
+            k: Some(if f16 { k.cast(FloatDType::F16) } else { k }),
+            v: Some(if f16 { v.cast(FloatDType::F16) } else { v }),
             len: 0,
             capacity,
             positions: vec![usize::MAX; capacity],
+            f16,
         }
     }
 
@@ -60,14 +67,17 @@ impl<B: Backend> KvCache<B> {
         heads: usize,
         dim: usize,
         capacity: usize,
+        f16: bool,
         device: &B::Device,
     ) -> Self {
+        let k: Tensor<B, 4> = Tensor::zeros([batch, heads, capacity, dim], device);
         Self {
-            k: Some(Tensor::zeros([batch, heads, capacity, dim], device)),
+            k: Some(if f16 { k.cast(FloatDType::F16) } else { k }),
             v: None,
             len: 0,
             capacity,
             positions: vec![usize::MAX; capacity],
+            f16,
         }
     }
 }
@@ -486,6 +496,12 @@ fn cache_write<B: Backend>(
     sink_tokens: usize,
 ) {
     let [batch_size, n_kv_head, new_seq_len, head_size] = k_embed.dims();
+    let k_embed = if cache.f16 {
+        k_embed.cast(FloatDType::F16)
+    } else {
+        k_embed
+    };
+    let v = if cache.f16 { v.cast(FloatDType::F16) } else { v };
     assert!(
         cache.capacity > sink_tokens,
         "KV cache capacity ({}) must exceed the sink tokens ({})",
@@ -545,6 +561,11 @@ fn cache_write_latent<B: Backend>(
     sink_tokens: usize,
 ) {
     let [batch_size, heads, new_seq_len, dim] = latent.dims();
+    let latent = if cache.f16 {
+        latent.cast(FloatDType::F16)
+    } else {
+        latent
+    };
     assert!(
         cache.capacity > sink_tokens,
         "KV cache capacity ({}) must exceed the sink tokens ({})",
@@ -834,21 +855,20 @@ impl<B: Backend> Llm<B> {
     }
 
     /// Preallocated caches (one per K/V group) sized to `capacity` positions.
-    /// MLA groups cache only the compressed latent.
-    pub fn new_kv_caches(&self, capacity: usize, device: &B::Device) -> Vec<KvCache<B>> {
+    /// MLA groups cache only the compressed latent. `f16` halves the cache
+    /// memory at the cost of a cast per read.
+    pub fn new_kv_caches(&self, capacity: usize, f16: bool, device: &B::Device) -> Vec<KvCache<B>> {
         if self.use_mla() {
             self.mla
                 .iter()
-                .map(|m| {
-                    KvCache::preallocated_single(1, 1, m.d_latent, capacity, device)
-                })
+                .map(|m| KvCache::preallocated_single(1, 1, m.d_latent, capacity, f16, device))
                 .collect()
         } else {
             self.kv
                 .iter()
                 .map(|kv| {
                     let head_dim = kv.n_embd / kv.n_head;
-                    KvCache::preallocated(1, kv.n_kv_head, head_dim, capacity, device)
+                    KvCache::preallocated(1, kv.n_kv_head, head_dim, capacity, f16, device)
                 })
                 .collect()
         }
@@ -916,13 +936,21 @@ impl<B: Backend> Llm<B> {
             let cache = &caches[g];
             let (k_full, v_full) = if self.use_mla() {
                 let latent = cache.k.clone().expect("mla cache latent buffer");
+                let latent = if cache.f16 {
+                    latent.cast(FloatDType::F32)
+                } else {
+                    latent
+                };
                 let positions = cache_positions_i32(cache);
                 self.mla[g].expand(latent, &positions)
             } else {
-                (
-                    cache.k.clone().expect("kv cache k buffer"),
-                    cache.v.clone().expect("kv cache v buffer"),
-                )
+                let k = cache.k.clone().expect("kv cache k buffer");
+                let v = cache.v.clone().expect("kv cache v buffer");
+                if cache.f16 {
+                    (k.cast(FloatDType::F32), v.cast(FloatDType::F32))
+                } else {
+                    (k, v)
+                }
             };
             let col_pos = cache_col_positions(cache, &device);
             x = block.forward(x, k_full, v_full, start_pos, row_pos.clone(), col_pos);
@@ -1119,7 +1147,7 @@ mod tests {
         // Prefill path: the cache must reproduce the uncached logits exactly.
         let full = model.forward(input.clone()).into_data().to_vec::<f32>().unwrap();
         let mut caches: Vec<KvCache<NdArray<f32, i32>>> =
-            model.new_kv_caches(model.max_seq_len(), &device);
+            model.new_kv_caches(model.max_seq_len(), false, &device);
         let cached = model
             .forward_with_cache(input, 0, &mut caches)
             .into_data()
@@ -1178,7 +1206,7 @@ mod tests {
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
         assert_eq!(model.max_seq_len(), 16);
         let mut caches: Vec<KvCache<NdArray<f32, i32>>> =
-            model.new_kv_caches(model.max_seq_len(), &device);
+            model.new_kv_caches(model.max_seq_len(), false, &device);
 
         let prefill = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
             TensorData::new(vec![1i32, 2, 3, 4, 5, 6], [1, 6]),
@@ -1267,7 +1295,7 @@ mod tests {
         config.kv_share_group = kv_share_group;
         config.mla_latent_dim = mla_dim;
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
-        assert_eq!(model.new_kv_caches(1, &device).len(), config.n_kv_groups());
+        assert_eq!(model.new_kv_caches(1, false, &device).len(), config.n_kv_groups());
 
         let tokens: Vec<i32> = vec![3, 5, 7, 11, 13, 17];
         let full = model
@@ -1283,7 +1311,7 @@ mod tests {
         let expected_capacity = window.map(|w| w + sink_tokens).unwrap_or(model.max_seq_len());
         assert_eq!(capacity, expected_capacity);
 
-        let mut caches = model.new_kv_caches(capacity, &device);
+        let mut caches = model.new_kv_caches(capacity, false, &device);
         for (pos, &tok) in tokens.iter().enumerate() {
             let step = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
                 TensorData::new(vec![tok], [1, 1]),
@@ -1348,7 +1376,7 @@ mod tests {
         let mut config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
         config.mla_latent_dim = Some(16);
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
-        let caches = model.new_kv_caches(4, &device);
+        let caches = model.new_kv_caches(4, false, &device);
         assert_eq!(caches.len(), 2);
         assert_eq!(caches[0].k.as_ref().unwrap().dims(), [1, 1, 4, 16]);
         assert!(caches[0].v.is_none(), "MLA caches only the latent");
@@ -1393,13 +1421,57 @@ mod tests {
     }
 
     #[test]
+    fn test_f16_cache_close_to_f32_cache() {
+        // Same decode path, only the cache dtype changes: isolates f16
+        // rounding from the batched-vs-single forward differences that WGPU
+        // exhibits regardless of the cache dtype (see ROADMAP known issues).
+        use crate::backend::WgpuHalf;
+        let device = WgpuDevice::default();
+        let config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
+        let model: Llm<WgpuHalf<f32>> = config.init_model(&device);
+        let tokens: Vec<i32> = vec![3, 5, 7, 11, 13];
+
+        let run = |f16: bool| -> Vec<Vec<f32>> {
+            let mut caches = model.new_kv_caches(8, f16, &device);
+            tokens
+                .iter()
+                .enumerate()
+                .map(|(pos, &tok)| {
+                    let step = Tensor::<WgpuHalf<f32>, 2, Int>::from_data(
+                        TensorData::new(vec![tok], [1, 1]),
+                        &device,
+                    );
+                    model
+                        .forward_with_cache(step, pos, &mut caches)
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let f32_logits = run(false);
+        let f16_logits = run(true);
+        for pos in 0..tokens.len() {
+            let diff = f32_logits[pos]
+                .iter()
+                .zip(f16_logits[pos].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                diff < 5e-2,
+                "f16 cache diverged from f32 cache at pos {pos}: max_diff={diff}"
+            );
+        }
+    }
+
+    #[test]
     fn test_kv_sharing_reduces_cache_count() {
         use burn_ndarray::{NdArray, NdArrayDevice};
         let device = NdArrayDevice::Cpu;
         let mut config = ModelConfig::new(50, 32, 4, Some(2), 4, 8, 0.0, 0.0);
         config.kv_share_group = 4;
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
-        assert_eq!(model.new_kv_caches(8, &device).len(), 1);
+        assert_eq!(model.new_kv_caches(8, false, &device).len(), 1);
         // The grouped model is a different function than the ungrouped one.
         let input = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
             TensorData::new(vec![1i32, 2, 3, 4], [1, 4]),
@@ -1424,7 +1496,7 @@ mod tests {
         let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 8, 0.0, 0.0);
         config.sliding_window = Some(2);
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
-        let mut caches = model.new_kv_caches(model.kv_capacity(), &device);
+        let mut caches = model.new_kv_caches(model.kv_capacity(), false, &device);
 
         for pos in 0..6usize {
             let step = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
@@ -1512,4 +1584,5 @@ mod tests {
         );
     }
 }
+
 

@@ -358,6 +358,9 @@ struct GenerateArgs {
     /// Compute precision: f32 (default) or f16 (faster on supported GPUs)
     #[arg(long, default_value = "f32")]
     dtype: String,
+    /// KV cache precision: f32 (default) or f16 (halves the cache memory)
+    #[arg(long, default_value = "f32")]
+    kv_cache_dtype: String,
     /// Maximum new tokens to generate
     #[arg(long, default_value_t = 50)]
     max_tokens: usize,
@@ -401,6 +404,16 @@ fn run_generate<B: Backend>(
         .map_err(|e| format!("Failed to load weights: {:?}", e))?;
     let model = model.load_record(record);
 
+    let cache_f16 = match args.kv_cache_dtype.trim().to_ascii_lowercase().as_str() {
+        "f16" | "fp16" | "half" => true,
+        "f32" | "fp32" | "float32" => false,
+        other => {
+            return Err(format!(
+                "Unknown KV cache dtype '{other}'. Available: f32, f16"
+            )
+            .into())
+        }
+    };
     let result = generate(
         &model,
         tokenizer,
@@ -412,6 +425,7 @@ fn run_generate<B: Backend>(
         args.min_p,
         args.rep_penalty,
         seed,
+        cache_f16,
         device,
     )?;
 

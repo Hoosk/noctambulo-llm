@@ -916,6 +916,7 @@ pub fn train_with_events<B: AutodiffBackend>(
             0.05,
             1.1,
             42 + epoch as u64,
+            false,
             device,
         ).ok();
 
@@ -1188,7 +1189,7 @@ mod tests {
         let model: Llm<TestBackend> = config.init_model(&device);
 
         let full = crate::generate::generate::<NdArray<f32, i32>>(
-            &model.valid(), &tokenizer, "once", 8, 0.9, 40, 0.9, 0.05, 1.1, 7, &device,
+            &model.valid(), &tokenizer, "once", 8, 0.9, 40, 0.9, 0.05, 1.1, 7, false, &device,
         )
         .unwrap();
 
@@ -1204,6 +1205,7 @@ mod tests {
             0.05,
             1.1,
             7,
+            false,
             &device,
             |chunk| {
                 streamed.push_str(chunk);
@@ -1298,12 +1300,38 @@ mod tests {
         (tokenizer, corpus)
     }
 
+    /// Replaces every float parameter with a deterministic pattern so tests
+    /// that compare numerical trajectories (gradient accumulation, resume)
+    /// do not flake on random initialization.
+    fn deterministic_fill<B: Backend>(model: Llm<B>) -> Llm<B> {
+        use burn::module::{ModuleMapper, Param};
+        struct Fill;
+        impl<B: Backend> ModuleMapper<B> for Fill {
+            fn map_float<const D: usize>(
+                &mut self,
+                param: Param<Tensor<B, D>>,
+            ) -> Param<Tensor<B, D>> {
+                let (_, tensor, _) = param.consume();
+                let dims = tensor.dims();
+                let n: usize = dims.iter().product();
+                let data: Vec<f32> = (0..n)
+                    .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.001)
+                    .collect();
+                Param::from_tensor(Tensor::<B, D>::from_data(
+                    TensorData::new(data, dims),
+                    &tensor.device(),
+                ))
+            }
+        }
+        model.map(&mut Fill)
+    }
+
     fn save_initial_weights<B: Backend>(
         dir: &Path,
         config: &ModelConfig,
         device: &B::Device,
     ) -> PathBuf {
-        let model: Llm<B> = config.init_model(device);
+        let model: Llm<B> = deterministic_fill(config.init_model(device));
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         let path = dir.join("init");
         recorder.record(model.into_record(), path.clone()).unwrap();

@@ -163,11 +163,12 @@ pub fn generate<B: Backend>(
     min_p: f32,
     repetition_penalty: f32,
     seed: u64,
+    cache_f16: bool,
     device: &B::Device,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     generate_streaming(
         model, tokenizer, prompt, max_new_tokens, temperature, top_k, top_p, min_p,
-        repetition_penalty, seed, device, |_| true,
+        repetition_penalty, seed, cache_f16, device, |_| true,
     )
 }
 
@@ -186,6 +187,7 @@ pub fn generate_streaming<B: Backend>(
     min_p: f32,
     repetition_penalty: f32,
     seed: u64,
+    cache_f16: bool,
     device: &B::Device,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -215,7 +217,7 @@ pub fn generate_streaming<B: Backend>(
     let eos_token_id = tokenizer.end_of_text_id();
     let mut decode_stream = tokenizer.decode_stream(true);
 
-    let mut caches: Vec<KvCache<B>> = model.new_kv_caches(capacity, device);
+    let mut caches: Vec<KvCache<B>> = model.new_kv_caches(capacity, cache_f16, device);
 
     // 1. Prefill Phase: process the prompt in chunks of at most `capacity`
     // tokens so a ring cache never sees duplicate slots in a single call.
