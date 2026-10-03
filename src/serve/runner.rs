@@ -26,6 +26,8 @@ pub struct TrainParams {
     pub n_layer: usize,
     pub dropout: f64,
     pub attn_softcap: f32,
+    pub sliding_window: usize,
+    pub sink_tokens: usize,
     pub save_dir: Option<PathBuf>,
     pub resume: Option<PathBuf>,
     pub output_dir: String,
@@ -241,7 +243,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
     let worker_pause = paused.clone();
 
     let worker = std::thread::spawn(move || {
-        let config = crate::config::ModelConfig::new(
+        let mut config = crate::config::ModelConfig::new(
             worker_tokenizer.vocab_size(),
             params.n_embd,
             params.n_head,
@@ -251,6 +253,8 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
             params.dropout,
             params.attn_softcap,
         );
+        config.sliding_window = (params.sliding_window > 0).then_some(params.sliding_window);
+        config.sink_tokens = params.sink_tokens;
         let device = parse_device(&params.device);
         let _ = tx.send(TrainingEvent::LogEvent {
             line: format!("Compute precision: {}", params.dtype.as_str()),

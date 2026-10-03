@@ -58,6 +58,12 @@ pub(super) struct TrainRequest {
     dropout: f64,
     #[serde(default)]
     attn_softcap: f32,
+    /// Sliding attention window in tokens (0 = full causal attention).
+    #[serde(default)]
+    sliding_window: usize,
+    /// Initial tokens always kept attendable (attention sinks).
+    #[serde(default)]
+    sink_tokens: usize,
     #[serde(default)]
     save_dir: Option<String>,
     #[serde(default)]
@@ -199,6 +205,8 @@ pub(super) async fn train(
         n_layer: req.n_layer,
         dropout: req.dropout,
         attn_softcap: req.attn_softcap,
+        sliding_window: req.sliding_window,
+        sink_tokens: req.sink_tokens,
         save_dir: req.save_dir.map(path_buf_from),
         resume: req.resume.map(path_buf_from),
         output_dir: req.output_dir,

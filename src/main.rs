@@ -291,6 +291,13 @@ struct TrainArgs {
     /// Attention score softcapping threshold (0.0 = disabled, 50.0 = Gemma 4 math)
     #[arg(long, default_value_t = 0.0)]
     attn_softcap: f32,
+    /// Sliding attention window in tokens (0 = full causal attention). Bounds
+    /// the KV cache to `window + sink_tokens` rows at inference.
+    #[arg(long, default_value_t = 0)]
+    sliding_window: usize,
+    /// Initial tokens always kept attendable (attention sinks, StreamingLLM)
+    #[arg(long, default_value_t = 0)]
+    sink_tokens: usize,
     /// Validation set ratio (0.1 = 10% validation split)
     #[arg(long, default_value_t = 0.1)]
     val_split: f32,
@@ -620,7 +627,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.n_layer,
                 args.n_ctx,
             );
-            let model_config = ModelConfig::new(
+            let mut model_config = ModelConfig::new(
                 vocab_size,
                 n_embd,
                 n_head,
@@ -630,6 +637,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.dropout,
                 args.attn_softcap,
             );
+            model_config.sliding_window =
+                (args.sliding_window > 0).then_some(args.sliding_window);
+            model_config.sink_tokens = args.sink_tokens;
 
             let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
             let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
@@ -843,6 +853,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  KV Heads (GQA)   : {} (Ratio 1:{})", n_kv_head, n_head / n_kv_head);
             println!("  Layers           : {}", n_layer);
             println!("  Softcapping Cap  : {}", if model_config.attn_softcap > 0.0 { format!("{:.1}", model_config.attn_softcap) } else { "Disabled".to_string() });
+            if let Some(window) = model_config.sliding_window {
+                println!("  Sliding Window   : {} tokens ({} sink tokens)", window, model_config.sink_tokens);
+            }
             println!("-------------------------------------------------------------------------------");
             println!("  Total Parameters : {} ({:.2} Million)", total_params, total_params as f64 / 1_000_000.0);
             println!("  Model Size (FP32): {:.2} MB", fp32_mb);

@@ -444,6 +444,19 @@ pub fn export_to_gguf<B: Backend>(
         ));
     }
 
+    // Sliding-window attention metadata (llama.cpp reads it for supported
+    // architectures; harmless for runtimes that ignore it).
+    if let Some(window) = config.sliding_window {
+        kv_pairs.push((
+            "llama.attention.sliding_window",
+            GGUF_TYPE_UINT32,
+            Box::new(move |w| {
+                w.write_all(&(window as u32).to_le_bytes())?;
+                Ok(4)
+            }),
+        ));
+    }
+
     w.write_all(&tensor_count.to_le_bytes())?;
     w.write_all(&(kv_pairs.len() as u64).to_le_bytes())?;
     current_offset += 4 + 4 + 8 + 8;

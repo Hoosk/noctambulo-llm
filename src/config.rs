@@ -90,6 +90,13 @@ pub struct ModelConfig {
     /// Context-extension factor (e.g. `2.0` doubles the usable context).
     #[serde(default = "default_rope_factor")]
     pub rope_factor: f32,
+    /// Sliding attention window in tokens. `None` (default) is full causal
+    /// attention; setting it bounds the KV cache to `window + sink_tokens`.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    /// Initial tokens kept attendable forever (attention sinks).
+    #[serde(default)]
+    pub sink_tokens: usize,
 }
 
 impl ModelConfig {
@@ -136,6 +143,8 @@ impl ModelConfig {
             attn_softcap,
             rope_scaling: None,
             rope_factor: 1.0,
+            sliding_window: None,
+            sink_tokens: 0,
         }
     }
 

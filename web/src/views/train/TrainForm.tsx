@@ -24,6 +24,8 @@ interface FormState {
   nKvHead: string;
   dropout: string;
   attnSoftcap: string;
+  slidingWindow: string;
+  sinkTokens: string;
   seqWarmup: string;
   weightDecay: string;
   labelSmoothing: string;
@@ -50,6 +52,8 @@ const DEFAULT_FORM: FormState = {
   nKvHead: "0",
   dropout: "0.1",
   attnSoftcap: "0",
+  slidingWindow: "0",
+  sinkTokens: "0",
   seqWarmup: "0",
   weightDecay: "0.1",
   labelSmoothing: "0",
@@ -98,6 +102,8 @@ function buildTrainBody(
       nKvHead: num(form.nKvHead) || null,
       dropout: num(form.dropout),
       attnSoftcap: num(form.attnSoftcap),
+      slidingWindow: Number(form.slidingWindow) || 0,
+      sinkTokens: Number(form.sinkTokens) || 0,
       seqWarmupSteps: num(form.seqWarmup),
       weightDecay: num(form.weightDecay),
       labelSmoothing: num(form.labelSmoothing),
@@ -329,6 +335,8 @@ function ConfigFields({ form, set, datasets, devices, onSaveDirChange }: ConfigF
         <NumberField label="KV heads (GQA)" min={0} value={form.nKvHead} onChange={(v) => set("nKvHead", v)} />
         <NumberField label="Dropout" step={0.05} min={0} max={0.9} value={form.dropout} onChange={(v) => set("dropout", v)} />
         <NumberField label="Attn softcap" step={1} min={0} value={form.attnSoftcap} onChange={(v) => set("attnSoftcap", v)} />
+        <NumberField label="Sliding window" step={1} min={0} value={form.slidingWindow} onChange={(v) => set("slidingWindow", v)} />
+        <NumberField label="Sink tokens" step={1} min={0} value={form.sinkTokens} onChange={(v) => set("sinkTokens", v)} />
         <NumberField label="Seq warmup steps" min={0} value={form.seqWarmup} onChange={(v) => set("seqWarmup", v)} />
         <NumberField label="Early stop (epochs)" min={0} value={form.earlyStop} onChange={(v) => set("earlyStop", v)} />
         <NumberField label="Weight decay" step={0.01} min={0} value={form.weightDecay} onChange={(v) => set("weightDecay", v)} />

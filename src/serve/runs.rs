@@ -283,6 +283,8 @@ mod tests {
             n_layer: 4,
             dropout: 0.1,
             attn_softcap: 0.0,
+            sliding_window: 0,
+            sink_tokens: 0,
             save_dir: None,
             resume: None,
             output_dir: "model_output".into(),

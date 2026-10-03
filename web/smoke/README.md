@@ -31,6 +31,7 @@ npm run smoke                        # from web/
 node web/smoke/run.mjs --help        # flags (--url, --token, --cdp, --models-dir, ...)
 ```
 
-The suite creates and removes its own artifacts: a disposable copy of `--fixture`
-(default `model_output_v2_ppl1.83`), a 1 MB dataset mix and a tiny training run. Use
-`--keep-artifacts` to inspect them, or `--skip-training` for a fast UI-only pass.
+The suite creates and removes its own artifacts: a disposable copy of the model it just
+trained (or of `--fixture` when given), a 1 MB dataset mix and a tiny training run. Use
+`--keep-artifacts` to inspect them, or `--skip-training` for a fast UI-only pass (with
+`--fixture <dir>` so the model CRUD checks have a checkpoint to copy).

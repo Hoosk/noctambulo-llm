@@ -167,6 +167,8 @@ export interface TrainRequestBody {
   nKvHead: number | null;
   dropout: number;
   attnSoftcap: number;
+  slidingWindow?: number;
+  sinkTokens?: number;
   seqWarmupSteps: number;
   weightDecay: number;
   labelSmoothing: number;

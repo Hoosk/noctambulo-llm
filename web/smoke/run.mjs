@@ -28,7 +28,7 @@ function parseArgs(argv) {
     cdp: "http://127.0.0.1:9222",
     modelsDir: REPO,
     datasetsDir: resolve(REPO, "datasets"),
-    fixture: "model_output_v2_ppl1.83",
+    fixture: "",
     skipTraining: false,
     keepArtifacts: false,
   };
@@ -268,72 +268,6 @@ try {
     "system + process counters",
   );
 
-  // --- E2: model files / rename / delete (disposable fixture copy) ---------
-  const fixturePath = resolve(opts.modelsDir, opts.fixture);
-  let crud = false;
-  if (existsSync(fixturePath)) {
-    rmSync(resolve(opts.modelsDir, SCRATCH), { recursive: true, force: true });
-    cpSync(fixturePath, resolve(opts.modelsDir, SCRATCH), { recursive: true });
-    crud = true;
-  }
-
-  await clickNav("Models");
-  if (crud) {
-    await waitFor(`document.body.innerText.includes(${JSON.stringify(SCRATCH)})`, 30_000, "scratch model row");
-    await evaluate(`(() => {
-      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
-      [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Files').click();
-    })()`);
-    await waitFor(`document.body.innerText.includes('model_weights.bin')`, 30_000, "files panel");
-    const filesOk = await evaluate(`(() => {
-      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
-      return row.querySelectorAll('a[download]').length;
-    })()`);
-    record("E2 model files + download", filesOk > 0, `${filesOk} download links`);
-
-    await evaluate(`(() => {
-      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
-      [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Rename').click();
-    })()`);
-    await waitFor(`Boolean(document.querySelector('#prompt-input'))`, 15_000, "rename dialog");
-    await setField("New name", SCRATCH_RENAMED);
-    await clickText("button", "Save");
-    await waitFor(`document.body.innerText.includes(${JSON.stringify(SCRATCH_RENAMED)})`, 30_000, "renamed row");
-    record("E2 rename model", true, `renamed to ${SCRATCH_RENAMED}`);
-
-    // E3: export op with progress, run before deleting the scratch model.
-    await evaluate(`(() => {
-      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH_RENAMED)}));
-      [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Export GGUF').click();
-    })()`);
-    const exportOk = await waitFor(
-      `document.body.innerText.includes('.gguf')`,
-      180_000,
-      "export result",
-    )
-      .then(() => true)
-      .catch(() => false);
-    record("E3 export op progress + result", exportOk, "gguf produced");
-
-    await evaluate(`(() => {
-      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH_RENAMED)}));
-      row.querySelector('button[aria-label^="Delete"]').click();
-    })()`);
-    await waitFor(`document.body.innerText.includes('Delete model?')`, 15_000, "delete dialog");
-    await evaluate(`(() => {
-      const overlay = [...document.querySelectorAll('div.fixed')].find((d) => d.textContent.includes('Delete model?'));
-      [...overlay.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Delete').click();
-    })()`);
-    await waitFor(
-      `![...document.querySelectorAll('main li')].some((li) => li.textContent.includes(${JSON.stringify(SCRATCH_RENAMED)}))`,
-      30_000,
-      "row removed",
-    );
-    record("E2 delete model", true, "scratch model removed");
-  } else {
-    record("E2 model CRUD", false, `fixture not found: ${fixturePath}`);
-  }
-
   // --- E6/E3: weighted combine, .bin rejection, share %, op progress -------
   await clickNav("Datasets");
   await toggleDataset("combined_corpus.txt");
@@ -400,7 +334,7 @@ try {
     await waitFor(`document.body.innerText.toLowerCase().includes('completed')`, 60_000, "run status badge");
     const runInfo = await evaluate(`(() => {
       const checks = [...document.querySelectorAll('main input[type=checkbox]')];
-      const runCheck = checks.find((c) => c.closest('li')?.textContent.includes('combined_corpus.txt'));
+      const runCheck = checks.find((c) => c.closest('li')?.textContent.includes(${JSON.stringify(MIX_FILE)}));
       runCheck?.click();
       return Boolean(runCheck);
     })()`);
@@ -413,6 +347,75 @@ try {
       return pre ? pre.querySelectorAll('span').length : 0;
     })()`);
     record("E7 worker logs", logs >= 1, `${logs} log lines`);
+  }
+
+  // --- E2/E3: model files, rename, export, delete --------------------------
+  // The fixture is the tiny model just trained by this suite (new-architecture
+  // checkpoint); pass --fixture to use another model directory instead.
+  const fixturePath = opts.fixture
+    ? resolve(opts.modelsDir, opts.fixture)
+    : resolve(opts.modelsDir, RUN_DIR);
+  const crud = existsSync(fixturePath);
+  if (crud) {
+    rmSync(resolve(opts.modelsDir, SCRATCH), { recursive: true, force: true });
+    cpSync(fixturePath, resolve(opts.modelsDir, SCRATCH), { recursive: true });
+  }
+
+  await clickNav("Models");
+  if (crud) {
+    await waitFor(`document.body.innerText.includes(${JSON.stringify(SCRATCH)})`, 30_000, "scratch model row");
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
+      [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Files').click();
+    })()`);
+    await waitFor(`document.body.innerText.includes('model_weights.bin')`, 30_000, "files panel");
+    const filesOk = await evaluate(`(() => {
+      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
+      return row.querySelectorAll('a[download]').length;
+    })()`);
+    record("E2 model files + download", filesOk > 0, `${filesOk} download links`);
+
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
+      [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Rename').click();
+    })()`);
+    await waitFor(`Boolean(document.querySelector('#prompt-input'))`, 15_000, "rename dialog");
+    await setField("New name", SCRATCH_RENAMED);
+    await clickText("button", "Save");
+    await waitFor(`document.body.innerText.includes(${JSON.stringify(SCRATCH_RENAMED)})`, 30_000, "renamed row");
+    record("E2 rename model", true, `renamed to ${SCRATCH_RENAMED}`);
+
+    // E3: export op with progress, run before deleting the scratch model.
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH_RENAMED)}));
+      [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Export GGUF').click();
+    })()`);
+    const exportOk = await waitFor(
+      `document.body.innerText.includes('.gguf')`,
+      180_000,
+      "export result",
+    )
+      .then(() => true)
+      .catch(() => false);
+    record("E3 export op progress + result", exportOk, "gguf produced");
+
+    await evaluate(`(() => {
+      const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH_RENAMED)}));
+      row.querySelector('button[aria-label^="Delete"]').click();
+    })()`);
+    await waitFor(`document.body.innerText.includes('Delete model?')`, 15_000, "delete dialog");
+    await evaluate(`(() => {
+      const overlay = [...document.querySelectorAll('div.fixed')].find((d) => d.textContent.includes('Delete model?'));
+      [...overlay.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Delete').click();
+    })()`);
+    await waitFor(
+      `![...document.querySelectorAll('main li')].some((li) => li.textContent.includes(${JSON.stringify(SCRATCH_RENAMED)}))`,
+      30_000,
+      "row removed",
+    );
+    record("E2 delete model", true, "scratch model removed");
+  } else {
+    record("E2 model CRUD", false, `fixture not found: ${fixturePath}`);
   }
 
   // --- HTTP contracts ------------------------------------------------------

@@ -196,8 +196,10 @@ pub fn generate_streaming<B: Backend>(
     }
 
     // `max_seq_len` is the trained context window extended by the active RoPE
-    // scaling factor (equal to `n_ctx` when scaling is off).
+    // scaling factor (equal to `n_ctx` when scaling is off); `kv_capacity` is
+    // the per-layer cache size, bounded by the sliding window when configured.
     let max_seq = model.max_seq_len();
+    let capacity = model.kv_capacity();
     if tokens.len() > max_seq {
         eprintln!(
             "Warning: prompt length ({}) exceeds model context window ({}). Keeping the most recent {} tokens.",
@@ -213,16 +215,26 @@ pub fn generate_streaming<B: Backend>(
     let eos_token_id = tokenizer.end_of_text_id();
     let mut decode_stream = tokenizer.decode_stream(true);
 
-    let mut caches: Vec<KvCache<B>> = model.new_kv_caches(max_seq, device);
+    let mut caches: Vec<KvCache<B>> = model.new_kv_caches(capacity, device);
 
-    // 1. Prefill Phase: process prompt tokens in one forward pass
+    // 1. Prefill Phase: process the prompt in chunks of at most `capacity`
+    // tokens so a ring cache never sees duplicate slots in a single call.
     let prompt_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let prompt_len = prompt_i32.len();
-    let input_data = TensorData::new(prompt_i32, [1, prompt_len]);
-    let input = Tensor::<B, 2, Int>::from_data(input_data, device);
-
-    let logits = model.forward_with_cache(input, 0, &mut caches);
-    let last_logits = logits.slice([0..1, (prompt_len - 1)..prompt_len]);
+    let mut last_logits: Option<Tensor<B, 3>> = None;
+    let mut pos = 0;
+    while pos < prompt_len {
+        let chunk = (prompt_len - pos).min(capacity);
+        let chunk_data = prompt_i32[pos..(pos + chunk)].to_vec();
+        let input =
+            Tensor::<B, 2, Int>::from_data(TensorData::new(chunk_data, [1, chunk]), device);
+        let logits = model.forward_with_cache(input, pos, &mut caches);
+        if pos + chunk == prompt_len {
+            last_logits = Some(logits.slice([0..1, (chunk - 1)..chunk]));
+        }
+        pos += chunk;
+    }
+    let last_logits = last_logits.expect("prompt is not empty");
     let mut logits_vec: Vec<f32> = last_logits
         .into_data()
         .convert::<f32>()

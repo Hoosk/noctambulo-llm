@@ -15,11 +15,12 @@ use burn::tensor::{Int, Tensor, TensorData};
 pub struct KvCache<B: Backend> {
     pub k: Option<Tensor<B, 4>>,
     pub v: Option<Tensor<B, 4>>,
-    /// Number of filled positions (`k`/`v` hold `capacity` rows, of which the
-    /// first `len` are valid).
+    /// Number of valid rows (`<= capacity`).
     pub len: usize,
-    /// Maximum number of positions the buffers can hold.
+    /// Number of ring slots (window + sinks, or the full context window).
     pub capacity: usize,
+    /// Absolute position stored in each ring slot (`usize::MAX` = empty).
+    pub positions: Vec<usize>,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -37,6 +38,18 @@ impl<B: Backend> KvCache<B> {
             v: Some(Tensor::zeros(shape, device)),
             len: 0,
             capacity,
+            positions: vec![usize::MAX; capacity],
+        }
+    }
+
+    /// Ring slot for an absolute position. The first `sink_tokens` slots are
+    /// reserved for the attention sinks and never overwritten; the rest ring.
+    pub fn slot_for(&self, pos: usize, sink_tokens: usize) -> usize {
+        if pos < sink_tokens {
+            pos
+        } else {
+            let ring = self.capacity - sink_tokens;
+            sink_tokens + (pos - sink_tokens) % ring
         }
     }
 }
@@ -72,17 +85,15 @@ pub const ROPE_BASE_THETA: f32 = 10000.0;
 const YARN_BETA_FAST: f32 = 32.0;
 const YARN_BETA_SLOW: f32 = 1.0;
 
-/// Upper bound for the RoPE cache when context scaling is enabled; keeps the
-/// per-layer cache tensors bounded for very large factors.
-pub const MAX_EXTENDED_CTX: usize = 16384;
-
-/// Effective number of positions covered by the RoPE cache. Scaling with
-/// `factor > 1` extends it up to [`MAX_EXTENDED_CTX`].
+/// Effective number of positions the model can address. With `factor > 1`
+/// RoPE scaling stretches the usable window; the RoPE angles are computed per
+/// position, so there is no table cap. The KV cache is bounded separately by
+/// the sliding window when one is configured.
 pub fn extended_ctx_len(n_ctx: usize, kind: RopeScalingKind, factor: f32) -> usize {
     if kind == RopeScalingKind::None || factor <= 1.0 || !factor.is_finite() {
         return n_ctx;
     }
-    ((n_ctx as f32 * factor).ceil() as usize).clamp(n_ctx, MAX_EXTENDED_CTX)
+    ((n_ctx as f32 * factor).ceil() as usize).max(n_ctx)
 }
 
 /// Resolved RoPE frequencies for one head size.
@@ -177,26 +188,29 @@ pub fn rope_spec(n_ctx: usize, head_dim: usize, kind: RopeScalingKind, factor: f
     }
 }
 
-pub fn precompute_rope_cache<B: Backend>(
-    n_ctx: usize,
-    head_dim: usize,
-    spec: &RopeSpec,
+/// Build the cos/sin rotation tensors for the absolute positions
+/// `start_pos..start_pos + seq_len`, one row per position. Angles are computed
+/// on the fly (no precomputed table), so any position is addressable.
+pub fn rope_cos_sin<B: Backend>(
+    freqs: &[f32],
+    mscale: f32,
+    start_pos: usize,
+    seq_len: usize,
     device: &B::Device,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    let half_dim = head_dim / 2;
-    debug_assert_eq!(spec.freqs.len(), half_dim);
-
-    let mut angles_vec = Vec::with_capacity(n_ctx * half_dim);
-    for pos in 0..n_ctx {
-        for &f in &spec.freqs {
-            angles_vec.push(pos as f32 * f);
+    let half_dim = freqs.len();
+    let mut angles_vec = Vec::with_capacity(seq_len * half_dim);
+    for pos in start_pos..(start_pos + seq_len) {
+        let p = pos as f32;
+        for &f in freqs {
+            angles_vec.push(p * f);
         }
     }
 
-    let angles_data = TensorData::new(angles_vec, [1, 1, n_ctx, half_dim]);
+    let angles_data = TensorData::new(angles_vec, [1, 1, seq_len, half_dim]);
     let angles = Tensor::<B, 4>::from_data(angles_data, device);
-    let cos = angles.clone().cos() * spec.mscale;
-    let sin = angles.sin() * spec.mscale;
+    let cos = angles.clone().cos() * mscale;
+    let sin = angles.sin() * mscale;
 
     let cos = Tensor::cat(vec![cos.clone(), cos], 3);
     let sin = Tensor::cat(vec![sin.clone(), sin], 3);
@@ -222,15 +236,49 @@ pub struct CausalSelfAttention<B: Backend> {
     pub out_proj: Linear<B>,
     pub attn_dropout: Dropout,
     pub resid_dropout: Dropout,
-    pub cos: Tensor<B, 4>,
-    pub sin: Tensor<B, 4>,
+    /// Inverse RoPE frequencies for the first half of each head. Angles are
+    /// computed per position at forward time (no precomputed table).
+    pub rope_freqs: Vec<f32>,
+    /// YaRN attention scaling applied to cos/sin.
+    pub rope_mscale: f32,
     pub n_head: usize,
     pub n_kv_head: usize,
     pub n_embd: usize,
     pub attn_softcap: f32,
+    /// Sliding attention window in tokens (`None` = full causal attention).
+    pub sliding_window: Option<usize>,
+    /// Number of initial tokens kept attendable forever (attention sinks).
+    pub sink_tokens: usize,
 }
 
 impl<B: Backend> CausalSelfAttention<B> {
+    /// Allowed-attention mask over absolute row and column positions: causal,
+    /// plus the sliding window and attention sinks when configured. Columns
+    /// with the `i32::MAX` sentinel (empty ring slots) are always masked out.
+    fn allowed_mask(
+        &self,
+        row_pos: Tensor<B, 1, Int>,
+        col_pos: Tensor<B, 1, Int>,
+    ) -> Tensor<B, 2, burn::tensor::Bool> {
+        let [rows] = row_pos.dims();
+        let [cols] = col_pos.dims();
+        let r = row_pos.reshape([rows, 1]);
+        let c = col_pos.reshape([1, cols]);
+        let causal = c.clone().lower_equal(r.clone());
+        match self.sliding_window {
+            Some(window) => {
+                // Last `window` positions: distance < window  <=>  col > row - window.
+                let recent = c.clone().greater(r.sub_scalar(window as i32));
+                let mut allowed = causal.bool_and(recent);
+                if self.sink_tokens > 0 {
+                    allowed = allowed.bool_or(c.lower_elem(self.sink_tokens as i32));
+                }
+                allowed
+            }
+            None => causal,
+        }
+    }
+
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, n_embd] = x.dims();
         let head_size = n_embd / self.n_head;
@@ -250,8 +298,8 @@ impl<B: Backend> CausalSelfAttention<B> {
             .reshape([batch_size, seq_len, self.n_kv_head, head_size])
             .swap_dims(1, 2);
 
-        let cos = self.cos.clone().slice([0..1, 0..1, 0..seq_len, 0..head_size]);
-        let sin = self.sin.clone().slice([0..1, 0..1, 0..seq_len, 0..head_size]);
+        let device = q.device();
+        let (cos, sin) = rope_cos_sin::<B>(&self.rope_freqs, self.rope_mscale, 0, seq_len, &device);
 
         let q_rot = rotate_half(q.clone());
         let q_embed = (q * cos.clone()) + (q_rot * sin.clone());
@@ -271,12 +319,10 @@ impl<B: Backend> CausalSelfAttention<B> {
             scores = (scores / cap).tanh() * cap;
         }
 
-        let device = scores.device();
-        let causal_mask = Tensor::<B, 2, burn::tensor::Bool>::tril_mask([seq_len, seq_len], 0, &device)
-            .unsqueeze_dim::<3>(0)
-            .unsqueeze_dim::<4>(0);
-
-        scores = scores.mask_fill(causal_mask, -1e4);
+        let row_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
+        let col_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
+        let disallowed = self.allowed_mask(row_pos, col_pos).bool_not();
+        scores = scores.mask_fill(disallowed.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0), -1e4);
 
         let attn_probs = burn::tensor::activation::softmax(scores, 3);
         let attn_probs = self.attn_dropout.forward(attn_probs);
@@ -310,58 +356,69 @@ impl<B: Backend> CausalSelfAttention<B> {
             .reshape([batch_size, new_seq_len, self.n_kv_head, head_size])
             .swap_dims(1, 2);
 
-        // Within the cache, slice the precomputed (possibly context-extended)
-        // table. Generation paths enforce the limit with a clear error.
-        let cached_len = self.cos.dims()[2];
-        assert!(
-            start_pos + new_seq_len <= cached_len,
-            "context window exhausted: asked for positions {start_pos}..{} but the RoPE cache holds {cached_len} (increase --rope-factor)",
-            start_pos + new_seq_len
-        );
-        let cos = self
-            .cos
-            .clone()
-            .slice([0..1, 0..1, start_pos..(start_pos + new_seq_len), 0..head_size]);
-        let sin = self
-            .sin
-            .clone()
-            .slice([0..1, 0..1, start_pos..(start_pos + new_seq_len), 0..head_size]);
+        let device = q.device();
+        let (cos, sin) =
+            rope_cos_sin::<B>(&self.rope_freqs, self.rope_mscale, start_pos, new_seq_len, &device);
         let q_rot = rotate_half(q.clone());
         let q_embed = (q * cos.clone()) + (q_rot * sin.clone());
 
         let k_rot = rotate_half(k.clone());
         let k_embed = (k * cos) + (k_rot * sin);
 
-        // Preallocated write: `slice_assign` mutates the buffer in place when
-        // the handle has a single owner (we `take` it first), so decoding no
-        // longer reallocates and copies the whole cache every token.
+        // Ring-buffer write: consecutive positions map to consecutive slots
+        // (except at the ring wrap and the sink boundary), so each chunk is
+        // written with at most a couple of in-place `slice_assign` segments.
+        // Neither prefill nor decode copy the whole cache.
         assert!(
-            cache.capacity > 0 && start_pos + new_seq_len <= cache.capacity,
-            "KV cache overflow: asked for positions {start_pos}..{} but capacity is {} (increase --rope-factor or n_ctx)",
-            start_pos + new_seq_len,
-            cache.capacity
+            cache.capacity > self.sink_tokens,
+            "KV cache capacity ({}) must exceed the sink tokens ({})",
+            cache.capacity,
+            self.sink_tokens
         );
-        let k_buf = cache.k.take().expect("kv cache k buffer");
-        let v_buf = cache.v.take().expect("kv cache v buffer");
-        let write_slice = [
-            0..batch_size,
-            0..self.n_kv_head,
-            start_pos..(start_pos + new_seq_len),
-            0..head_size,
-        ];
-        let k_buf = k_buf.slice_assign(write_slice.clone(), k_embed);
-        let v_buf = v_buf.slice_assign(write_slice, v);
-        cache.len = start_pos + new_seq_len;
-        let valid_slice = [0..batch_size, 0..self.n_kv_head, 0..cache.len, 0..head_size];
-        let k_full = k_buf.clone().slice(valid_slice.clone());
-        let v_full = v_buf.clone().slice(valid_slice);
+        for pos in start_pos..(start_pos + new_seq_len) {
+            let slot = cache.slot_for(pos, self.sink_tokens);
+            cache.positions[slot] = pos;
+        }
+        let mut k_buf = cache.k.take().expect("kv cache k buffer");
+        let mut v_buf = cache.v.take().expect("kv cache v buffer");
+        let mut offset = 0usize;
+        while offset < new_seq_len {
+            let pos = start_pos + offset;
+            let slot = cache.slot_for(pos, self.sink_tokens);
+            let mut len = 1usize;
+            while offset + len < new_seq_len {
+                let next_pos = start_pos + offset + len;
+                if cache.slot_for(next_pos, self.sink_tokens) == slot + len {
+                    len += 1;
+                } else {
+                    break;
+                }
+            }
+            let write_slice = [
+                0..batch_size,
+                0..self.n_kv_head,
+                slot..(slot + len),
+                0..head_size,
+            ];
+            let k_part = k_embed
+                .clone()
+                .slice([0..batch_size, 0..self.n_kv_head, offset..(offset + len), 0..head_size]);
+            let v_part = v
+                .clone()
+                .slice([0..batch_size, 0..self.n_kv_head, offset..(offset + len), 0..head_size]);
+            k_buf = k_buf.slice_assign(write_slice.clone(), k_part);
+            v_buf = v_buf.slice_assign(write_slice, v_part);
+            offset += len;
+        }
+        cache.len = (cache.len + new_seq_len).min(cache.capacity);
+        let k_full = k_buf.clone();
+        let v_full = v_buf.clone();
         cache.k = Some(k_buf);
         cache.v = Some(v_buf);
 
         let k_repeat = repeat_kv(k_full, n_rep);
         let v_repeat = repeat_kv(v_full, n_rep);
 
-        let full_len = k_repeat.dims()[2];
         let k_t = k_repeat.swap_dims(2, 3);
         let scale = 1.0 / (head_size as f64).sqrt();
         let mut scores = q_embed.matmul(k_t) * scale;
@@ -371,17 +428,17 @@ impl<B: Backend> CausalSelfAttention<B> {
             scores = (scores / cap).tanh() * cap;
         }
 
-        if new_seq_len > 1 {
-            let device = scores.device();
-            let row_idx = Tensor::<B, 1, Int>::arange(start_pos as i64..(start_pos + new_seq_len) as i64, &device);
-            let col_idx = Tensor::<B, 1, Int>::arange(0..full_len as i64, &device);
-            let upper_mask = col_idx
-                .unsqueeze_dim::<2>(0)
-                .greater(row_idx.unsqueeze_dim::<2>(1))
-                .unsqueeze_dim::<3>(0)
-                .unsqueeze_dim::<4>(0);
-            scores = scores.mask_fill(upper_mask, -1e4);
-        }
+        let row_pos =
+            Tensor::<B, 1, Int>::arange(start_pos as i64..(start_pos + new_seq_len) as i64, &device);
+        let col_pos: Vec<i32> = cache
+            .positions
+            .iter()
+            .map(|&p| if p == usize::MAX { i32::MAX } else { p as i32 })
+            .collect();
+        let col_pos =
+            Tensor::<B, 1, Int>::from_data(TensorData::new(col_pos, [cache.capacity]), &device);
+        let disallowed = self.allowed_mask(row_pos, col_pos).bool_not();
+        scores = scores.mask_fill(disallowed.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0), -1e4);
 
         let attn_probs = burn::tensor::activation::softmax(scores, 3);
         let attn_probs = self.attn_dropout.forward(attn_probs);
@@ -411,6 +468,8 @@ pub struct CausalSelfAttentionConfig {
     pub attn_softcap: f32,
     pub rope_kind: RopeScalingKind,
     pub rope_factor: f32,
+    pub sliding_window: Option<usize>,
+    pub sink_tokens: usize,
 }
 
 impl CausalSelfAttentionConfig {
@@ -418,8 +477,6 @@ impl CausalSelfAttentionConfig {
         let head_dim = self.n_embd / self.n_head;
         let kv_dim = self.n_kv_head * head_dim;
         let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
-        let cache_len = extended_ctx_len(self.n_ctx, self.rope_kind, self.rope_factor);
-        let (cos, sin) = precompute_rope_cache(cache_len, head_dim, &rope, device);
 
         CausalSelfAttention {
             q_proj: LinearConfig::new(self.n_embd, self.n_embd).with_bias(true).init(device),
@@ -428,12 +485,14 @@ impl CausalSelfAttentionConfig {
             out_proj: LinearConfig::new(self.n_embd, self.n_embd).with_bias(false).init(device),
             attn_dropout: DropoutConfig::new(self.dropout).init(),
             resid_dropout: DropoutConfig::new(self.dropout).init(),
-            cos,
-            sin,
+            rope_freqs: rope.freqs,
+            rope_mscale: rope.mscale,
             n_head: self.n_head,
             n_kv_head: self.n_kv_head,
             n_embd: self.n_embd,
             attn_softcap: self.attn_softcap,
+            sliding_window: self.sliding_window,
+            sink_tokens: self.sink_tokens,
         }
     }
 }
@@ -510,6 +569,8 @@ pub struct BlockConfig {
     pub attn_softcap: f32,
     pub rope_kind: RopeScalingKind,
     pub rope_factor: f32,
+    pub sliding_window: Option<usize>,
+    pub sink_tokens: usize,
 }
 
 impl BlockConfig {
@@ -524,6 +585,8 @@ impl BlockConfig {
                 attn_softcap: self.attn_softcap,
                 rope_kind: self.rope_kind,
                 rope_factor: self.rope_factor,
+                sliding_window: self.sliding_window,
+                sink_tokens: self.sink_tokens,
             }
             .init(device),
             mlp: SwiGluMlpConfig {
@@ -543,16 +606,27 @@ pub struct Llm<B: Backend> {
     pub blocks: Vec<Block<B>>,
     pub norm: RmsNorm<B>,
     pub n_ctx: usize,
+    /// Position limit: `n_ctx` extended by the active RoPE scaling factor.
+    pub max_seq: usize,
 }
 
 impl<B: Backend> Llm<B> {
     /// Total number of positions the model can attend to (the config `n_ctx`
     /// extended by the active RoPE scaling factor).
     pub fn max_seq_len(&self) -> usize {
-        self.blocks
-            .first()
-            .map(|b| b.attn.cos.dims()[2])
-            .unwrap_or(self.n_ctx)
+        self.max_seq
+    }
+
+    /// Number of rows each layer cache needs. With a sliding window the cache
+    /// is bounded to `window + sinks`; otherwise it spans the whole context.
+    pub fn kv_capacity(&self) -> usize {
+        match self.blocks.first() {
+            Some(b) => match b.attn.sliding_window {
+                Some(window) => window + b.attn.sink_tokens,
+                None => self.max_seq,
+            },
+            None => self.max_seq,
+        }
     }
 
     /// Preallocated caches (one per layer) sized to `capacity` positions.
@@ -605,6 +679,7 @@ impl ModelConfig {
         let kv_head = self.get_n_kv_head();
         let rope_kind = self.rope_kind();
         let rope_factor = self.rope_factor;
+        let max_seq = extended_ctx_len(self.n_ctx, rope_kind, rope_factor);
         let blocks = (0..self.n_layer)
             .map(|_| {
                 BlockConfig {
@@ -616,6 +691,8 @@ impl ModelConfig {
                     attn_softcap: self.attn_softcap,
                     rope_kind,
                     rope_factor,
+                    sliding_window: self.sliding_window,
+                    sink_tokens: self.sink_tokens,
                 }
                 .init(device)
             })
@@ -637,6 +714,7 @@ impl ModelConfig {
             blocks,
             norm: RmsNorm::new(self.n_embd, device),
             n_ctx: self.n_ctx,
+            max_seq,
         }
     }
 }
@@ -692,12 +770,12 @@ mod tests {
         assert_eq!(extended_ctx_len(256, RopeScalingKind::Linear, 1.0), 256);
         assert_eq!(extended_ctx_len(256, RopeScalingKind::Linear, 2.0), 512);
         assert_eq!(extended_ctx_len(256, RopeScalingKind::Yarn, 2.5), 640);
-        // Huge factors are clamped to the cache cap.
-        assert_eq!(extended_ctx_len(4096, RopeScalingKind::Ntk, 100.0), MAX_EXTENDED_CTX);
+        // No table cap: angles are computed per position.
+        assert_eq!(extended_ctx_len(4096, RopeScalingKind::Ntk, 100.0), 409_600);
     }
 
     #[test]
-    fn test_attention_cache_extends_with_scaling() {
+    fn test_rope_spec_wiring() {
         use burn_ndarray::{NdArray, NdArrayDevice};
         let device = NdArrayDevice::Cpu;
 
@@ -710,17 +788,20 @@ mod tests {
             attn_softcap: 0.0,
             rope_kind: RopeScalingKind::None,
             rope_factor: 1.0,
+            sliding_window: None,
+            sink_tokens: 0,
         };
         let attn = base.init::<NdArray<f32, i32>>(&device);
-        assert_eq!(attn.cos.dims()[2], 8);
+        assert_eq!(attn.rope_freqs.len(), 4); // head_dim / 2
+        assert_eq!(attn.rope_mscale, 1.0);
 
-        let scaled = CausalSelfAttentionConfig {
-            rope_kind: RopeScalingKind::Linear,
+        let yarn = CausalSelfAttentionConfig {
+            rope_kind: RopeScalingKind::Yarn,
             rope_factor: 2.0,
             ..base
         };
-        let attn = scaled.init::<NdArray<f32, i32>>(&device);
-        assert_eq!(attn.cos.dims()[2], 16);
+        let attn = yarn.init::<NdArray<f32, i32>>(&device);
+        assert!((attn.rope_mscale - (0.1 * 2.0f32.ln() + 1.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -868,6 +949,173 @@ mod tests {
 
         eprintln!("[CAUSALITY TEST] max_diff pos0 = {max_diff:.6}, changed_pos1 = {changed_pos1}/{v}");
         assert!(max_diff < 1e-4, "Position 0 logits changed when token at position 1 changed (max_diff={max_diff}). Causal mask broken!");
+    }
+
+    /// Runs the same token sequence through the cached decode loop and through
+    /// a single full forward, comparing every row. Exercises the ring buffer,
+    /// the per-position RoPE angles and the window/sink mask together.
+    fn assert_cached_matches_full_with_window(
+        window: Option<usize>,
+        sink_tokens: usize,
+    ) -> (usize, usize) {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
+        config.sliding_window = window;
+        config.sink_tokens = sink_tokens;
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+
+        let tokens: Vec<i32> = vec![3, 5, 7, 11, 13, 17];
+        let full = model
+            .forward(Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                TensorData::new(tokens.clone(), [1, tokens.len()]),
+                &device,
+            ))
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let capacity = model.kv_capacity();
+        let expected_capacity = window.map(|w| w + sink_tokens).unwrap_or(model.max_seq_len());
+        assert_eq!(capacity, expected_capacity);
+
+        let mut caches = model.new_kv_caches(capacity, &device);
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let step = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                TensorData::new(vec![tok], [1, 1]),
+                &device,
+            );
+            let logits = model
+                .forward_with_cache(step, pos, &mut caches)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            let expected = &full[pos * 50..(pos + 1) * 50];
+            let diff = expected
+                .iter()
+                .zip(logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                diff < 1e-4,
+                "cached decode diverged at pos {pos} (window={window:?}, sinks={sink_tokens}): max_diff={diff}"
+            );
+        }
+        (capacity, model.max_seq_len())
+    }
+
+    #[test]
+    fn test_cached_decode_matches_full_without_window() {
+        let (capacity, max_seq) = assert_cached_matches_full_with_window(None, 0);
+        assert_eq!(capacity, max_seq);
+    }
+
+    #[test]
+    fn test_cached_decode_matches_full_with_ring_window() {
+        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 0);
+        // Bounded cache: only `window` slots, all overwritten by the end.
+        assert_eq!(capacity, 2);
+    }
+
+    #[test]
+    fn test_cached_decode_matches_full_with_sinks() {
+        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 1);
+        assert_eq!(capacity, 3);
+    }
+
+    #[test]
+    fn test_ring_cache_keeps_only_window_positions() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 8, 0.0, 0.0);
+        config.sliding_window = Some(2);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        let mut caches = model.new_kv_caches(model.kv_capacity(), &device);
+
+        for pos in 0..6usize {
+            let step = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                TensorData::new(vec![pos as i32 + 1], [1, 1]),
+                &device,
+            );
+            model.forward_with_cache(step, pos, &mut caches);
+        }
+
+        let cache = &caches[0];
+        assert_eq!(cache.len, 2);
+        let mut stored: Vec<usize> = cache
+            .positions
+            .iter()
+            .copied()
+            .filter(|&p| p != usize::MAX)
+            .collect();
+        stored.sort_unstable();
+        assert_eq!(stored, vec![4, 5]);
+    }
+
+    #[test]
+    fn test_sliding_window_limits_attention_span() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 8, 0.0, 0.0);
+        config.sliding_window = Some(2);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+
+        let run = |first: i32| -> Vec<f32> {
+            model
+                .forward(Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                    TensorData::new(vec![first, 11, 13, 17], [1, 4]),
+                    &device,
+                ))
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+        let a = run(7);
+        let b = run(49);
+
+        let row_diff = |row: usize| -> f32 {
+            a[row * 50..(row + 1) * 50]
+                .iter()
+                .zip(b[row * 50..(row + 1) * 50].iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // Row 1 sees position 0 (distance 1), row 3 does not (distance 3 > 2).
+        assert!(row_diff(1) > 1e-4, "window should include the previous token");
+        assert!(row_diff(3) < 1e-4, "window must drop positions older than 2");
+    }
+
+    #[test]
+    fn test_sink_tokens_keep_first_position_visible() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 8, 0.0, 0.0);
+        config.sliding_window = Some(2);
+        config.sink_tokens = 1;
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+
+        let run = |first: i32| -> Vec<f32> {
+            model
+                .forward(Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                    TensorData::new(vec![first, 11, 13, 17], [1, 4]),
+                    &device,
+                ))
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+        };
+        let a = run(7);
+        let b = run(49);
+        let diff = a[3 * 50..4 * 50]
+            .iter()
+            .zip(b[3 * 50..4 * 50].iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff > 1e-4,
+            "sink token at position 0 must stay visible at row 3 (diff={diff})"
+        );
     }
 }
 
