@@ -22,7 +22,8 @@
   - **GPU loss accumulation** with no per-batch GPU $\to$ CPU synchronization stalls.
   - **Gradient accumulation**, **progressive sequence scaling** warmup and **early stopping**.
   - **Decoupled weight decay** (AdamW) applied to all parameters, optional **label smoothing** and **z-loss**.
-- **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; generation and evaluation can run past the trained `n_ctx` and GGUF exports carry the `rope.scaling.*` metadata.
+- **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; RoPE angles are computed per position (no table cap), generation and evaluation can run past the trained `n_ctx`, and GGUF exports carry the `rope.scaling.*` metadata.
+- **Bounded KV cache**: `--sliding-window` plus `--sink-tokens` turn the per-layer cache into a ring buffer of `window + sinks` rows (long prompts are prefilled in chunks); without a window the cache is preallocated to the context and written in place.
 - **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
 - **Full-state checkpoints and resume**: weights, AdamW moments, LR schedule and shuffler RNG; safe stop with Ctrl+C saves an interrupted checkpoint.
 - **Evaluation with BPB**: cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and bits-per-byte (comparable across tokenizers), over all batches by default.
@@ -75,6 +76,8 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--lr <float>` | Learning rate | `0.0003` |
 | `--dropout <float>` | Dropout probability | `0.1` |
 | `--attn-softcap <float>` | Attention capping (`0.0` disabled, `50.0` Gemma-style) | `0.0` |
+| `--sliding-window <n>` | Sliding attention window (`0` = full causal); bounds the inference KV cache to `n + sink-tokens` | `0` |
+| `--sink-tokens <n>` | Initial tokens always kept attendable (attention sinks) | `0` |
 | `--val-split <float>` | Fraction reserved for validation and perplexity ($PPL$) | `0.1` |
 | `--grad-accum <n>` | Micro-batches accumulated per AdamW step (true gradient mean, equivalent to a larger batch) | `1` |
 | `--save-dir <path>` | Directory for automatic per-epoch checkpoint saving | `None` |

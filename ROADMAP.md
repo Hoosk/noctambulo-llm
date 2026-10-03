@@ -4,8 +4,8 @@ Last updated: 2026-10-03 (KV cache modernization started: Phase 0 quality gates 
 
 ## Current Status
 
-- Complete engine: BPE tokenizer, datasets (txt/bin/parquet with direct ingest and dedupe), `train` (real gradient accumulation, full-state resume, safe stop, f16, RoPE context extension, label smoothing, z-loss, AdamW weight decay), `eval` (BPB, all batches, early stopping, `--max-tokens` slice), `generate` (CLI + SSE streaming, RoPE scaling flags, f32/f16), GGUF `export` (with `rope.scaling.*` keys) and the `serve` web suite.
-- 67 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
+- Complete engine: BPE tokenizer, datasets (txt/bin/parquet with direct ingest and dedupe), `train` (real gradient accumulation, full-state resume, safe stop, f16, RoPE context extension, sliding window + sinks, label smoothing, z-loss, AdamW weight decay), `eval` (BPB, all batches, early stopping, `--max-tokens` slice), `generate` (CLI + SSE streaming, RoPE scaling flags, f32/f16, bounded ring cache), GGUF `export` (with `rope.scaling.*` and `attention.sliding_window` keys) and the `serve` web suite.
+- 73 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
 - Web: React 19 + Vite + TypeScript + Tailwind v4 built locally (no CDN), English UI, HttpOnly-cookie auth, served from `web/dist` by Axum. Train/Datasets/Generate/Models/Export/Devices views plus run history and live telemetry.
 - Docs: English-only (README, `cli_parameters.md`, `doc/*.md`, ROADMAP and the auxiliary notes).
 
@@ -15,7 +15,7 @@ Goal: move from a per-layer f32 cache that reallocated with `Tensor::cat` on eve
 
 - ✅ **Phase 0 — Baseline and quality gates**: cache-vs-full-forward parity test, overfit regression test (caught the Stage D weight-decay bug: a `ModuleMapper`-based decay froze every mapped parameter), `stats` KV bytes/token, `eval --max-tokens`, decode benchmark.
 - ✅ **Phase 1 — Cache engine v2**: preallocated per-layer buffers written with in-place `slice_assign` (no more per-token `cat`), attention over the filled region only, `generate --dtype f16` (f16 cache follows compute), API/web compute-precision field. Decode baseline on the tiny model: ~8.6 tok/s, ~143 MB peak RSS.
-- ⏳ **Phase 2 — Sliding window + sinks + dynamic RoPE**: trained `sliding_window`/`sink_tokens`, masks in both forwards, RoPE computed per position (drop the precomputed table and its 16k cap), bounded cache with eviction.
+- ✅ **Phase 2 — Sliding window + sinks + dynamic RoPE**: `sliding_window`/`sink_tokens` in `ModelConfig` (CLI/API/web), window+sink masks in the training and cached forwards, RoPE angles computed per position (the precomputed table and its 16k cap are gone) and a bounded ring-buffer KV cache written in place with chunked prefill. Verified end-to-end: a tiny 1-epoch model with `--sliding-window 64 --sink-tokens 4` reaches PPL 373 (random is ~8000), generates coherent TinyStories text, and continues past the window with a 68-row cache. GGUF exports `llama.attention.sliding_window`.
 - ⏳ **Phase 3 — Cross-layer KV sharing**: one K/V per layer group (`kv_share_group`), `arch_version` gating, GGUF compatibility mode with a documented approximation.
 - ⏳ **Phase 4 — MLA latent cache**: `kv_down`/`k_up`/`v_up` with decoupled RoPE, latent-only cache (~/4 memory, /8 with f16), matrix absorption at inference, `deepseek2` GGUF mapping where possible.
 - ⏳ **Phase 5 — Quantized cache with custom kernels**: `burn::cubecl` kernels for in-place writes and int8/Q4 block-quantized cache (recent window in f16); FP4 packing as a stretch.
@@ -58,4 +58,4 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 
 ## Suggested Order
 
-The KV cache modernization phases above are the active work, in order (2 → 5). Separate known gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. After Phase 2/3/4 change the architecture, re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above).
+The KV cache modernization phases above are the active work, in order (3 → 5). Separate known gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. After Phase 3/4 change the architecture, re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above).

@@ -26,6 +26,8 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--lr` | `f64` | `0.0003` | Maximum learning rate (peak learning rate) for AdamW. |
 | `--dropout` | `f64` | `0.1` | Neuron dropout probability for attention and MLP regularization. |
 | `--attn-softcap` | `f32` | `0.0` | Threshold for soft-capping attention scores via $\tanh$. `0.0` disables it. |
+| `--sliding-window` | `usize` | `0` | Sliding attention window in tokens (`0` = full causal attention). The KV cache at inference is bounded to `window + sink_tokens` rows. |
+| `--sink-tokens` | `usize` | `0` | Initial tokens always kept attendable (attention sinks, StreamingLLM). |
 | `--val-split` | `f32` | `0.1` | Percentage of the dataset reserved for validation and perplexity computation ($\text{PPL} = e^{\text{loss}}$). |
 | `--grad-accum` | `usize` | `1` | Gradient accumulation steps before running the AdamW step. |
 | `--save-dir` | `Option<String>`| `None` | Directory to save automatic model checkpoints at the end of each epoch. |

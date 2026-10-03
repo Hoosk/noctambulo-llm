@@ -157,6 +157,24 @@ cargo run --release -- generate "Once upon a time" \
 | `ntk` | Dynamic-NTK: the RoPE base grows as `10000 · factor^(d/(d-2))`. |
 | `yarn` | YaRN: high frequencies keep the original table, low ones are interpolated, plus the standard `mscale` attention factor. |
 
-The effective window becomes `factor × n_ctx` (capped at 16384 positions to bound the
-per-layer cache), and the same flags are available on `eval`. The web Generate view
+The effective window becomes `factor × n_ctx` (RoPE angles are computed per position, so
+there is no table cap), and the same flags are available on `eval`. The web Generate view
 exposes both fields, and GGUF exports record the strategy (see `doc/export.md`).
+
+## Bounded KV Cache (Sliding Window)
+
+When the checkpoint was trained with `--sliding-window N` (and optionally
+`--sink-tokens S`), each layer cache is a **ring buffer of `N + S` rows** instead of a
+buffer spanning the whole context:
+
+- The first `S` slots are reserved for the attention sinks and never overwritten.
+- Every new token is written in place (`slice_assign` over contiguous slot segments);
+  decoding never reallocates or copies the cache.
+- Long prompts are prefilled in chunks of at most `N + S` tokens, so the ring never sees
+  duplicate slots in one forward pass.
+- The mask compares **absolute positions**, so windowing and RoPE stay correct while the
+  buffer wraps around.
+
+Memory per layer is therefore `2 · n_kv_head · head_dim · 4 bytes · (N + S)`, independent
+of how long the conversation grows. Checkpoints without a window keep the preallocated
+full-context cache (same behavior as before, without the per-token `cat`).

@@ -29,6 +29,8 @@ The `train` subcommand accepts **23 CLI** configuration parameters:
 | `--lr <float>` | `f64` | `0.0003` (3e-4) | Peak learning rate. It is adjusted dynamically via a cosine schedule with *warmup*. |
 | `--dropout <float>` | `f64` | `0.1` | Dropout probability applied to attention probabilities and to residual/MLP projections as regularization. |
 | `--attn-softcap <float>` | `f32` | `0.0` | Softcapping threshold for attention scores. `0.0` disables the function. A value such as `50.0` applies the Gemma 4-style formula to stabilize gradients. |
+| `--sliding-window <n>` | `usize` | `0` | Sliding attention window in tokens (`0` = full causal attention). Tokens farther back than `n` are masked out; at inference the KV cache is a ring buffer bounded to `n + sink_tokens` rows. |
+| `--sink-tokens <n>` | `usize` | `0` | Number of initial tokens that stay attendable forever (attention sinks). They survive ring eviction, which keeps long streams stable. |
 | `--val-split <float>` | `f32` | `0.1` | Fraction of the corpus reserved for validation (computation of Loss and Perplexity per epoch). `0.0` disables validation. |
 | `--grad-accum <n>` | `usize` | `1` | Gradient accumulation steps per AdamW update. The accumulated gradient is the **mean** of the micro-batches (equivalent to a larger batch). |
 | `--save-dir <path>` | `Option<String>` | `None` | Directory where `checkpoint_epoch_N.bin` and `checkpoint_best.bin` are saved at the end of each epoch. |
