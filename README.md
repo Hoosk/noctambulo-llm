@@ -310,10 +310,13 @@ kuro-neko/
 ## ✅ Tests and Quality
 
 ```bash
-cargo test              # 40 tests (data, model, train/resume, serve API, GGUF export)
+cargo test                    # 66 tests (data, model, train/resume, serve API, GGUF export)
+cargo clippy --all-targets
+cargo check --features cuda   # optional CUDA backend (runtime requires an NVIDIA GPU)
 
 cd web
-npm run lint            # ESLint
-npm run doctor          # react-doctor quality gate
-npm run build           # TypeScript check + production build in web/dist
+npm run lint                  # ESLint
+npm run doctor                # react-doctor quality gate
+npm run build                 # TypeScript check + production build in web/dist
+npm run smoke                 # CDP browser suite (see web/smoke/README.md)
 ```

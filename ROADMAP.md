@@ -34,14 +34,14 @@ Last updated: 2026-09-29 (after Stage D: RoPE scaling, direct Parquet ingest wit
 - ✅ **Framework**: option C chosen and executed — React 19 + Vite + Tailwind v4, with the server serving `dist/`; the old vanilla `frontend/` (~2.8k LOC) was deleted.
 - ✅ **Language**: UI rewritten in English; docs are English-only.
 - ✅ **Linting**: ESLint flat config with `npm run lint` plus `npm run doctor` (react-doctor, kept at 100/100).
-- **UI smoke test**: version the CDP (headless Chromium) script in the repo; today it lives in scratch space and validates console errors and each tab.
+- ✅ **UI smoke test**: versioned at `web/smoke/run.mjs` (CDP over headless Chromium, no test framework) with `npm run smoke`, configurable URL/token/CDP flags, self-created and self-cleaned artifacts; covers login, D4/D6 form fields, telemetry, model CRUD, GGUF export, weighted combine (`.bin` rejection), run history, worker logs and val curve.
 - ✅ **README**: rewritten in English with install, full workflow, web build/auth and troubleshooting.
 
 ## Technical Debt (Docs and Strings)
 
 - ✅ **Translate all documentation to English**: README, `cli_parameters.md`, `doc/*.md`, ROADMAP and the auxiliary notes, with no Spanish copies.
-- **Code strings and help text**: parts of `src/` still mix Spanish comments and occasional messages; migrate them to English. Also fix inaccurate `--help` strings (`serve --token` claims it is auto-generated; `train --dtype` advertises `bf16` although runtime rejects it).
+- ✅ **Code strings and help text**: the remaining Spanish comments/messages in `src/` were translated; `serve --token` now documents that omitting it disables auth and `train --dtype` states that `bf16` is rejected by the WGPU backend.
 
 ## Suggested Order
 
-Stages D and E are complete. Remaining work is technical debt: version the UI smoke test in the repo, and finish the English pass over code comments/strings plus the inaccurate `--help` texts (`serve --token` is optional, not auto-generated; `train --dtype` advertises `bf16` although runtime rejects it).
+Stages D and E are complete and the English/help/smoke debt is closed. The only known verification gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. No active work items.
