@@ -32,7 +32,7 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--resume` | `Option<String>`| `None` | Path to a checkpoint file or previous weights to resume training from. |
 | `--seq-warmup-steps` | `usize` | `0` | Initial steps for **Progressive Sequence Scaling** (grows the context window from $N/4$ to $N$). `0` disables it. |
 | `--early-stop-patience` | `usize` | `0` | Stops training after $N$ epochs without `val_loss` improvement. `0` disables it. |
-| `--weight-decay` | `f64` | `0.1` | Decoupled weight decay applied only to rank ≥ 2 parameters (weight matrices and embeddings); norms and biases are excluded. `0` disables it. |
+| `--weight-decay` | `f64` | `0.1` | Decoupled weight decay (AdamW) applied to all parameters. `0` disables it. |
 | `--label-smoothing` | `f32` | `0.0` | Label-smoothing factor for the cross-entropy loss. `0.0` disables it. |
 | `--z-loss` | `f32` | `0.0` | Z-loss coefficient applied to `logsumexp(logits)²`. `0.0` disables it. |
 
@@ -68,6 +68,7 @@ Evaluates the cross-entropy loss, perplexity ($PPL$) and bits per byte (BPB) of 
 | `--n-ctx` | `Option<usize>`| `None` | Overrides the context window for evaluation. |
 | `--eval-batch-size` | `usize` | `16` | Evaluation batch (lower it if there is OOM on small GPUs). |
 | `--eval-batches` | `usize` | `0` | Maximum number of batches to evaluate (`0` = all). There used to be a fixed limit of 100. BPB is not available for `.bin` datasets (they do not know their size in bytes). |
+| `--max-tokens` | `usize` | `0` | Tokenizes at most this many dataset tokens before evaluating (`0` = all). Useful to evaluate a slice of a huge corpus instead of tokenizing it fully. Pairs with `--eval-batches`. |
 | `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
 | `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
 
@@ -100,6 +101,7 @@ Performs autoregressive text inference using the model loaded from `model_output
 | `--rep-penalty` | `f32` | `1.6` | Repetition penalty. Discourages repeated tokens by dividing their logits. |
 | `--max-tokens` | `usize` | `50` | Maximum number of new tokens to generate. |
 | `--seed` | `Option<u64>` | `None` | Random seed of the Xorshift generator for reproducibility. |
+| `--dtype` | `String` | `"f32"` | Compute precision: `f32` (fused WGPU) or `f16` (non-fused half backend; the KV cache follows the compute dtype). |
 | `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
 | `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
 
@@ -127,7 +129,7 @@ Downloads a dataset file from Hugging Face Hub; Parquet files are automatically 
 ---
 
 ## 📈 8. `stats` Subcommand Parameters
-Prints the model parameter count, VRAM footprint, and FLOPs statistics. It takes no parameters.
+Prints the model parameter count, VRAM footprint, FLOPs statistics and KV cache estimates (`KV Cache (f32)` and `KV Cache (f16)`, in bytes/token and total MB at `n_ctx`). It takes no parameters.
 
 ---
 

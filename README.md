@@ -21,7 +21,7 @@
   - **Sparse loss computation ($NLL$)** with `log_softmax` + `gather`.
   - **GPU loss accumulation** with no per-batch GPU $\to$ CPU synchronization stalls.
   - **Gradient accumulation**, **progressive sequence scaling** warmup and **early stopping**.
-  - **Decoupled weight decay** applied only to weight matrices/embeddings (norms and biases excluded), optional **label smoothing** and **z-loss**.
+  - **Decoupled weight decay** (AdamW) applied to all parameters, optional **label smoothing** and **z-loss**.
 - **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; generation and evaluation can run past the trained `n_ctx` and GGUF exports carry the `rope.scaling.*` metadata.
 - **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
 - **Full-state checkpoints and resume**: weights, AdamW moments, LR schedule and shuffler RNG; safe stop with Ctrl+C saves an interrupted checkpoint.
@@ -81,7 +81,7 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--resume <path>` | Checkpoint to resume from (restores weights, AdamW, schedule and RNG; `--epochs` = additional epochs) | `None` |
 | `--seq-warmup-steps <n>` | Initial steps for **Progressive Sequence Scaling** (from $N/4$ to $N$) | `0` |
 | `--early-stop-patience <n>` | Stops training after `n` epochs without improving `val_loss` (`0` = disabled) | `0` |
-| `--weight-decay <float>` | Decoupled weight decay for rank ≥ 2 weights (norms/biases excluded) | `0.1` |
+| `--weight-decay <float>` | Decoupled weight decay (AdamW) applied to all parameters (`0` disables it) | `0.1` |
 | `--label-smoothing <float>` | Label-smoothing factor for the cross-entropy loss | `0.0` |
 | `--z-loss <float>` | Z-loss coefficient on `logsumexp(logits)²` | `0.0` |
 
@@ -151,7 +151,7 @@ With `--resume`, `--epochs` means **additional epochs** and the cosine schedule 
 
 ### 3. Evaluate Model, Perplexity and BPB (`eval`)
 
-Evaluates the cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and **bits-per-byte** (BPB, comparable across tokenizers) of a trained model. By default it evaluates **all** dataset batches (`--eval-batches 0`); BPB is not available with `.bin` datasets because they do not keep the original size in bytes:
+Evaluates the cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and **bits-per-byte** (BPB, comparable across tokenizers) of a trained model. By default it evaluates **all** dataset batches (`--eval-batches 0`) and tokenizes the full dataset (`--max-tokens 0`); `--max-tokens <n>` tokenizes at most `n` tokens first (it pairs with `--eval-batches`) to evaluate a slice of a huge corpus. BPB is not available with `.bin` datasets because they do not keep the original size in bytes:
 
 ```bash
 cargo run --release -- eval --model-dir model_output --file datasets/corpus.txt
@@ -200,16 +200,17 @@ cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p
 | `--rep-penalty <float>` | Repetition penalty factor for repeated tokens | `1.6` |
 | `--max-tokens <n>` | Maximum number of new tokens to generate | `50` |
 | `--seed <n>` | Pseudo-random generator seed for reproducibility | `None` |
+| `--dtype <kind>` | Compute precision: `f32` or `f16` (KV cache follows it) | `f32` |
 | `--rope-scaling <kind>` | Context extension: `none`, `linear`, `ntk` or `yarn` | `none` |
 | `--rope-factor <float>` | Extension factor (e.g. `2.0` doubles the usable context) | `1.0` |
 
-The web API additionally exposes `POST /api/generate/stream` (SSE), which streams tokens as they are generated and supports cancellation.
+The web API additionally exposes `POST /api/generate/stream` (SSE), which streams tokens as they are generated and supports cancellation. The web Generate form also exposes the compute precision (`f32`/`f16`).
 
 ---
 
 ### 6. Inspect Model Statistics (`stats`)
 
-Prints the total parameter count, FP32 memory footprint, FLOPs per token and GQA compression:
+Prints the total parameter count, FP32 memory footprint, FLOPs per token, GQA compression and KV cache estimates (f32/f16, in bytes/token and total MB at `n_ctx`):
 
 ```bash
 cargo run --release -- stats

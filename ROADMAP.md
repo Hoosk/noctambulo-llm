@@ -1,13 +1,27 @@
 # 🗺️ Kuro-Neko Roadmap
 
-Last updated: 2026-09-29 (after Stage D: RoPE scaling, direct Parquet ingest with dedupe, grouped weight decay plus label smoothing/z-loss, and the optional CUDA backend).
+Last updated: 2026-10-03 (KV cache modernization started: Phase 0 quality gates and Phase 1 preallocated cache/f16 generation landed).
 
 ## Current Status
 
-- Complete engine: BPE tokenizer, datasets (txt/bin/parquet with direct ingest and dedupe), `train` (real gradient accumulation, full-state resume, safe stop, f16, RoPE context extension, label smoothing, z-loss, grouped weight decay), `eval` (BPB, all batches, early stopping), `generate` (CLI + SSE streaming, RoPE scaling flags), GGUF `export` (with `rope.scaling.*` keys) and the `serve` web suite.
-- 66 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
+- Complete engine: BPE tokenizer, datasets (txt/bin/parquet with direct ingest and dedupe), `train` (real gradient accumulation, full-state resume, safe stop, f16, RoPE context extension, label smoothing, z-loss, AdamW weight decay), `eval` (BPB, all batches, early stopping, `--max-tokens` slice), `generate` (CLI + SSE streaming, RoPE scaling flags, f32/f16), GGUF `export` (with `rope.scaling.*` keys) and the `serve` web suite.
+- 67 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
 - Web: React 19 + Vite + TypeScript + Tailwind v4 built locally (no CDN), English UI, HttpOnly-cookie auth, served from `web/dist` by Axum. Train/Datasets/Generate/Models/Export/Devices views plus run history and live telemetry.
 - Docs: English-only (README, `cli_parameters.md`, `doc/*.md`, ROADMAP and the auxiliary notes).
+
+## KV Cache Modernization (DeepSeek-style)
+
+Goal: move from a per-layer f32 cache that reallocated with `Tensor::cat` on every decoded token to a compressed, bounded, optionally quantized cache. Plan and status:
+
+- ✅ **Phase 0 — Baseline and quality gates**: cache-vs-full-forward parity test, overfit regression test (caught the Stage D weight-decay bug: a `ModuleMapper`-based decay froze every mapped parameter), `stats` KV bytes/token, `eval --max-tokens`, decode benchmark.
+- ✅ **Phase 1 — Cache engine v2**: preallocated per-layer buffers written with in-place `slice_assign` (no more per-token `cat`), attention over the filled region only, `generate --dtype f16` (f16 cache follows compute), API/web compute-precision field. Decode baseline on the tiny model: ~8.6 tok/s, ~143 MB peak RSS.
+- ⏳ **Phase 2 — Sliding window + sinks + dynamic RoPE**: trained `sliding_window`/`sink_tokens`, masks in both forwards, RoPE computed per position (drop the precomputed table and its 16k cap), bounded cache with eviction.
+- ⏳ **Phase 3 — Cross-layer KV sharing**: one K/V per layer group (`kv_share_group`), `arch_version` gating, GGUF compatibility mode with a documented approximation.
+- ⏳ **Phase 4 — MLA latent cache**: `kv_down`/`k_up`/`v_up` with decoupled RoPE, latent-only cache (~/4 memory, /8 with f16), matrix absorption at inference, `deepseek2` GGUF mapping where possible.
+- ⏳ **Phase 5 — Quantized cache with custom kernels**: `burn::cubecl` kernels for in-place writes and int8/Q4 block-quantized cache (recent window in f16); FP4 packing as a stretch.
+- ⏳ **Phase 6 (backlog)** — heavy-hitter eviction and host-RAM spill/replay.
+
+Known prerequisites discovered in Phase 0: all existing checkpoints are invalid (the v1 model was a 1-step run; v2 was trained with an older tokenizer and served with the current one; every `.bin` dataset is v1 without a fingerprint). Re-run `prepare-dataset` with the current tokenizer and retrain from scratch before measuring quality.
 
 ## Stage D — Training Quality and Speed
 
@@ -16,7 +30,7 @@ Last updated: 2026-09-29 (after Stage D: RoPE scaling, direct Parquet ingest wit
 3. ✅ **Eval**: removed the fixed 100-batch cap (`--eval-batches`, 0 = all), added the BPB (bits-per-byte) metric and early stopping (`--early-stop-patience`).
 4. ✅ **RoPE scaling**: `linear`, `ntk` (dynamic NTK) and `yarn` strategies with a configurable factor. The per-layer RoPE cache extends to `factor × n_ctx` (capped), `generate`/`eval` take `--rope-scaling`/`--rope-factor`, the web Generate view exposes both, and GGUF exports carry `llama.rope.scaling.{type,factor,original_context_length}`.
 5. ✅ **Datasets**: `prepare-dataset` tokenizes Parquet text columns straight to `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents (hashed) for both text and Parquet; mixing Parquet sources is rejected with an explicit error.
-6. ✅ **Optimizer**: decoupled weight decay applied only to rank ≥ 2 parameters (norms and biases excluded) with `--weight-decay`, plus optional `--label-smoothing` and `--z-loss` (also in the web Train form and API).
+6. ✅ **Optimizer**: decoupled weight decay (AdamW) applied to all parameters with `--weight-decay`, plus optional `--label-smoothing` and `--z-loss` (also in the web Train form and API).
 7. ✅ **Optional CUDA backend**: `cargo build --features cuda` swaps the CLI (train/eval/generate/export) to `burn::backend::Cuda` for f32 and f16; the web server keeps WGPU for adapter enumeration. Compile-checked with `cargo check --features cuda` (runtime requires an NVIDIA GPU).
 
 ## Stage E — Web Suite
@@ -44,4 +58,4 @@ Last updated: 2026-09-29 (after Stage D: RoPE scaling, direct Parquet ingest wit
 
 ## Suggested Order
 
-Stages D and E are complete and the English/help/smoke debt is closed. The only known verification gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. No active work items.
+The KV cache modernization phases above are the active work, in order (2 → 5). Separate known gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. After Phase 2/3/4 change the architecture, re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above).

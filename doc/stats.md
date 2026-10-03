@@ -1,6 +1,6 @@
 # 📊 Kuro-Neko — Model Statistics (`stats`)
 
-The `stats` subcommand provides a comprehensive diagnosis of the model architecture, the exact number of trainable parameters, the memory consumption in single precision FP32, the estimated computational intensity in FLOPs per token, and the VRAM compression achieved through **Grouped Query Attention (GQA)**.
+The `stats` subcommand provides a comprehensive diagnosis of the model architecture, the exact number of trainable parameters, the memory consumption in single precision FP32, the estimated computational intensity in FLOPs per token, the VRAM compression achieved through **Grouped Query Attention (GQA)**, and the estimated KV cache footprint per token and at full context (f32/f16).
 
 ---
 
@@ -59,6 +59,11 @@ $$\text{FLOPs per Token} = 2 \times N_{\text{total}}$$
 It measures the percentage reduction in the size of the Key ($K$) and Value ($V$) tensors in VRAM thanks to the use of Grouped Query Attention instead of conventional Multi-Head Attention:
 $$\text{GQA Saving (\%)} = \left(1 - \frac{H_{\text{kv}}}{H}\right) \times 100\%$$
 
+### 5. KV Cache Estimates (f32 / f16)
+The report estimates the Key/Value cache footprint per token and for the full context window, for both f32 (4 bytes per element) and f16 (2 bytes per element):
+$$\text{KV Cache (bytes/token)} = 2 \times H_{\text{kv}} \times d_k \times L \times \text{bytes per element}$$
+$$\text{KV Cache (MB at n\_ctx)} = \frac{\text{bytes/token} \times \text{n\_ctx}}{1024 \times 1024}$$
+
 ---
 
 ## 🖥️ Example Command Output
@@ -82,5 +87,7 @@ When running `cargo run --release -- stats` with the base configuration, the sub
   Model Size (FP32): 13.28 MB
   FLOPs per Token  : 0.01 GFLOPs
   GQA Cache Saving : 50.0% KV-cache VRAM reduction
+  KV Cache (f32)   : 4096 B/token (1.00 MB at n_ctx=256)
+  KV Cache (f16)   : 2048 B/token (0.50 MB at n_ctx=256)
 ===============================================================================
 ```

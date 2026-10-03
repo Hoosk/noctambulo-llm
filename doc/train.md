@@ -65,8 +65,8 @@ $$g \leftarrow g \times \frac{1.0}{\max(1.0, \|g\|_2)}$$
 ### 3. AdamW Optimizer and Weight Decay
 
 The **AdamW** optimizer is used with the following properties:
-- **Weight Decay**: Set to $WD = 0.1$.
-- Explicit separation of weight decay from the gradient moment update, preventing important weights from being disproportionately degraded.
+- **Weight Decay**: Set to $WD = 0.1$ through AdamW's built-in decoupled weight decay, applied to **all** parameters. `--weight-decay 0` disables it.
+- Decay is applied directly to the weights, separate from the gradient moment update, preventing important weights from being disproportionately degraded.
 
 ---
 
@@ -194,8 +194,8 @@ cargo run --release -- train \
   --z-loss 0.001
 ```
 
-- `--weight-decay` (default `0.1`) applies **decoupled** weight decay only to rank ≥ 2
-  parameters (projection matrices and embeddings); norms and biases are never decayed.
+- `--weight-decay` (default `0.1`) applies **decoupled** weight decay (AdamW) to **all**
+  parameters; `0` disables it.
 - `--label-smoothing` (default `0.0`) mixes the negative log-likelihood with the uniform
   distribution over the vocabulary.
 - `--z-loss` (default `0.0`) adds `coef · mean(logsumexp(logits)²)`, which keeps logits
