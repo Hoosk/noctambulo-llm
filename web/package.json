@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "typecheck": "tsc -b",
-    "doctor": "react-doctor"
+    "doctor": "react-doctor",
+    "smoke": "node smoke/run.mjs"
   },
   "dependencies": {
     "chart.js": "^4.5.1",
