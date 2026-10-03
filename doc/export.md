@@ -11,6 +11,7 @@ GGUF (GGML Unified Format) is the universal standard adopted by the community to
 | Flag | Type | Default Value | Detailed Description |
 | :--- | :--- | :--- | :--- |
 | `--model-name <name>` | `String` | `kuro-neko-qwen` | Base name of the exported binary model. Defines the name of the resulting file inside the output directory. |
+| `--approx` | flag | off | Allow exporting a model trained with `--kv-share-group > 1`. The exporter duplicates the shared K/V weights under every layer, producing a standard-attention model. This is an approximation: llama.cpp computes K/V from each layer's own input, while the engine reuses the group leader's K/V. |
 
 ---
 

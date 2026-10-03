@@ -24,6 +24,7 @@
   - **Decoupled weight decay** (AdamW) applied to all parameters, optional **label smoothing** and **z-loss**.
 - **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; RoPE angles are computed per position (no table cap), generation and evaluation can run past the trained `n_ctx`, and GGUF exports carry the `rope.scaling.*` metadata.
 - **Bounded KV cache**: `--sliding-window` plus `--sink-tokens` turn the per-layer cache into a ring buffer of `window + sinks` rows (long prompts are prefilled in chunks); without a window the cache is preallocated to the context and written in place.
+- **Cross-layer KV sharing**: `--kv-share-group N` makes each group of N layers share one K/V projection and cache (DeepSeek CSA-style), shrinking KV memory by N. Checkpoints carry an `arch_version`; GGUF export of grouped models requires `--approx` and is documented as an approximation.
 - **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
 - **Full-state checkpoints and resume**: weights, AdamW moments, LR schedule and shuffler RNG; safe stop with Ctrl+C saves an interrupted checkpoint.
 - **Evaluation with BPB**: cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and bits-per-byte (comparable across tokenizers), over all batches by default.
@@ -78,6 +79,7 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--attn-softcap <float>` | Attention capping (`0.0` disabled, `50.0` Gemma-style) | `0.0` |
 | `--sliding-window <n>` | Sliding attention window (`0` = full causal); bounds the inference KV cache to `n + sink-tokens` | `0` |
 | `--sink-tokens <n>` | Initial tokens always kept attendable (attention sinks) | `0` |
+| `--kv-share-group <n>` | Layers per cross-layer K/V sharing group (`1` = off); one K/V projection and cache per group | `1` |
 | `--val-split <float>` | Fraction reserved for validation and perplexity ($PPL$) | `0.1` |
 | `--grad-accum <n>` | Micro-batches accumulated per AdamW step (true gradient mean, equivalent to a larger batch) | `1` |
 | `--save-dir <path>` | Directory for automatic per-epoch checkpoint saving | `None` |
@@ -236,6 +238,7 @@ The resulting `.gguf` file is saved to `exported/kuro-neko-2026.gguf` and can be
 | Flag | Description | Default |
 |:---|:---|:---|
 | `--model-name <name>` | Base name of the resulting `.gguf` file | `kuro-neko-qwen` |
+| `--approx` | Export grouped-KV models as a standard-attention approximation (duplicated K/V weights) | off |
 
 ---
 

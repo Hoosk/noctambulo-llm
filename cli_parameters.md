@@ -28,6 +28,7 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--attn-softcap` | `f32` | `0.0` | Threshold for soft-capping attention scores via $\tanh$. `0.0` disables it. |
 | `--sliding-window` | `usize` | `0` | Sliding attention window in tokens (`0` = full causal attention). The KV cache at inference is bounded to `window + sink_tokens` rows. |
 | `--sink-tokens` | `usize` | `0` | Initial tokens always kept attendable (attention sinks, StreamingLLM). |
+| `--kv-share-group` | `usize` | `1` | Layers per cross-layer K/V sharing group (`1` = no sharing). One K/V projection and cache serve each group, shrinking KV memory by the group size at the cost of a different computation graph. |
 | `--val-split` | `f32` | `0.1` | Percentage of the dataset reserved for validation and perplexity computation ($\text{PPL} = e^{\text{loss}}$). |
 | `--grad-accum` | `usize` | `1` | Gradient accumulation steps before running the AdamW step. |
 | `--save-dir` | `Option<String>`| `None` | Directory to save automatic model checkpoints at the end of each epoch. |
@@ -115,6 +116,7 @@ Exports weights to GGUF v3 binary format for external inference.
 | Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
 | `--model-name` | `String` | `"kuro-neko-qwen"` | Base name of the `.gguf` file that will be saved in `exported/`. |
+| `--approx` | `bool` (flag) | `false` | Allow exporting a cross-layer KV sharing model (`kv_share_group > 1`) as a standard-attention approximation: the shared K/V weights are duplicated per layer, so the exported model is not identical to the engine's grouped computation. |
 
 ---
 
