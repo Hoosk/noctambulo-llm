@@ -234,7 +234,7 @@ pub fn export_to_gguf<B: Backend>(
         let n_kv_head = config.get_n_kv_head();
         let head_dim = config.n_embd / config.n_head;
         let kv_dim = n_kv_head * head_dim;
-        let kv_group = &model.kv[i / config.kv_share_group.max(1)];
+        let group_idx = i / config.kv_share_group.max(1);
 
         let q = block.attn.q_proj.weight.val().into_data().to_vec::<f32>()
             .map_err(|e| format!("Failed to extract q_proj weight: {:?}", e))?;
@@ -257,8 +257,47 @@ pub fn export_to_gguf<B: Backend>(
             });
         }
 
-        let k = kv_group.k_proj.weight.val().into_data().to_vec::<f32>()
-            .map_err(|e| format!("Failed to extract k_proj weight: {:?}", e))?;
+        // MLA models are folded back into an exact standard K/V projection:
+        // W_eff = kv_down · k_up (Burn Linear layout [in, out]). No
+        // approximation needed because this MLA variant has no decoupled RoPE.
+        let (k, k_bias, v, v_bias) = if let Some(mla) = model.mla.get(group_idx) {
+            let fold = |up: &burn::nn::Linear<B>| -> Result<Vec<f32>, String> {
+                mla.kv_down
+                    .weight
+                    .val()
+                    .matmul(up.weight.val())
+                    .into_data()
+                    .to_vec::<f32>()
+                    .map_err(|e| format!("Failed to fold MLA weights: {:?}", e))
+            };
+            (fold(&mla.k_up)?, None, fold(&mla.v_up)?, None)
+        } else {
+            let kv_group = &model.kv[group_idx];
+            let k = kv_group.k_proj.weight.val().into_data().to_vec::<f32>()
+                .map_err(|e| format!("Failed to extract k_proj weight: {:?}", e))?;
+            let k_bias = match kv_group.k_proj.bias.as_ref() {
+                Some(b) => Some(
+                    b.val()
+                        .into_data()
+                        .to_vec::<f32>()
+                        .map_err(|e| format!("Failed to extract k_proj bias: {:?}", e))?,
+                ),
+                None => None,
+            };
+            let v = kv_group.v_proj.weight.val().into_data().to_vec::<f32>()
+                .map_err(|e| format!("Failed to extract v_proj weight: {:?}", e))?;
+            let v_bias = match kv_group.v_proj.bias.as_ref() {
+                Some(b) => Some(
+                    b.val()
+                        .into_data()
+                        .to_vec::<f32>()
+                        .map_err(|e| format!("Failed to extract v_proj bias: {:?}", e))?,
+                ),
+                None => None,
+            };
+            (k, k_bias, v, v_bias)
+        };
+
         let k_trans = transpose_2d(&k, kv_dim, config.n_embd);
         let k_permuted = permute_rope_weight(&k_trans, n_kv_head, head_dim, config.n_embd);
         named_tensors.push(NamedTensor {
@@ -267,9 +306,7 @@ pub fn export_to_gguf<B: Backend>(
             data: k_permuted,
         });
 
-        if let Some(ref k_b_param) = kv_group.k_proj.bias {
-            let k_b = k_b_param.val().into_data().to_vec::<f32>()
-                .map_err(|e| format!("Failed to extract k_proj bias: {:?}", e))?;
+        if let Some(k_b) = k_bias {
             let k_b_permuted = permute_rope_bias(&k_b, n_kv_head, head_dim);
             named_tensors.push(NamedTensor {
                 name: format!("{}.attn_k.bias", prefix),
@@ -278,17 +315,13 @@ pub fn export_to_gguf<B: Backend>(
             });
         }
 
-        let v = kv_group.v_proj.weight.val().into_data().to_vec::<f32>()
-            .map_err(|e| format!("Failed to extract v_proj weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_v.weight", prefix),
             dims: vec![config.n_embd as u64, kv_dim as u64],
             data: transpose_2d(&v, kv_dim, config.n_embd),
         });
 
-        if let Some(ref v_b_param) = kv_group.v_proj.bias {
-            let v_b = v_b_param.val().into_data().to_vec::<f32>()
-                .map_err(|e| format!("Failed to extract v_proj bias: {:?}", e))?;
+        if let Some(v_b) = v_bias {
             named_tensors.push(NamedTensor {
                 name: format!("{}.attn_v.bias", prefix),
                 dims: vec![kv_dim as u64],

@@ -29,6 +29,7 @@ pub struct TrainParams {
     pub sliding_window: usize,
     pub sink_tokens: usize,
     pub kv_share_group: usize,
+    pub mla_latent_dim: usize,
     pub save_dir: Option<PathBuf>,
     pub resume: Option<PathBuf>,
     pub output_dir: String,
@@ -257,6 +258,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
         config.sliding_window = (params.sliding_window > 0).then_some(params.sliding_window);
         config.sink_tokens = params.sink_tokens;
         config.kv_share_group = params.kv_share_group.max(1);
+        config.mla_latent_dim = (params.mla_latent_dim > 0).then_some(params.mla_latent_dim);
         let device = parse_device(&params.device);
         let _ = tx.send(TrainingEvent::LogEvent {
             line: format!("Compute precision: {}", params.dtype.as_str()),

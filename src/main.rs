@@ -302,6 +302,10 @@ struct TrainArgs {
     /// shrinks by this factor, at the cost of a different computation graph).
     #[arg(long, default_value_t = 1)]
     kv_share_group: usize,
+    /// Multi-head Latent Attention: compress K/V into a latent of this size
+    /// and cache only the latent (0 = disabled). Exports to GGUF exactly.
+    #[arg(long, default_value_t = 0)]
+    mla_latent_dim: usize,
     /// Validation set ratio (0.1 = 10% validation split)
     #[arg(long, default_value_t = 0.1)]
     val_split: f32,
@@ -649,6 +653,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 (args.sliding_window > 0).then_some(args.sliding_window);
             model_config.sink_tokens = args.sink_tokens;
             model_config.kv_share_group = args.kv_share_group.max(1);
+            model_config.mla_latent_dim =
+                (args.mla_latent_dim > 0).then_some(args.mla_latent_dim);
 
             let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
             let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
@@ -872,8 +878,31 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  FLOPs per Token  : {:.2} GFLOPs", flops_per_token as f64 / 1_000_000_000.0);
             println!("  GQA Cache Saving : {:.1}% KV-cache VRAM reduction", (1.0 - (n_kv_head as f64 / n_head as f64)) * 100.0);
             let head_dim = n_embd / n_head;
-            let kv_f32 = 2 * n_kv_head * head_dim * 4 * n_layer;
-            let kv_f16 = 2 * n_kv_head * head_dim * 2 * n_layer;
+            let (kv_f32, kv_f16) = if model_config.use_mla() {
+                // One latent per token per group; only `k` is cached.
+                let d = model_config.mla_dim();
+                let groups = model_config.n_kv_groups();
+                (d * 4 * groups, d * 2 * groups)
+            } else {
+                (
+                    2 * n_kv_head * head_dim * 4 * n_layer,
+                    2 * n_kv_head * head_dim * 2 * n_layer,
+                )
+            };
+            if model_config.use_mla() {
+                println!(
+                    "  MLA Latent       : {} ({} group(s), cross-layer {})",
+                    model_config.mla_dim(),
+                    model_config.n_kv_groups(),
+                    model_config.kv_share_group
+                );
+            } else if model_config.kv_share_group > 1 {
+                println!(
+                    "  KV Share Group   : {} layers/group ({} group(s))",
+                    model_config.kv_share_group,
+                    model_config.n_kv_groups()
+                );
+            }
             let mb = |bytes: usize| bytes as f64 * model_config.n_ctx as f64 / (1024.0 * 1024.0);
             println!(
                 "  KV Cache (f32)   : {} B/token ({:.2} MB at n_ctx={})",

@@ -170,6 +170,7 @@ export interface TrainRequestBody {
   slidingWindow?: number;
   sinkTokens?: number;
   kvShareGroup?: number;
+  mlaLatentDim?: number;
   seqWarmupSteps: number;
   weightDecay: number;
   labelSmoothing: number;

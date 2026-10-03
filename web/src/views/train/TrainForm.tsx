@@ -27,6 +27,7 @@ interface FormState {
   slidingWindow: string;
   sinkTokens: string;
   kvShareGroup: string;
+  mlaLatentDim: string;
   seqWarmup: string;
   weightDecay: string;
   labelSmoothing: string;
@@ -56,6 +57,7 @@ const DEFAULT_FORM: FormState = {
   slidingWindow: "0",
   sinkTokens: "0",
   kvShareGroup: "1",
+  mlaLatentDim: "0",
   seqWarmup: "0",
   weightDecay: "0.1",
   labelSmoothing: "0",
@@ -107,6 +109,7 @@ function buildTrainBody(
       slidingWindow: Number(form.slidingWindow) || 0,
       sinkTokens: Number(form.sinkTokens) || 0,
       kvShareGroup: Number(form.kvShareGroup) || 1,
+      mlaLatentDim: Number(form.mlaLatentDim) || 0,
       seqWarmupSteps: num(form.seqWarmup),
       weightDecay: num(form.weightDecay),
       labelSmoothing: num(form.labelSmoothing),
@@ -341,6 +344,7 @@ function ConfigFields({ form, set, datasets, devices, onSaveDirChange }: ConfigF
         <NumberField label="Sliding window" step={1} min={0} value={form.slidingWindow} onChange={(v) => set("slidingWindow", v)} />
         <NumberField label="Sink tokens" step={1} min={0} value={form.sinkTokens} onChange={(v) => set("sinkTokens", v)} />
         <NumberField label="KV share group" step={1} min={1} value={form.kvShareGroup} onChange={(v) => set("kvShareGroup", v)} />
+        <NumberField label="MLA latent dim" step={16} min={0} value={form.mlaLatentDim} onChange={(v) => set("mlaLatentDim", v)} />
         <NumberField label="Seq warmup steps" min={0} value={form.seqWarmup} onChange={(v) => set("seqWarmup", v)} />
         <NumberField label="Early stop (epochs)" min={0} value={form.earlyStop} onChange={(v) => set("earlyStop", v)} />
         <NumberField label="Weight decay" step={0.01} min={0} value={form.weightDecay} onChange={(v) => set("weightDecay", v)} />

@@ -52,6 +52,24 @@ impl<B: Backend> KvCache<B> {
             sink_tokens + (pos - sink_tokens) % ring
         }
     }
+
+    /// MLA variant: only the latent buffer (`k`) is allocated; `v` stays
+    /// unused because K and V are expanded from the same latent.
+    pub fn preallocated_single(
+        batch: usize,
+        heads: usize,
+        dim: usize,
+        capacity: usize,
+        device: &B::Device,
+    ) -> Self {
+        Self {
+            k: Some(Tensor::zeros([batch, heads, capacity, dim], device)),
+            v: None,
+            len: 0,
+            capacity,
+            positions: vec![usize::MAX; capacity],
+        }
+    }
 }
 
 #[derive(Module, Debug)]
@@ -217,6 +235,32 @@ pub fn rope_cos_sin<B: Backend>(
     (cos, sin)
 }
 
+/// Like [`rope_cos_sin`] but for an arbitrary list of absolute positions
+/// (ring-cache slots are not contiguous). Sentinel positions (`i32::MAX`,
+/// empty slots) are treated as 0; they are masked out by the attention.
+pub fn rope_cos_sin_at<B: Backend>(
+    freqs: &[f32],
+    mscale: f32,
+    positions: &[i32],
+    device: &B::Device,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    let half_dim = freqs.len();
+    let n = positions.len();
+    let mut angles_vec = Vec::with_capacity(n * half_dim);
+    for &pos in positions {
+        let p = if pos == i32::MAX { 0.0 } else { pos as f32 };
+        for &f in freqs {
+            angles_vec.push(p * f);
+        }
+    }
+    let angles = Tensor::<B, 4>::from_data(TensorData::new(angles_vec, [1, 1, n, half_dim]), device);
+    let cos = angles.clone().cos() * mscale;
+    let sin = angles.sin() * mscale;
+    let cos = Tensor::cat(vec![cos.clone(), cos], 3);
+    let sin = Tensor::cat(vec![sin.clone(), sin], 3);
+    (cos, sin)
+}
+
 fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
     if n_rep == 1 {
         x
@@ -376,6 +420,61 @@ impl<B: Backend> KvProj<B> {
     }
 }
 
+/// Multi-head Latent Attention projections (DeepSeek MLA-style): K/V are
+/// compressed into a small latent that is the only thing cached; K/V are
+/// expanded from the latent at attention time. With no decoupled RoPE the
+/// folded weights (`k_up · kv_down`) are exactly equivalent to a standard
+/// K/V projection, so GGUF export needs no approximation.
+#[derive(Module, Debug)]
+pub struct MlaProj<B: Backend> {
+    pub kv_down: Linear<B>,
+    pub k_up: Linear<B>,
+    pub v_up: Linear<B>,
+    pub rope_freqs: Vec<f32>,
+    pub rope_mscale: f32,
+    pub n_head: usize,
+    pub n_kv_head: usize,
+    pub n_embd: usize,
+    pub d_latent: usize,
+}
+
+impl<B: Backend> MlaProj<B> {
+    /// Compress `x` into the latent that is written to the cache:
+    /// `[batch, 1, seq, d_latent]`.
+    pub fn compress(&self, x: Tensor<B, 3>) -> Tensor<B, 4> {
+        let [batch, seq, _] = x.dims();
+        self.kv_down
+            .forward(x)
+            .reshape([batch, seq, 1, self.d_latent])
+            .swap_dims(1, 2)
+    }
+
+    /// Expand cached latents `[batch, 1, n, d_latent]` into RoPE-rotated K and
+    /// V `[batch, n_kv_head, n, head_dim]` at the given absolute positions.
+    pub fn expand(&self, latents: Tensor<B, 4>, positions: &[i32]) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let [batch, _, n, _] = latents.dims();
+        let head_dim = self.n_embd / self.n_head;
+        let device = latents.device();
+
+        let k = self
+            .k_up
+            .forward(latents.clone())
+            .reshape([batch, 1, n, self.n_kv_head, head_dim])
+            .swap_dims(1, 3)
+            .reshape([batch, self.n_kv_head, n, head_dim]);
+        let v = self
+            .v_up
+            .forward(latents)
+            .reshape([batch, 1, n, self.n_kv_head, head_dim])
+            .swap_dims(1, 3)
+            .reshape([batch, self.n_kv_head, n, head_dim]);
+
+        let (cos, sin) = rope_cos_sin_at::<B>(&self.rope_freqs, self.rope_mscale, positions, &device);
+        let k_rot = rotate_half(k.clone());
+        ((k * cos) + (k_rot * sin), v)
+    }
+}
+
 /// Writes K/V rows for the absolute positions `start_pos..` into the ring
 /// cache with contiguous `slice_assign` segments (in place when the buffer has
 /// a single owner). Shared by every group leader.
@@ -428,14 +527,63 @@ fn cache_write<B: Backend>(
     cache.v = Some(v_buf);
 }
 
-/// Absolute position of every ring slot as an `Int` tensor (`i32::MAX` for
-/// empty slots, masked out by the attention).
-fn cache_col_positions<B: Backend>(cache: &KvCache<B>, device: &B::Device) -> Tensor<B, 1, Int> {
-    let col_pos: Vec<i32> = cache
+/// Absolute position of every ring slot as `i32` (`i32::MAX` for empty slots,
+/// masked out by the attention).
+fn cache_positions_i32<B: Backend>(cache: &KvCache<B>) -> Vec<i32> {
+    cache
         .positions
         .iter()
         .map(|&p| if p == usize::MAX { i32::MAX } else { p as i32 })
-        .collect();
+        .collect()
+}
+
+/// MLA variant of [`cache_write`]: only the latent (`k`) buffer is written.
+fn cache_write_latent<B: Backend>(
+    cache: &mut KvCache<B>,
+    latent: Tensor<B, 4>,
+    start_pos: usize,
+    sink_tokens: usize,
+) {
+    let [batch_size, heads, new_seq_len, dim] = latent.dims();
+    assert!(
+        cache.capacity > sink_tokens,
+        "KV cache capacity ({}) must exceed the sink tokens ({})",
+        cache.capacity,
+        sink_tokens
+    );
+    for pos in start_pos..(start_pos + new_seq_len) {
+        let slot = cache.slot_for(pos, sink_tokens);
+        cache.positions[slot] = pos;
+    }
+    let mut k_buf = cache.k.take().expect("kv cache latent buffer");
+    let mut offset = 0usize;
+    while offset < new_seq_len {
+        let pos = start_pos + offset;
+        let slot = cache.slot_for(pos, sink_tokens);
+        let mut len = 1usize;
+        while offset + len < new_seq_len {
+            let next_pos = start_pos + offset + len;
+            if cache.slot_for(next_pos, sink_tokens) == slot + len {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+        let write_slice = [0..batch_size, 0..heads, slot..(slot + len), 0..dim];
+        let part = latent
+            .clone()
+            .slice([0..batch_size, 0..heads, offset..(offset + len), 0..dim]);
+        k_buf = k_buf.slice_assign(write_slice, part);
+        offset += len;
+    }
+    cache.len = (cache.len + new_seq_len).min(cache.capacity);
+    cache.k = Some(k_buf);
+}
+
+/// Absolute position of every ring slot as an `Int` tensor (`i32::MAX` for
+/// empty slots, masked out by the attention).
+fn cache_col_positions<B: Backend>(cache: &KvCache<B>, device: &B::Device) -> Tensor<B, 1, Int> {
+    let col_pos = cache_positions_i32(cache);
     Tensor::<B, 1, Int>::from_data(TensorData::new(col_pos, [cache.capacity]), device)
 }
 
@@ -483,6 +631,36 @@ pub struct KvProjConfig {
     pub n_ctx: usize,
     pub rope_kind: RopeScalingKind,
     pub rope_factor: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MlaProjConfig {
+    pub n_embd: usize,
+    pub n_head: usize,
+    pub n_kv_head: usize,
+    pub n_ctx: usize,
+    pub rope_kind: RopeScalingKind,
+    pub rope_factor: f32,
+    pub d_latent: usize,
+}
+
+impl MlaProjConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> MlaProj<B> {
+        let head_dim = self.n_embd / self.n_head;
+        let kv_dim = self.n_kv_head * head_dim;
+        let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
+        MlaProj {
+            kv_down: LinearConfig::new(self.n_embd, self.d_latent).with_bias(false).init(device),
+            k_up: LinearConfig::new(self.d_latent, kv_dim).with_bias(false).init(device),
+            v_up: LinearConfig::new(self.d_latent, kv_dim).with_bias(false).init(device),
+            rope_freqs: rope.freqs,
+            rope_mscale: rope.mscale,
+            n_head: self.n_head,
+            n_kv_head: self.n_kv_head,
+            n_embd: self.n_embd,
+            d_latent: self.d_latent,
+        }
+    }
 }
 
 impl KvProjConfig {
@@ -612,7 +790,11 @@ impl BlockConfig {
 pub struct Llm<B: Backend> {
     pub embed_tokens: Embedding<B>,
     /// One K/V projection per sharing group (`ceil(n_layer / kv_share_group)`).
+    /// Empty when MLA is enabled.
     pub kv: Vec<KvProj<B>>,
+    /// One MLA projection per sharing group; empty unless `mla_latent_dim` is
+    /// set. Only the compressed latent is cached.
+    pub mla: Vec<MlaProj<B>>,
     pub blocks: Vec<Block<B>>,
     pub norm: RmsNorm<B>,
     pub n_ctx: usize,
@@ -627,6 +809,11 @@ impl<B: Backend> Llm<B> {
     /// extended by the active RoPE scaling factor).
     pub fn max_seq_len(&self) -> usize {
         self.max_seq
+    }
+
+    /// Whether the model compresses K/V into an MLA latent.
+    pub fn use_mla(&self) -> bool {
+        !self.mla.is_empty()
     }
 
     /// Number of rows each layer cache needs. With a sliding window the cache
@@ -647,14 +834,24 @@ impl<B: Backend> Llm<B> {
     }
 
     /// Preallocated caches (one per K/V group) sized to `capacity` positions.
+    /// MLA groups cache only the compressed latent.
     pub fn new_kv_caches(&self, capacity: usize, device: &B::Device) -> Vec<KvCache<B>> {
-        self.kv
-            .iter()
-            .map(|kv| {
-                let head_dim = kv.n_embd / kv.n_head;
-                KvCache::preallocated(1, kv.n_kv_head, head_dim, capacity, device)
-            })
-            .collect()
+        if self.use_mla() {
+            self.mla
+                .iter()
+                .map(|m| {
+                    KvCache::preallocated_single(1, 1, m.d_latent, capacity, device)
+                })
+                .collect()
+        } else {
+            self.kv
+                .iter()
+                .map(|kv| {
+                    let head_dim = kv.n_embd / kv.n_head;
+                    KvCache::preallocated(1, kv.n_kv_head, head_dim, capacity, device)
+                })
+                .collect()
+        }
     }
 
     pub fn forward(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
@@ -664,13 +861,19 @@ impl<B: Backend> Llm<B> {
         let row_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
         let col_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
         let group = self.kv_share_group.max(1);
+        let positions: Vec<i32> = (0..seq_len as i32).collect();
 
         let mut x = tok_emb;
         let mut group_kv: Option<(Tensor<B, 4>, Tensor<B, 4>)> = None;
         for (i, block) in self.blocks.iter().enumerate() {
             if i % group == 0 {
                 let ln = block.input_layernorm.forward(x.clone());
-                group_kv = Some(self.kv[self.group_of(i)].forward(ln, 0));
+                group_kv = Some(if self.use_mla() {
+                    let latent = self.mla[self.group_of(i)].compress(ln);
+                    self.mla[self.group_of(i)].expand(latent, &positions)
+                } else {
+                    self.kv[self.group_of(i)].forward(ln, 0)
+                });
             }
             let (k, v) = group_kv.as_ref().expect("group leader computed K/V");
             x = block.forward(x, k.clone(), v.clone(), 0, row_pos.clone(), col_pos.clone());
@@ -702,12 +905,25 @@ impl<B: Backend> Llm<B> {
             let g = self.group_of(i);
             if i % group == 0 {
                 let ln = block.input_layernorm.forward(x.clone());
-                let (k, v) = self.kv[g].forward(ln, start_pos);
-                cache_write(&mut caches[g], k, v, start_pos, block.attn.sink_tokens);
+                if self.use_mla() {
+                    let latent = self.mla[g].compress(ln);
+                    cache_write_latent(&mut caches[g], latent, start_pos, block.attn.sink_tokens);
+                } else {
+                    let (k, v) = self.kv[g].forward(ln, start_pos);
+                    cache_write(&mut caches[g], k, v, start_pos, block.attn.sink_tokens);
+                }
             }
             let cache = &caches[g];
-            let k_full = cache.k.clone().expect("kv cache k buffer");
-            let v_full = cache.v.clone().expect("kv cache v buffer");
+            let (k_full, v_full) = if self.use_mla() {
+                let latent = cache.k.clone().expect("mla cache latent buffer");
+                let positions = cache_positions_i32(cache);
+                self.mla[g].expand(latent, &positions)
+            } else {
+                (
+                    cache.k.clone().expect("kv cache k buffer"),
+                    cache.v.clone().expect("kv cache v buffer"),
+                )
+            };
             let col_pos = cache_col_positions(cache, &device);
             x = block.forward(x, k_full, v_full, start_pos, row_pos.clone(), col_pos);
         }
@@ -742,19 +958,41 @@ impl ModelConfig {
                 .init(device)
             })
             .collect();
-        let kv: Vec<KvProj<B>> = (0..self.n_kv_groups())
-            .map(|_| {
-                KvProjConfig {
-                    n_embd: self.n_embd,
-                    n_head: self.n_head,
-                    n_kv_head: kv_head,
-                    n_ctx: self.n_ctx,
-                    rope_kind,
-                    rope_factor,
-                }
-                .init(device)
-            })
-            .collect();
+        let kv: Vec<KvProj<B>> = if self.use_mla() {
+            Vec::new()
+        } else {
+            (0..self.n_kv_groups())
+                .map(|_| {
+                    KvProjConfig {
+                        n_embd: self.n_embd,
+                        n_head: self.n_head,
+                        n_kv_head: kv_head,
+                        n_ctx: self.n_ctx,
+                        rope_kind,
+                        rope_factor,
+                    }
+                    .init(device)
+                })
+                .collect()
+        };
+        let mla: Vec<MlaProj<B>> = if self.use_mla() {
+            (0..self.n_kv_groups())
+                .map(|_| {
+                    MlaProjConfig {
+                        n_embd: self.n_embd,
+                        n_head: self.n_head,
+                        n_kv_head: kv_head,
+                        n_ctx: self.n_ctx,
+                        rope_kind,
+                        rope_factor,
+                        d_latent: self.mla_dim(),
+                    }
+                    .init(device)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Qwen Normal(0, 0.02) weight initialization for tied word embeddings
         let std = 0.02f64;
@@ -770,6 +1008,7 @@ impl ModelConfig {
         Llm {
             embed_tokens,
             kv,
+            mla,
             blocks,
             norm: RmsNorm::new(self.n_embd, device),
             n_ctx: self.n_ctx,
@@ -1018,6 +1257,7 @@ mod tests {
         window: Option<usize>,
         sink_tokens: usize,
         kv_share_group: usize,
+        mla_dim: Option<usize>,
     ) -> (usize, usize) {
         use burn_ndarray::{NdArray, NdArrayDevice};
         let device = NdArrayDevice::Cpu;
@@ -1025,6 +1265,7 @@ mod tests {
         config.sliding_window = window;
         config.sink_tokens = sink_tokens;
         config.kv_share_group = kv_share_group;
+        config.mla_latent_dim = mla_dim;
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
         assert_eq!(model.new_kv_caches(1, &device).len(), config.n_kv_groups());
 
@@ -1069,20 +1310,20 @@ mod tests {
 
     #[test]
     fn test_cached_decode_matches_full_without_window() {
-        let (capacity, max_seq) = assert_cached_matches_full_with_window(None, 0, 1);
+        let (capacity, max_seq) = assert_cached_matches_full_with_window(None, 0, 1, None);
         assert_eq!(capacity, max_seq);
     }
 
     #[test]
     fn test_cached_decode_matches_full_with_ring_window() {
-        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 0, 1);
+        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 0, 1, None);
         // Bounded cache: only `window` slots, all overwritten by the end.
         assert_eq!(capacity, 2);
     }
 
     #[test]
     fn test_cached_decode_matches_full_with_sinks() {
-        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 1, 1);
+        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 1, 1, None);
         assert_eq!(capacity, 3);
     }
 
@@ -1090,8 +1331,65 @@ mod tests {
     fn test_cached_decode_matches_full_with_kv_sharing() {
         // 4 layers, 2 per group -> 2 caches; training and cached paths must
         // agree on the shared-K/V computation.
-        let (capacity, _) = assert_cached_matches_full_with_window(None, 0, 2);
+        let (capacity, _) = assert_cached_matches_full_with_window(None, 0, 2, None);
         assert_eq!(capacity, 8);
+    }
+
+    #[test]
+    fn test_cached_decode_matches_full_with_mla() {
+        let (capacity, _) = assert_cached_matches_full_with_window(None, 0, 1, Some(16));
+        assert_eq!(capacity, 8);
+    }
+
+    #[test]
+    fn test_mla_cache_is_latent_only() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
+        config.mla_latent_dim = Some(16);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        let caches = model.new_kv_caches(4, &device);
+        assert_eq!(caches.len(), 2);
+        assert_eq!(caches[0].k.as_ref().unwrap().dims(), [1, 1, 4, 16]);
+        assert!(caches[0].v.is_none(), "MLA caches only the latent");
+    }
+
+    #[test]
+    fn test_mla_weight_folding_matches_expansion() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 8, 0.0, 0.0);
+        config.mla_latent_dim = Some(16);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        let mla = &model.mla[0];
+
+        let x = Tensor::<NdArray<f32, i32>, 2>::from_data(
+            TensorData::new(
+                (0..32).map(|i| (i as f32) * 0.01 - 0.16).collect::<Vec<f32>>(),
+                [1, 32],
+            ),
+            &device,
+        );
+        let direct = mla
+            .k_up
+            .forward(mla.kv_down.forward(x.clone()))
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        // Export folds W_eff = kv_down.weight @ k_up.weight (Burn layout) and
+        // applies it as x @ W_eff.
+        let folded_w = mla.kv_down.weight.val().matmul(mla.k_up.weight.val());
+        let folded = x
+            .matmul(folded_w)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let diff = direct
+            .iter()
+            .zip(folded.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff < 1e-5, "folded MLA weights differ from expansion: {diff}");
     }
 
     #[test]

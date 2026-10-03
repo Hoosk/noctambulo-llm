@@ -286,6 +286,7 @@ mod tests {
             sliding_window: 0,
             sink_tokens: 0,
             kv_share_group: 1,
+            mla_latent_dim: 0,
             save_dir: None,
             resume: None,
             output_dir: "model_output".into(),

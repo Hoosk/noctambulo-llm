@@ -67,6 +67,9 @@ pub(super) struct TrainRequest {
     /// Layers per cross-layer K/V sharing group (0/1 = no sharing).
     #[serde(default)]
     kv_share_group: usize,
+    /// MLA latent dimension (0 = disabled).
+    #[serde(default)]
+    mla_latent_dim: usize,
     #[serde(default)]
     save_dir: Option<String>,
     #[serde(default)]
@@ -211,6 +214,7 @@ pub(super) async fn train(
         sliding_window: req.sliding_window,
         sink_tokens: req.sink_tokens,
         kv_share_group: req.kv_share_group,
+        mla_latent_dim: req.mla_latent_dim,
         save_dir: req.save_dir.map(path_buf_from),
         resume: req.resume.map(path_buf_from),
         output_dir: req.output_dir,

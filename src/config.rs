@@ -101,6 +101,10 @@ pub struct ModelConfig {
     /// (cross-layer KV reuse, DeepSeek CSA-style). `1` disables sharing.
     #[serde(default = "default_kv_share_group")]
     pub kv_share_group: usize,
+    /// Multi-head Latent Attention: when set, K/V are compressed into a
+    /// latent of this size and only the latent is cached (DeepSeek MLA-style).
+    #[serde(default)]
+    pub mla_latent_dim: Option<usize>,
     /// Checkpoint architecture version. Bumped whenever the module layout
     /// changes; older versions cannot be loaded (records are positional).
     #[serde(default = "default_arch_version")]
@@ -108,8 +112,8 @@ pub struct ModelConfig {
 }
 
 /// Current module layout. 1 = pre-KV-cache-refactor, 2 = dynamic RoPE +
-/// sliding window, 3 = grouped cross-layer KV projections.
-pub const ARCH_VERSION: u32 = 3;
+/// sliding window, 3 = grouped cross-layer KV projections, 4 = MLA latent.
+pub const ARCH_VERSION: u32 = 4;
 
 fn default_kv_share_group() -> usize {
     1
@@ -166,8 +170,19 @@ impl ModelConfig {
             sliding_window: None,
             sink_tokens: 0,
             kv_share_group: 1,
+            mla_latent_dim: None,
             arch_version: ARCH_VERSION,
         }
+    }
+
+    /// Whether the model compresses K/V into an MLA latent.
+    pub fn use_mla(&self) -> bool {
+        self.mla_latent_dim.is_some_and(|d| d > 0)
+    }
+
+    /// Latent dimension when MLA is enabled.
+    pub fn mla_dim(&self) -> usize {
+        self.mla_latent_dim.filter(|d| *d > 0).unwrap_or(0)
     }
 
     /// Number of layer groups (each group owns one K/V projection and cache).
@@ -226,8 +241,14 @@ impl ModelConfig {
         let norms = 2 * n_embd;
         let mlp = 3 * n_embd * hidden;
         let per_layer = q + out + norms + mlp;
-        let kv = n_embd * kv_dim + kv_dim;
-        let per_group = 2 * kv;
+        let per_group = if self.use_mla() {
+            let d = self.mla_dim();
+            // kv_down (n_embd -> d) + k_up/v_up (d -> kv_dim), no biases.
+            n_embd * d + 2 * kv_dim * d
+        } else {
+            let kv = n_embd * kv_dim + kv_dim;
+            2 * kv
+        };
 
         embed + self.n_layer * per_layer + self.n_kv_groups() * per_group + n_embd
     }
