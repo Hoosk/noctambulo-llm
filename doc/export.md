@@ -117,3 +117,20 @@ standard llama.cpp keys so runtimes can reproduce the same positions:
 
 Unscaled exports (`rope_scaling = none`) keep the exact same key set as before: the three
 keys are only written when scaling is active in `config.json`.
+
+## MLA Models
+
+Models trained with `--mla-latent-dim` cache only a compressed latent at inference, but
+the exporter folds `kv_down · k_up` (and `kv_down · v_up`) into standard `attn_k`/`attn_v`
+weights. The GGUF is therefore an **exact** standard-attention equivalent and does not
+need `--approx`. This works because this MLA variant has no decoupled RoPE (RoPE is
+applied after expansion); the folding is covered by
+`test_mla_weight_folding_matches_expansion`.
+
+## Grouped-KV Models
+
+Models trained with `--kv-share-group > 1` reuse one K/V across several layers, which a
+standard attention graph cannot represent. The exporter refuses them unless `--approx` is
+passed; in that mode the shared K/V weights are duplicated under every layer and the
+result is a documented approximation (llama.cpp recomputes K/V from each layer's own
+input).

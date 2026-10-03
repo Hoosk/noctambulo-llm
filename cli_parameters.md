@@ -29,6 +29,7 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--sliding-window` | `usize` | `0` | Sliding attention window in tokens (`0` = full causal attention). The KV cache at inference is bounded to `window + sink_tokens` rows. |
 | `--sink-tokens` | `usize` | `0` | Initial tokens always kept attendable (attention sinks, StreamingLLM). |
 | `--kv-share-group` | `usize` | `1` | Layers per cross-layer K/V sharing group (`1` = no sharing). One K/V projection and cache serve each group, shrinking KV memory by the group size at the cost of a different computation graph. |
+| `--mla-latent-dim` | `usize` | `0` | Multi-head Latent Attention: compress K/V into a latent of this size and cache only the latent (`0` = disabled). Memory per token is `latent_dim` floats instead of `2·n_kv_head·head_dim`. GGUF export folds the weights exactly (`W_down · W_up`). |
 | `--val-split` | `f32` | `0.1` | Percentage of the dataset reserved for validation and perplexity computation ($\text{PPL} = e^{\text{loss}}$). |
 | `--grad-accum` | `usize` | `1` | Gradient accumulation steps before running the AdamW step. |
 | `--save-dir` | `Option<String>`| `None` | Directory to save automatic model checkpoints at the end of each epoch. |
