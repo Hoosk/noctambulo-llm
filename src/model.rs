@@ -4,25 +4,40 @@ use burn::nn::{Dropout, DropoutConfig, Embedding, Linear, LinearConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 
+/// Preallocated per-layer KV cache.
+///
+/// The buffers are sized once (capacity = trained context window, possibly
+/// extended by RoPE scaling) and written with `slice_assign`, which mutates in
+/// place when the handle has a single owner. This removes the per-token
+/// `Tensor::cat` reallocation the engine used to do, which copied the whole
+/// cache on every decoded token.
 #[derive(Clone, Debug)]
 pub struct KvCache<B: Backend> {
     pub k: Option<Tensor<B, 4>>,
     pub v: Option<Tensor<B, 4>>,
+    /// Number of filled positions (`k`/`v` hold `capacity` rows, of which the
+    /// first `len` are valid).
+    pub len: usize,
+    /// Maximum number of positions the buffers can hold.
+    pub capacity: usize,
 }
 
 impl<B: Backend> KvCache<B> {
-    pub fn new() -> Self {
-        Self { k: None, v: None }
-    }
-
-    pub fn empty() -> Self {
-        Self::new()
-    }
-}
-
-impl<B: Backend> Default for KvCache<B> {
-    fn default() -> Self {
-        Self::new()
+    /// Allocate zeroed buffers up front, sized to `capacity` positions.
+    pub fn preallocated(
+        batch: usize,
+        n_kv_head: usize,
+        head_dim: usize,
+        capacity: usize,
+        device: &B::Device,
+    ) -> Self {
+        let shape = [batch, n_kv_head, capacity, head_dim];
+        Self {
+            k: Some(Tensor::zeros(shape, device)),
+            v: Some(Tensor::zeros(shape, device)),
+            len: 0,
+            capacity,
+        }
     }
 }
 
@@ -281,7 +296,6 @@ impl<B: Backend> CausalSelfAttention<B> {
         let [batch_size, new_seq_len, n_embd] = x.dims();
         let head_size = n_embd / self.n_head;
         let n_rep = self.n_head / self.n_kv_head;
-
         let q = self.q_proj.forward(x.clone());
         let k = self.k_proj.forward(x.clone());
         let v = self.v_proj.forward(x);
@@ -318,17 +332,31 @@ impl<B: Backend> CausalSelfAttention<B> {
         let k_rot = rotate_half(k.clone());
         let k_embed = (k * cos) + (k_rot * sin);
 
-        let (k_full, v_full) = match (&cache.k, &cache.v) {
-            (Some(prev_k), Some(prev_v)) => {
-                let new_k = Tensor::cat(vec![prev_k.clone(), k_embed], 2);
-                let new_v = Tensor::cat(vec![prev_v.clone(), v], 2);
-                (new_k, new_v)
-            }
-            _ => (k_embed, v),
-        };
-
-        cache.k = Some(k_full.clone());
-        cache.v = Some(v_full.clone());
+        // Preallocated write: `slice_assign` mutates the buffer in place when
+        // the handle has a single owner (we `take` it first), so decoding no
+        // longer reallocates and copies the whole cache every token.
+        assert!(
+            cache.capacity > 0 && start_pos + new_seq_len <= cache.capacity,
+            "KV cache overflow: asked for positions {start_pos}..{} but capacity is {} (increase --rope-factor or n_ctx)",
+            start_pos + new_seq_len,
+            cache.capacity
+        );
+        let k_buf = cache.k.take().expect("kv cache k buffer");
+        let v_buf = cache.v.take().expect("kv cache v buffer");
+        let write_slice = [
+            0..batch_size,
+            0..self.n_kv_head,
+            start_pos..(start_pos + new_seq_len),
+            0..head_size,
+        ];
+        let k_buf = k_buf.slice_assign(write_slice.clone(), k_embed);
+        let v_buf = v_buf.slice_assign(write_slice, v);
+        cache.len = start_pos + new_seq_len;
+        let valid_slice = [0..batch_size, 0..self.n_kv_head, 0..cache.len, 0..head_size];
+        let k_full = k_buf.clone().slice(valid_slice.clone());
+        let v_full = v_buf.clone().slice(valid_slice);
+        cache.k = Some(k_buf);
+        cache.v = Some(v_buf);
 
         let k_repeat = repeat_kv(k_full, n_rep);
         let v_repeat = repeat_kv(v_full, n_rep);
@@ -527,6 +555,17 @@ impl<B: Backend> Llm<B> {
             .unwrap_or(self.n_ctx)
     }
 
+    /// Preallocated caches (one per layer) sized to `capacity` positions.
+    pub fn new_kv_caches(&self, capacity: usize, device: &B::Device) -> Vec<KvCache<B>> {
+        self.blocks
+            .iter()
+            .map(|b| {
+                let head_dim = b.attn.n_embd / b.attn.n_head;
+                KvCache::preallocated(1, b.attn.n_kv_head, head_dim, capacity, device)
+            })
+            .collect()
+    }
+
     pub fn forward(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let tok_emb = self.embed_tokens.forward(input);
 
@@ -685,6 +724,72 @@ mod tests {
     }
 
     #[test]
+    fn test_cached_forward_matches_full_forward() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+
+        let tokens = vec![1i32, 2, 3, 4, 5, 6];
+        let input = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(tokens.clone(), [1, 6]),
+            &device,
+        );
+
+        // Prefill path: the cache must reproduce the uncached logits exactly.
+        let full = model.forward(input.clone()).into_data().to_vec::<f32>().unwrap();
+        let mut caches: Vec<KvCache<NdArray<f32, i32>>> =
+            model.new_kv_caches(model.max_seq_len(), &device);
+        let cached = model
+            .forward_with_cache(input, 0, &mut caches)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(full.len(), cached.len());
+        let max_diff = full
+            .iter()
+            .zip(cached.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-4,
+            "prefill cache diverged from the full forward pass: max_diff={max_diff}"
+        );
+
+        // Decode path: feeding one new token at start_pos=6 must match the
+        // corresponding row of a single 7-token uncached forward.
+        let full7 = model
+            .forward(Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                TensorData::new(vec![1i32, 2, 3, 4, 5, 6, 7], [1, 7]),
+                &device,
+            ))
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let step = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(vec![7i32], [1, 1]),
+            &device,
+        );
+        let step_logits = model
+            .forward_with_cache(step, 6, &mut caches)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let vocab = 50;
+        let expected = &full7[6 * vocab..7 * vocab];
+        let step_diff = expected
+            .iter()
+            .zip(step_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            step_diff < 1e-4,
+            "decode cache diverged from the full forward pass: max_diff={step_diff}"
+        );
+        assert_eq!(caches[0].len, 7);
+    }
+
+    #[test]
     fn test_forward_with_cache_past_n_ctx_with_scaling() {
         use burn_ndarray::{NdArray, NdArrayDevice};
         let device = NdArrayDevice::Cpu;
@@ -692,7 +797,8 @@ mod tests {
         config.set_rope_scaling(RopeScalingKind::Linear, 2.0);
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
         assert_eq!(model.max_seq_len(), 16);
-        let mut caches: Vec<KvCache<NdArray<f32, i32>>> = vec![KvCache::new()];
+        let mut caches: Vec<KvCache<NdArray<f32, i32>>> =
+            model.new_kv_caches(model.max_seq_len(), &device);
 
         let prefill = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
             TensorData::new(vec![1i32, 2, 3, 4, 5, 6], [1, 6]),
@@ -709,7 +815,8 @@ mod tests {
         );
         let out = model.forward_with_cache(next, 6, &mut caches);
         assert_eq!(out.dims(), [1, 6, 50]);
-        assert_eq!(caches[0].k.as_ref().unwrap().dims()[2], 12);
+        assert_eq!(caches[0].len, 12);
+        assert_eq!(caches[0].capacity, 16);
         assert!(12 <= model.max_seq_len());
     }
 

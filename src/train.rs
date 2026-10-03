@@ -4,7 +4,7 @@ use crate::generate::{generate, XorshiftRng};
 use crate::model::Llm;
 use crate::tui;
 use burn::grad_clipping::GradientClippingConfig;
-use burn::module::{AutodiffModule, Module, ModuleMapper, Param};
+use burn::module::{AutodiffModule, Module};
 use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::backend::{AutodiffBackend, Backend};
@@ -34,21 +34,6 @@ impl Default for LossOptions {
             label_smoothing: 0.0,
             z_loss: 0.0,
         }
-    }
-}
-
-/// Applies decoupled decay (`w <- w * factor`) to rank >= 2 parameters only.
-struct WeightDecayMapper {
-    factor: f64,
-}
-
-impl<B: Backend> ModuleMapper<B> for WeightDecayMapper {
-    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
-        if D < 2 || (self.factor - 1.0).abs() < 1e-12 {
-            return param;
-        }
-        let (id, tensor, mapper) = param.consume();
-        Param::from_mapped_value(id, tensor.mul_scalar(self.factor), mapper)
     }
 }
 
@@ -576,10 +561,11 @@ pub fn train_with_events<B: AutodiffBackend>(
         emit_log(tx, "Successfully loaded checkpoint weights!");
     }
 
-    // Weight decay is applied manually through `WeightDecayMapper` so norms and
-    // biases are excluded (rank >= 2 only); AdamW's uniform decay stays off.
+    // AdamW's built-in decoupled weight decay. A previous ModuleMapper-based
+    // implementation (rank >= 2 only) froze every mapped parameter: the mapped
+    // tensor stopped receiving gradients, so training stayed at ln(vocab).
     let mut optim = AdamWConfig::new()
-        .with_weight_decay(0.0f32)
+        .with_weight_decay(loss_opts.weight_decay as f32)
         .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0)))
         .init();
 
@@ -758,10 +744,6 @@ pub fn train_with_events<B: AutodiffBackend>(
 
             if batch_idx + 1 - window_start == window_len {
                 let grads = grad_accumulator.grads();
-                if loss_opts.weight_decay > 0.0 {
-                    let factor = 1.0 - current_lr * loss_opts.weight_decay;
-                    model = model.map(&mut WeightDecayMapper { factor });
-                }
                 model = optim.step(current_lr, model, grads);
                 window_start = batch_idx + 1;
             }
@@ -1058,6 +1040,7 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     n_ctx: Option<usize>,
     eval_batch_size: usize,
     eval_batches: usize,
+    max_tokens: usize,
     device: &B::Device,
     rope_override: Option<(crate::config::RopeScalingKind, f32)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1092,7 +1075,8 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
         model
     };
 
-    let dataset = TextDataset::from_file(dataset_path, tokenizer, config.n_ctx, None, None)?;
+    let token_limit = if max_tokens == 0 { None } else { Some(max_tokens) };
+    let dataset = TextDataset::from_file(dataset_path, tokenizer, config.n_ctx, None, token_limit)?;
     let batch_limit = if eval_batches == 0 { "all".to_string() } else { eval_batches.to_string() };
     println!(
         "Evaluating model on dataset {:?} ({} samples, {} tokens) [batch={}, batches={}]...",
@@ -1369,6 +1353,53 @@ mod tests {
         rx.into_iter()
             .filter_map(|event| match event {
                 TrainingEvent::Progress { step, lr, .. } => Some((step, lr)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_train_losses<B: AutodiffBackend>(
+        config: &ModelConfig,
+        tokenizer: &LlmTokenizer,
+        corpus: &str,
+        epochs: usize,
+        batch_size: usize,
+        max_tokens: usize,
+        resume: &Path,
+        output_dir: &Path,
+        device: &B::Device,
+    ) -> Vec<(usize, f32)> {
+        let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        train_with_events::<B>(
+            None,
+            Some(corpus),
+            config.clone(),
+            tokenizer,
+            epochs,
+            batch_size,
+            0.1,
+            None,
+            Some(max_tokens),
+            0.0,
+            1,
+            0,
+            None,
+            Some(resume),
+            device,
+            output_dir.to_str().unwrap(),
+            0,
+            LossOptions::default(),
+            &tx,
+            &cancel,
+            None,
+        )
+        .expect("tiny training run failed");
+        drop(tx);
+        rx.into_iter()
+            .filter_map(|event| match event {
+                TrainingEvent::Progress { step, avg_loss, .. } => Some((step, avg_loss)),
                 _ => None,
             })
             .collect()
@@ -1654,55 +1685,37 @@ mod tests {
         );
     }
 
+    /// Regression gate for the Stage D weight-decay bug: a `ModuleMapper`-based
+    /// decoupled decay froze every mapped parameter, so training stayed at
+    /// ln(vocab) no matter the learning rate. AdamW now applies weight decay
+    /// natively; with the default `LossOptions` (weight_decay = 0.1) the loss
+    /// must fall well below the random baseline on a corpus small enough to
+    /// overfit.
     #[test]
-    fn test_weight_decay_mapper_skips_rank1() {
-        use burn_ndarray::{NdArray, NdArrayDevice};
+    fn test_training_learns_with_default_weight_decay() {
         let device = NdArrayDevice::Cpu;
-        let config = ModelConfig::new(64, 32, 4, Some(2), 1, 8, 0.0, 0.0);
-        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        let dir = test_dir("overfit");
+        let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
+        let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        let init = save_initial_weights::<NdArray<f32, i32>>(&dir, &config, &device);
+        let out = dir.join("out");
 
-        let embed_before = model.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap();
-        let weight_before = model.blocks[0].attn.q_proj.weight.val().into_data().to_vec::<f32>().unwrap();
-        let norm_before = model.blocks[0].input_layernorm.weight.val().into_data().to_vec::<f32>().unwrap();
-        let bias_before = model
-            .blocks[0]
-            .attn
-            .q_proj
-            .bias
-            .as_ref()
-            .unwrap()
-            .val()
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-
-        let mapped = model.map(&mut WeightDecayMapper { factor: 0.5 });
-
-        let embed_after = mapped.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap();
-        let weight_after = mapped.blocks[0].attn.q_proj.weight.val().into_data().to_vec::<f32>().unwrap();
-        let norm_after = mapped.blocks[0].input_layernorm.weight.val().into_data().to_vec::<f32>().unwrap();
-        let bias_after = mapped
-            .blocks[0]
-            .attn
-            .q_proj
-            .bias
-            .as_ref()
-            .unwrap()
-            .val()
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-
-        // Rank >= 2 (embeddings, projection matrices) is decayed...
-        for (before, after) in embed_before.iter().zip(embed_after.iter()) {
-            assert!((before * 0.5 - after).abs() < 1e-6);
-        }
-        for (before, after) in weight_before.iter().zip(weight_after.iter()) {
-            assert!((before * 0.5 - after).abs() < 1e-6);
-        }
-        // ...while norms and biases are untouched.
-        assert_eq!(norm_before, norm_after);
-        assert_eq!(bias_before, bias_after);
+        let losses = run_train_losses::<TestBackend>(
+            &config, &tokenizer, &corpus, 8, 4, 0, &init, &out, &device,
+        );
+        assert!(!losses.is_empty(), "no progress events emitted");
+        let first = losses.first().unwrap().1;
+        let last = losses.last().unwrap().1;
+        eprintln!(
+            "[OVERFIT] avg_loss {first:.4} -> {last:.4} over {} steps (chance ~ {:.2})",
+            losses.len(),
+            (tokenizer.vocab_size() as f32).ln()
+        );
+        assert!(
+            last < first - 1.0,
+            "training did not reduce the loss ({first:.4} -> {last:.4}); \
+             default weight decay is breaking the optimizer again"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ use backend::{MainBackend, MainHalf};
 use burn::backend::Autodiff;
 use burn::module::Module;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+use burn::tensor::backend::Backend;
 
 const DEFAULT_CORPUS: &str = "\
 Rust is a multi-paradigm, general-purpose programming language. \
@@ -221,6 +222,10 @@ struct EvalArgs {
     /// Max batches to evaluate (0 = all; the old hard cap was 100)
     #[arg(long, default_value_t = 0)]
     eval_batches: usize,
+    /// Tokenize at most this many tokens of the dataset before evaluating
+    /// (0 = all). Useful to evaluate a slice of a huge corpus.
+    #[arg(long, default_value_t = 0)]
+    max_tokens: usize,
     /// RoPE context-extension scaling: none, linear, ntk or yarn
     #[arg(long, default_value = "none")]
     rope_scaling: String,
@@ -335,6 +340,9 @@ struct GenerateArgs {
     /// Repetition penalty (1.6 prevents token loops in trained SLMs)
     #[arg(long, default_value_t = 1.6)]
     rep_penalty: f32,
+    /// Compute precision: f32 (default) or f16 (faster on supported GPUs)
+    #[arg(long, default_value = "f32")]
+    dtype: String,
     /// Maximum new tokens to generate
     #[arg(long, default_value_t = 50)]
     max_tokens: usize,
@@ -354,6 +362,42 @@ struct ExportArgs {
     /// Name of the exported GGUF model binary
     #[arg(long, default_value = "kuro-neko-qwen")]
     model_name: String,
+}
+
+/// Load a checkpoint and run greedy/sampled generation on any backend, so the
+/// CLI can dispatch f32 (fused WGPU) and f16 (non-fused half) identically.
+#[allow(clippy::too_many_arguments)]
+fn run_generate<B: Backend>(
+    model_config: &ModelConfig,
+    tokenizer: &LlmTokenizer,
+    weights_path: &Path,
+    device: &B::Device,
+    args: &GenerateArgs,
+    seed: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let model: Llm<B> = model_config.init_model(device);
+    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
+    let record = recorder
+        .load(weights_path.to_path_buf(), device)
+        .map_err(|e| format!("Failed to load weights: {:?}", e))?;
+    let model = model.load_record(record);
+
+    let result = generate(
+        &model,
+        tokenizer,
+        &args.prompt,
+        args.max_tokens,
+        args.temp,
+        args.top_k,
+        args.top_p,
+        args.min_p,
+        args.rep_penalty,
+        seed,
+        device,
+    )?;
+
+    println!("Generation Result:\n{}", result);
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -677,6 +721,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.n_ctx,
                 args.eval_batch_size,
                 args.eval_batches,
+                args.max_tokens,
                 &device,
                 rope_override,
             )?;
@@ -709,13 +754,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
             };
 
-            let model: Llm<MainBackend> = model_config.init_model(&device);
-            let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-            let record = recorder
-                .load(weights_path, &device)
-                .map_err(|e| format!("Failed to load weights: {:?}", e))?;
-            let model = model.load_record(record);
-
+            let dtype = DType::parse(&args.dtype)?;
+            tui::print_info(&format!("Compute precision: {}", dtype.as_str()));
+            tui::print_info(&format!("Backend: {}", backend::backend_label()));
             let seed = args.seed.unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -723,21 +764,28 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .unwrap_or(42)
             });
 
-            let result = generate(
-                &model,
-                &tokenizer,
-                &args.prompt,
-                args.max_tokens,
-                args.temp,
-                args.top_k,
-                args.top_p,
-                args.min_p,
-                args.rep_penalty,
-                seed,
-                &device,
-            )?;
-
-            println!("Generation Result:\n{}", result);
+            match dtype {
+                DType::F32 => {
+                    run_generate::<MainBackend>(
+                        &model_config,
+                        &tokenizer,
+                        &weights_path,
+                        &device,
+                        &args,
+                        seed,
+                    )?;
+                }
+                DType::F16 => {
+                    run_generate::<MainHalf>(
+                        &model_config,
+                        &tokenizer,
+                        &weights_path,
+                        &device,
+                        &args,
+                        seed,
+                    )?;
+                }
+            }
         }
         Commands::Export(args) => {
             let config_path = Path::new(output_dir).join("config.json");
@@ -800,6 +848,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  Model Size (FP32): {:.2} MB", fp32_mb);
             println!("  FLOPs per Token  : {:.2} GFLOPs", flops_per_token as f64 / 1_000_000_000.0);
             println!("  GQA Cache Saving : {:.1}% KV-cache VRAM reduction", (1.0 - (n_kv_head as f64 / n_head as f64)) * 100.0);
+            let head_dim = n_embd / n_head;
+            let kv_f32 = 2 * n_kv_head * head_dim * 4 * n_layer;
+            let kv_f16 = 2 * n_kv_head * head_dim * 2 * n_layer;
+            let mb = |bytes: usize| bytes as f64 * model_config.n_ctx as f64 / (1024.0 * 1024.0);
+            println!(
+                "  KV Cache (f32)   : {} B/token ({:.2} MB at n_ctx={})",
+                kv_f32, mb(kv_f32), model_config.n_ctx
+            );
+            println!(
+                "  KV Cache (f16)   : {} B/token ({:.2} MB at n_ctx={})",
+                kv_f16, mb(kv_f16), model_config.n_ctx
+            );
             println!("===============================================================================");
         }
         Commands::Serve(args) => {

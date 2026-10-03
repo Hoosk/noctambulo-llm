@@ -74,7 +74,11 @@ function record(name, ok, detail = "") {
 }
 
 // ---------------------------------------------------------------- CDP client
-const targets = await (await fetch(`${opts.cdp}/json/list`)).json();
+const targetsRes = await fetch(`${opts.cdp}/json/list`);
+if (!targetsRes.ok) {
+  throw new Error(`CDP target list failed: HTTP ${targetsRes.status} ${targetsRes.statusText}`);
+}
+const targets = await targetsRes.json();
 const page = targets.find((t) => t.type === "page");
 if (!page) fail(`no page target on ${opts.cdp}`);
 const ws = new WebSocket(page.webSocketDebuggerUrl);

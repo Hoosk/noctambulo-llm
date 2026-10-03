@@ -33,6 +33,9 @@ pub(super) struct GenerateRequest {
     rope_scaling: Option<String>,
     #[serde(default = "default_rope_factor")]
     rope_factor: f32,
+    /// Compute precision: f32 (default) or f16.
+    #[serde(default)]
+    dtype: Option<String>,
 }
 
 fn default_max_new_tokens() -> usize {
@@ -74,6 +77,7 @@ struct Sampling {
     repetition_penalty: f32,
     rope_kind: crate::config::RopeScalingKind,
     rope_factor: f32,
+    dtype: crate::config::DType,
 }
 
 impl Sampling {
@@ -87,6 +91,10 @@ impl Sampling {
         } else {
             1.0
         };
+        let dtype = match req.dtype.as_deref() {
+            Some(name) => crate::config::DType::parse(name).map_err(ApiError::bad_request)?,
+            None => crate::config::DType::F32,
+        };
         Ok(Self {
             prompt: req.prompt,
             max_tokens: req.max_tokens,
@@ -97,6 +105,7 @@ impl Sampling {
             repetition_penalty: req.repetition_penalty,
             rope_kind,
             rope_factor,
+            dtype,
         })
     }
 }
@@ -162,10 +171,6 @@ fn run_generate(
     stream: bool,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String, String> {
-    use burn::backend::Wgpu;
-    use burn::module::Module;
-    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-
     let config_path = model_dir.join("config.json");
     let weights_path = model_dir.join("model_weights");
     let config_str = std::fs::read_to_string(&config_path)
@@ -180,11 +185,32 @@ fn run_generate(
     let tokenizer = crate::data::LlmTokenizer::from_file(tokenizer_path)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
-    let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
-    let model: crate::model::Llm<Wgpu> = config.init_model(&device);
+    match s.dtype {
+        crate::config::DType::F32 => run_generate_backend::<burn::backend::Wgpu>(
+            config, weights_path, tokenizer, s, stream, tx,
+        ),
+        crate::config::DType::F16 => run_generate_backend::<crate::backend::WgpuHalf<burn::tensor::f16>>(
+            config, weights_path, tokenizer, s, stream, tx,
+        ),
+    }
+}
+
+fn run_generate_backend<B: burn::tensor::backend::Backend>(
+    config: crate::config::ModelConfig,
+    weights_path: std::path::PathBuf,
+    tokenizer: crate::data::LlmTokenizer,
+    s: Sampling,
+    stream: bool,
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
+) -> Result<String, String> {
+    use burn::module::Module;
+    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+
+    let device = B::Device::default();
+    let model: crate::model::Llm<B> = config.init_model(&device);
     let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
     let record = recorder
-        .load(weights_path.clone(), &device)
+        .load(weights_path, &device)
         .map_err(|e| format!("failed to load weights: {e:?}"))?;
     let model = model.load_record(record);
 

@@ -213,9 +213,7 @@ pub fn generate_streaming<B: Backend>(
     let eos_token_id = tokenizer.end_of_text_id();
     let mut decode_stream = tokenizer.decode_stream(true);
 
-    let mut caches: Vec<KvCache<B>> = (0..model.blocks.len())
-        .map(|_| KvCache::empty())
-        .collect();
+    let mut caches: Vec<KvCache<B>> = model.new_kv_caches(max_seq, device);
 
     // 1. Prefill Phase: process prompt tokens in one forward pass
     let prompt_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();

@@ -12,6 +12,7 @@ export interface GenForm {
   rep: string;
   ropeScaling: string;
   ropeFactor: string;
+  dtype: string;
 }
 
 interface Props {
@@ -113,6 +114,15 @@ export function GenerateForm({
       <p className="text-[11px] text-slate-500 -mt-1 mb-1">
         Scaling extends the usable context past the trained window (generation past n_ctx works with or without it).
       </p>
+
+      <div className="grid grid-cols-2 gap-3 mt-3">
+        <Field label="Compute precision">
+          <Select value={form.dtype} onChange={(e) => onField("dtype", e.target.value)}>
+            <option value="f32">f32 · full precision</option>
+            <option value="f16">f16 · faster on supported GPUs</option>
+          </Select>
+        </Field>
+      </div>
 
       <div className="mt-5 flex gap-3">
         <Button variant="primary" disabled={busy || !modelDir} onClick={onRun}>
