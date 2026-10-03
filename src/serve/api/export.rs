@@ -12,6 +12,10 @@ pub(super) struct ExportRequest {
     model_dir: String,
     #[serde(default = "default_model_name")]
     model_name: String,
+    /// Allow exporting cross-layer KV sharing models as a standard-attention
+    /// approximation (duplicated K/V weights).
+    #[serde(default)]
+    approx: bool,
 }
 
 fn default_model_name() -> String {
@@ -33,13 +37,14 @@ pub(super) async fn export_model(
     // Export runs as a background operation so the UI can show tensor-writing
     // progress and cancel a long export.
     let name = req.model_name;
+    let approx = req.approx;
     let label = format!("{} → {}.gguf", model_dir.display(), name);
     let op = state.ops.start("export", &label);
     let op_id = op.id().to_string();
     tokio::task::spawn_blocking(move || {
         let progress = |phase: &str, done: u64, total: u64, unit: &str| op.progress(phase, done, total, unit);
         let cancelled = || op.is_cancelled();
-        match run_export(model_dir, &name, &progress, &cancelled) {
+        match run_export(model_dir, &name, approx, &progress, &cancelled) {
             Ok(path) => op.finish(
                 &format!("GGUF exported: {path}"),
                 Some(serde_json::json!({ "gguf": path })),
@@ -60,6 +65,7 @@ pub(super) async fn export_model(
 fn run_export(
     model_dir: std::path::PathBuf,
     model_name: &str,
+    approx: bool,
     progress: &dyn Fn(&str, u64, u64, &str),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<String, String> {
@@ -73,6 +79,9 @@ fn run_export(
         .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
     let config: crate::config::ModelConfig =
         serde_json::from_str(&config_str).map_err(|e| format!("bad config: {e}"))?;
+    config
+        .check_arch_version(&config_path.display().to_string())
+        .map_err(|e| format!("incompatible checkpoint: {e}"))?;
 
     let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
     let model: crate::model::Llm<Wgpu> = config.init_model(&device);
@@ -82,6 +91,6 @@ fn run_export(
         .map_err(|e| format!("failed to load weights: {e:?}"))?;
     let model = model.load_record(record);
 
-    crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported", progress, cancelled)
+    crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported", approx, progress, cancelled)
         .map_err(|e| format!("export error: {e}"))
 }

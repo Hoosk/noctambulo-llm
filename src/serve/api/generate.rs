@@ -177,6 +177,9 @@ fn run_generate(
         .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
     let mut config: crate::config::ModelConfig =
         serde_json::from_str(&config_str).map_err(|e| format!("bad config: {e}"))?;
+    config
+        .check_arch_version(&config_path.display().to_string())
+        .map_err(|e| format!("incompatible checkpoint: {e}"))?;
     // Request-level RoPE override for context extension; `none` + factor 1
     // keeps whatever the checkpoint config declares.
     config.set_rope_scaling(s.rope_kind, s.rope_factor);

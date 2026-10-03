@@ -1050,6 +1050,7 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     }
     let config_str = std::fs::read_to_string(&config_path)?;
     let mut config: ModelConfig = serde_json::from_str(&config_str)?;
+    config.check_arch_version(&config_path.display().to_string())?;
 
     if let Some(ctx) = n_ctx {
         config.n_ctx = ctx;

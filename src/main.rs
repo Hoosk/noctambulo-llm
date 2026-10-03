@@ -101,7 +101,7 @@ enum Commands {
     /// Pre-tokenize corpus or HF dataset to compact binary dataset format (.bin)
     PrepareDataset(PrepareDatasetArgs),
     /// Train the causal transformer model
-    Train(TrainArgs),
+    Train(Box<TrainArgs>),
     /// Evaluate model cross-entropy loss and perplexity (PPL) on dataset
     Eval(EvalArgs),
     /// Generate text autoregressively from a prompt
@@ -298,6 +298,10 @@ struct TrainArgs {
     /// Initial tokens always kept attendable (attention sinks, StreamingLLM)
     #[arg(long, default_value_t = 0)]
     sink_tokens: usize,
+    /// Layers per cross-layer K/V sharing group (1 = no sharing; the KV cache
+    /// shrinks by this factor, at the cost of a different computation graph).
+    #[arg(long, default_value_t = 1)]
+    kv_share_group: usize,
     /// Validation set ratio (0.1 = 10% validation split)
     #[arg(long, default_value_t = 0.1)]
     val_split: f32,
@@ -369,6 +373,10 @@ struct ExportArgs {
     /// Name of the exported GGUF model binary
     #[arg(long, default_value = "kuro-neko-qwen")]
     model_name: String,
+    /// Allow exporting a cross-layer KV sharing model as a standard-attention
+    /// approximation (duplicated K/V weights; not bit-identical to the engine).
+    #[arg(long)]
+    approx: bool,
 }
 
 /// Load a checkpoint and run greedy/sampled generation on any backend, so the
@@ -640,6 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             model_config.sliding_window =
                 (args.sliding_window > 0).then_some(args.sliding_window);
             model_config.sink_tokens = args.sink_tokens;
+            model_config.kv_share_group = args.kv_share_group.max(1);
 
             let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
             let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
@@ -745,9 +754,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Ok(());
             }
 
-            let config_str = std::fs::read_to_string(config_path)?;
+            let config_str = std::fs::read_to_string(&config_path)?;
             let mut model_config: ModelConfig = serde_json::from_str(&config_str)?;
-
+            model_config.check_arch_version(&config_path.display().to_string())?;
             let rope_kind = RopeScalingKind::parse(&args.rope_scaling)?;
             if rope_kind != RopeScalingKind::None || (args.rope_factor - 1.0).abs() > f32::EPSILON {
                 model_config.set_rope_scaling(rope_kind, args.rope_factor);
@@ -806,8 +815,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Ok(());
             }
 
-            let config_str = std::fs::read_to_string(config_path)?;
+            let config_str = std::fs::read_to_string(&config_path)?;
             let model_config: ModelConfig = serde_json::from_str(&config_str)?;
+            model_config.check_arch_version(&config_path.display().to_string())?;
 
             let model: Llm<MainBackend> = model_config.init_model(&device);
             let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
@@ -816,7 +826,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map_err(|e| format!("Failed to load weights: {:?}", e))?;
             let model = model.load_record(record);
 
-            export_to_gguf(&model, &model_config, custom_tokenizer_file, &args.model_name, "exported")?;
+            export_to_gguf(&model, &model_config, custom_tokenizer_file, &args.model_name, "exported", args.approx)?;
         }
         Commands::Stats => {
             let config_path = Path::new(output_dir).join("config.json");

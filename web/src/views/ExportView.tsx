@@ -15,6 +15,7 @@ export function ExportView() {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [modelDir, setModelDir] = useState(activeModel);
   const [name, setName] = useState("kuro-neko");
+  const [approx, setApprox] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<string | null>(null);
   const [opId, setOpId] = useState<string | null>(null);
@@ -56,7 +57,11 @@ export function ExportView() {
     setError("");
     setResult(null);
     try {
-      const res = await api.exportModel(selectedDir, name || "kuro-neko");
+      const res = await api.exportModel({
+        modelDir: selectedDir,
+        modelName: name || "kuro-neko",
+        approx,
+      });
       setOpId(res.opId);
     } catch (e) {
       setError(e instanceof Error ? e.message : "unknown");
@@ -93,6 +98,15 @@ export function ExportView() {
             <Input type="text" value={name} onChange={(e) => setName(e.target.value)} />
           </Field>
         </div>
+        <label className="flex items-center gap-2.5 text-xs text-slate-400 cursor-pointer select-none mb-4">
+          <input
+            type="checkbox"
+            checked={approx}
+            onChange={(e) => setApprox(e.target.checked)}
+            className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+          />
+          Approx export (standard-attention approximation for grouped KV models)
+        </label>
         <Button variant="primary" disabled={running || !selectedDir} onClick={() => void run()}>
           {running ? "Exporting…" : "Export"}
         </Button>

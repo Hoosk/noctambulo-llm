@@ -5,6 +5,7 @@ import type {
   DatasetHit,
   DatasetInfo,
   DeviceInfo,
+  ExportRequestBody,
   LogsResponse,
   ModelFilesResponse,
   ModelInfo,
@@ -111,8 +112,8 @@ export const api = {
     request<{ status: string; deleted: string }>(`/api/models/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }),
-  exportModel: (modelDir: string, modelName: string) =>
-    request<{ opId: string; status: string }>("/api/export", { method: "POST", json: { modelDir, modelName } }),
+  exportModel: (body: ExportRequestBody) =>
+    request<{ opId: string; status: string }>("/api/export", { method: "POST", json: body }),
   getOps: () => request<OpStatus[]>("/api/ops"),
   cancelOp: (id: string) =>
     request<{ status: string; id: string }>(`/api/ops/${encodeURIComponent(id)}/cancel`, { method: "POST" }),

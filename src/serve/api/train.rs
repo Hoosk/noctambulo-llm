@@ -64,6 +64,9 @@ pub(super) struct TrainRequest {
     /// Initial tokens always kept attendable (attention sinks).
     #[serde(default)]
     sink_tokens: usize,
+    /// Layers per cross-layer K/V sharing group (0/1 = no sharing).
+    #[serde(default)]
+    kv_share_group: usize,
     #[serde(default)]
     save_dir: Option<String>,
     #[serde(default)]
@@ -207,6 +210,7 @@ pub(super) async fn train(
         attn_softcap: req.attn_softcap,
         sliding_window: req.sliding_window,
         sink_tokens: req.sink_tokens,
+        kv_share_group: req.kv_share_group,
         save_dir: req.save_dir.map(path_buf_from),
         resume: req.resume.map(path_buf_from),
         output_dir: req.output_dir,

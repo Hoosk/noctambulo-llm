@@ -169,6 +169,7 @@ export interface TrainRequestBody {
   attnSoftcap: number;
   slidingWindow?: number;
   sinkTokens?: number;
+  kvShareGroup?: number;
   seqWarmupSteps: number;
   weightDecay: number;
   labelSmoothing: number;
@@ -176,6 +177,12 @@ export interface TrainRequestBody {
   saveDir: string;
   outputDir: string;
   resume?: string;
+}
+
+export interface ExportRequestBody {
+  modelDir: string;
+  modelName: string;
+  approx?: boolean;
 }
 
 export type OpEvent =

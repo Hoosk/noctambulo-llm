@@ -147,6 +147,7 @@ pub fn export_to_gguf_cli<B: Backend>(
     tokenizer_path: &str,
     model_name: &str,
     output_dir: &str,
+    approx: bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     export_to_gguf(
         model,
@@ -154,6 +155,7 @@ pub fn export_to_gguf_cli<B: Backend>(
         tokenizer_path,
         model_name,
         output_dir,
+        approx,
         &|_, _, _, _| {},
         &|| false,
     )
@@ -162,6 +164,9 @@ pub fn export_to_gguf_cli<B: Backend>(
 /// Serialize the model to GGUF v3. `progress(phase, done, total, unit)`
 /// reports extraction/writing stages; `cancelled()` is polled between tensors
 /// and aborts leaving the partial file behind for inspection/removal.
+/// `approx` allows exporting models with cross-layer KV sharing by duplicating
+/// the shared K/V weights under every layer (a standard-attention
+/// approximation, not the exact grouped computation).
 #[allow(clippy::too_many_arguments)]
 pub fn export_to_gguf<B: Backend>(
     model: &Llm<B>,
@@ -169,9 +174,18 @@ pub fn export_to_gguf<B: Backend>(
     tokenizer_path: &str,
     model_name: &str,
     output_dir: &str,
+    approx: bool,
     progress: &dyn Fn(&str, u64, u64, &str),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if config.kv_share_group > 1 && !approx {
+        return Err(
+            "cross-layer KV sharing (kv_share_group > 1) cannot be represented by llama.cpp; \
+             pass --approx to export a standard-attention approximation (the shared K/V weights \
+             are duplicated per layer, so the exported model is not identical)"
+                .into(),
+        );
+    }
     std::fs::create_dir_all(output_dir)?;
     let gguf_path = format!("{}/{}.gguf", output_dir, model_name);
 
@@ -215,10 +229,12 @@ pub fn export_to_gguf<B: Backend>(
             data: gamma,
         });
 
-        // Self Attention Projections (Q, K, V, O)
-        let n_kv_head = config.n_kv_head;
+        // Self Attention Projections (Q, K, V, O). K/V come from the layer's
+        // sharing group (duplicated under every layer in --approx mode).
+        let n_kv_head = config.get_n_kv_head();
         let head_dim = config.n_embd / config.n_head;
         let kv_dim = n_kv_head * head_dim;
+        let kv_group = &model.kv[i / config.kv_share_group.max(1)];
 
         let q = block.attn.q_proj.weight.val().into_data().to_vec::<f32>()
             .map_err(|e| format!("Failed to extract q_proj weight: {:?}", e))?;
@@ -241,7 +257,7 @@ pub fn export_to_gguf<B: Backend>(
             });
         }
 
-        let k = block.attn.k_proj.weight.val().into_data().to_vec::<f32>()
+        let k = kv_group.k_proj.weight.val().into_data().to_vec::<f32>()
             .map_err(|e| format!("Failed to extract k_proj weight: {:?}", e))?;
         let k_trans = transpose_2d(&k, kv_dim, config.n_embd);
         let k_permuted = permute_rope_weight(&k_trans, n_kv_head, head_dim, config.n_embd);
@@ -251,7 +267,7 @@ pub fn export_to_gguf<B: Backend>(
             data: k_permuted,
         });
 
-        if let Some(ref k_b_param) = block.attn.k_proj.bias {
+        if let Some(ref k_b_param) = kv_group.k_proj.bias {
             let k_b = k_b_param.val().into_data().to_vec::<f32>()
                 .map_err(|e| format!("Failed to extract k_proj bias: {:?}", e))?;
             let k_b_permuted = permute_rope_bias(&k_b, n_kv_head, head_dim);
@@ -262,7 +278,7 @@ pub fn export_to_gguf<B: Backend>(
             });
         }
 
-        let v = block.attn.v_proj.weight.val().into_data().to_vec::<f32>()
+        let v = kv_group.v_proj.weight.val().into_data().to_vec::<f32>()
             .map_err(|e| format!("Failed to extract v_proj weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_v.weight", prefix),
@@ -270,7 +286,7 @@ pub fn export_to_gguf<B: Backend>(
             data: transpose_2d(&v, kv_dim, config.n_embd),
         });
 
-        if let Some(ref v_b_param) = block.attn.v_proj.bias {
+        if let Some(ref v_b_param) = kv_group.v_proj.bias {
             let v_b = v_b_param.val().into_data().to_vec::<f32>()
                 .map_err(|e| format!("Failed to extract v_proj bias: {:?}", e))?;
             named_tensors.push(NamedTensor {

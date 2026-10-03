@@ -202,7 +202,7 @@ export function ModelsView() {
   const exportGguf = async (model: ModelInfo) => {
     if (exportState) return;
     try {
-      const res = await api.exportModel(model.dir, model.name);
+      const res = await api.exportModel({ modelDir: model.dir, modelName: model.name });
       setExportState({ dir: model.dir, opId: res.opId });
     } catch (e) {
       toast.error(`Export failed: ${e instanceof Error ? e.message : "unknown"}`);

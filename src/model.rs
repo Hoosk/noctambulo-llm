@@ -228,11 +228,17 @@ fn repeat_kv<B: Backend>(x: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
     }
 }
 
+fn rotate_half<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
+    let [b, h, s, d] = x.dims();
+    let half = d / 2;
+    let x1 = x.clone().slice([0..b, 0..h, 0..s, 0..half]);
+    let x2 = x.slice([0..b, 0..h, 0..s, half..d]);
+    Tensor::cat(vec![x2.neg(), x1], 3)
+}
+
 #[derive(Module, Debug)]
 pub struct CausalSelfAttention<B: Backend> {
     pub q_proj: Linear<B>,
-    pub k_proj: Linear<B>,
-    pub v_proj: Linear<B>,
     pub out_proj: Linear<B>,
     pub attn_dropout: Dropout,
     pub resid_dropout: Dropout,
@@ -279,142 +285,36 @@ impl<B: Backend> CausalSelfAttention<B> {
         }
     }
 
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    /// Query projection + RoPE for the absolute positions
+    /// `start_pos..start_pos + seq_len`.
+    pub fn query(&self, x: Tensor<B, 3>, start_pos: usize) -> Tensor<B, 4> {
         let [batch_size, seq_len, n_embd] = x.dims();
         let head_size = n_embd / self.n_head;
-        let n_rep = self.n_head / self.n_kv_head;
-
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
-
-        let q = q
+        let q = self
+            .q_proj
+            .forward(x)
             .reshape([batch_size, seq_len, self.n_head, head_size])
             .swap_dims(1, 2);
-        let k = k
-            .reshape([batch_size, seq_len, self.n_kv_head, head_size])
-            .swap_dims(1, 2);
-        let v = v
-            .reshape([batch_size, seq_len, self.n_kv_head, head_size])
-            .swap_dims(1, 2);
-
-        let device = q.device();
-        let (cos, sin) = rope_cos_sin::<B>(&self.rope_freqs, self.rope_mscale, 0, seq_len, &device);
-
-        let q_rot = rotate_half(q.clone());
-        let q_embed = (q * cos.clone()) + (q_rot * sin.clone());
-
-        let k_rot = rotate_half(k.clone());
-        let k_embed = (k * cos) + (k_rot * sin);
-
-        let k_repeat = repeat_kv(k_embed, n_rep);
-        let v_repeat = repeat_kv(v, n_rep);
-
-        let k_t = k_repeat.swap_dims(2, 3);
-        let scale = 1.0 / (head_size as f64).sqrt();
-        let mut scores = q_embed.matmul(k_t) * scale;
-
-        if self.attn_softcap > 0.0 {
-            let cap = self.attn_softcap as f64;
-            scores = (scores / cap).tanh() * cap;
-        }
-
-        let row_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
-        let col_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
-        let disallowed = self.allowed_mask(row_pos, col_pos).bool_not();
-        scores = scores.mask_fill(disallowed.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0), -1e4);
-
-        let attn_probs = burn::tensor::activation::softmax(scores, 3);
-        let attn_probs = self.attn_dropout.forward(attn_probs);
-        let out = attn_probs.matmul(v_repeat);
-
-        let out = out.swap_dims(1, 2).reshape([batch_size, seq_len, n_embd]);
-        let out = self.out_proj.forward(out);
-        self.resid_dropout.forward(out)
-    }
-
-    pub fn forward_with_cache(
-        &self,
-        x: Tensor<B, 3>,
-        start_pos: usize,
-        cache: &mut KvCache<B>,
-    ) -> Tensor<B, 3> {
-        let [batch_size, new_seq_len, n_embd] = x.dims();
-        let head_size = n_embd / self.n_head;
-        let n_rep = self.n_head / self.n_kv_head;
-        let q = self.q_proj.forward(x.clone());
-        let k = self.k_proj.forward(x.clone());
-        let v = self.v_proj.forward(x);
-
-        let q = q
-            .reshape([batch_size, new_seq_len, self.n_head, head_size])
-            .swap_dims(1, 2);
-        let k = k
-            .reshape([batch_size, new_seq_len, self.n_kv_head, head_size])
-            .swap_dims(1, 2);
-        let v = v
-            .reshape([batch_size, new_seq_len, self.n_kv_head, head_size])
-            .swap_dims(1, 2);
-
         let device = q.device();
         let (cos, sin) =
-            rope_cos_sin::<B>(&self.rope_freqs, self.rope_mscale, start_pos, new_seq_len, &device);
+            rope_cos_sin::<B>(&self.rope_freqs, self.rope_mscale, start_pos, seq_len, &device);
         let q_rot = rotate_half(q.clone());
-        let q_embed = (q * cos.clone()) + (q_rot * sin.clone());
+        (q * cos) + (q_rot * sin)
+    }
 
-        let k_rot = rotate_half(k.clone());
-        let k_embed = (k * cos) + (k_rot * sin);
-
-        // Ring-buffer write: consecutive positions map to consecutive slots
-        // (except at the ring wrap and the sink boundary), so each chunk is
-        // written with at most a couple of in-place `slice_assign` segments.
-        // Neither prefill nor decode copy the whole cache.
-        assert!(
-            cache.capacity > self.sink_tokens,
-            "KV cache capacity ({}) must exceed the sink tokens ({})",
-            cache.capacity,
-            self.sink_tokens
-        );
-        for pos in start_pos..(start_pos + new_seq_len) {
-            let slot = cache.slot_for(pos, self.sink_tokens);
-            cache.positions[slot] = pos;
-        }
-        let mut k_buf = cache.k.take().expect("kv cache k buffer");
-        let mut v_buf = cache.v.take().expect("kv cache v buffer");
-        let mut offset = 0usize;
-        while offset < new_seq_len {
-            let pos = start_pos + offset;
-            let slot = cache.slot_for(pos, self.sink_tokens);
-            let mut len = 1usize;
-            while offset + len < new_seq_len {
-                let next_pos = start_pos + offset + len;
-                if cache.slot_for(next_pos, self.sink_tokens) == slot + len {
-                    len += 1;
-                } else {
-                    break;
-                }
-            }
-            let write_slice = [
-                0..batch_size,
-                0..self.n_kv_head,
-                slot..(slot + len),
-                0..head_size,
-            ];
-            let k_part = k_embed
-                .clone()
-                .slice([0..batch_size, 0..self.n_kv_head, offset..(offset + len), 0..head_size]);
-            let v_part = v
-                .clone()
-                .slice([0..batch_size, 0..self.n_kv_head, offset..(offset + len), 0..head_size]);
-            k_buf = k_buf.slice_assign(write_slice.clone(), k_part);
-            v_buf = v_buf.slice_assign(write_slice, v_part);
-            offset += len;
-        }
-        cache.len = (cache.len + new_seq_len).min(cache.capacity);
-        let k_full = k_buf.clone();
-        let v_full = v_buf.clone();
-        cache.k = Some(k_buf);
-        cache.v = Some(v_buf);
+    /// Attention output for a precomputed query and the K/V rows whose
+    /// absolute positions are `col_pos`.
+    pub fn attend(
+        &self,
+        q_embed: Tensor<B, 4>,
+        k_full: Tensor<B, 4>,
+        v_full: Tensor<B, 4>,
+        row_pos: Tensor<B, 1, Int>,
+        col_pos: Tensor<B, 1, Int>,
+    ) -> Tensor<B, 3> {
+        let [batch_size, _, seq_len, _] = q_embed.dims();
+        let head_size = self.n_embd / self.n_head;
+        let n_rep = self.n_head / self.n_kv_head;
 
         let k_repeat = repeat_kv(k_full, n_rep);
         let v_repeat = repeat_kv(v_full, n_rep);
@@ -428,15 +328,6 @@ impl<B: Backend> CausalSelfAttention<B> {
             scores = (scores / cap).tanh() * cap;
         }
 
-        let row_pos =
-            Tensor::<B, 1, Int>::arange(start_pos as i64..(start_pos + new_seq_len) as i64, &device);
-        let col_pos: Vec<i32> = cache
-            .positions
-            .iter()
-            .map(|&p| if p == usize::MAX { i32::MAX } else { p as i32 })
-            .collect();
-        let col_pos =
-            Tensor::<B, 1, Int>::from_data(TensorData::new(col_pos, [cache.capacity]), &device);
         let disallowed = self.allowed_mask(row_pos, col_pos).bool_not();
         scores = scores.mask_fill(disallowed.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0), -1e4);
 
@@ -444,18 +335,108 @@ impl<B: Backend> CausalSelfAttention<B> {
         let attn_probs = self.attn_dropout.forward(attn_probs);
         let out = attn_probs.matmul(v_repeat);
 
-        let out = out.swap_dims(1, 2).reshape([batch_size, new_seq_len, n_embd]);
-        let out = self.out_proj.forward(out);
-        self.resid_dropout.forward(out)
+        let out = out.swap_dims(1, 2).reshape([batch_size, seq_len, self.n_embd]);
+        self.resid_dropout.forward(self.out_proj.forward(out))
     }
 }
 
-fn rotate_half<B: Backend>(x: Tensor<B, 4>) -> Tensor<B, 4> {
-    let [b, h, s, d] = x.dims();
-    let half = d / 2;
-    let x1 = x.clone().slice([0..b, 0..h, 0..s, 0..half]);
-    let x2 = x.slice([0..b, 0..h, 0..s, half..d]);
-    Tensor::cat(vec![x2.neg(), x1], 3)
+/// K/V projections shared by a group of layers (cross-layer KV reuse).
+#[derive(Module, Debug)]
+pub struct KvProj<B: Backend> {
+    pub k_proj: Linear<B>,
+    pub v_proj: Linear<B>,
+    pub rope_freqs: Vec<f32>,
+    pub rope_mscale: f32,
+    pub n_head: usize,
+    pub n_kv_head: usize,
+    pub n_embd: usize,
+}
+
+impl<B: Backend> KvProj<B> {
+    /// Project and RoPE-rotate K (V stays unrotated) for the absolute
+    /// positions `start_pos..start_pos + seq_len`.
+    pub fn forward(&self, x: Tensor<B, 3>, start_pos: usize) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        let [batch_size, seq_len, n_embd] = x.dims();
+        let head_size = n_embd / self.n_head;
+        let k = self
+            .k_proj
+            .forward(x.clone())
+            .reshape([batch_size, seq_len, self.n_kv_head, head_size])
+            .swap_dims(1, 2);
+        let v = self
+            .v_proj
+            .forward(x)
+            .reshape([batch_size, seq_len, self.n_kv_head, head_size])
+            .swap_dims(1, 2);
+        let device = k.device();
+        let (cos, sin) =
+            rope_cos_sin::<B>(&self.rope_freqs, self.rope_mscale, start_pos, seq_len, &device);
+        let k_rot = rotate_half(k.clone());
+        ((k * cos) + (k_rot * sin), v)
+    }
+}
+
+/// Writes K/V rows for the absolute positions `start_pos..` into the ring
+/// cache with contiguous `slice_assign` segments (in place when the buffer has
+/// a single owner). Shared by every group leader.
+fn cache_write<B: Backend>(
+    cache: &mut KvCache<B>,
+    k_embed: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    start_pos: usize,
+    sink_tokens: usize,
+) {
+    let [batch_size, n_kv_head, new_seq_len, head_size] = k_embed.dims();
+    assert!(
+        cache.capacity > sink_tokens,
+        "KV cache capacity ({}) must exceed the sink tokens ({})",
+        cache.capacity,
+        sink_tokens
+    );
+    for pos in start_pos..(start_pos + new_seq_len) {
+        let slot = cache.slot_for(pos, sink_tokens);
+        cache.positions[slot] = pos;
+    }
+    let mut k_buf = cache.k.take().expect("kv cache k buffer");
+    let mut v_buf = cache.v.take().expect("kv cache v buffer");
+    let mut offset = 0usize;
+    while offset < new_seq_len {
+        let pos = start_pos + offset;
+        let slot = cache.slot_for(pos, sink_tokens);
+        let mut len = 1usize;
+        while offset + len < new_seq_len {
+            let next_pos = start_pos + offset + len;
+            if cache.slot_for(next_pos, sink_tokens) == slot + len {
+                len += 1;
+            } else {
+                break;
+            }
+        }
+        let write_slice = [0..batch_size, 0..n_kv_head, slot..(slot + len), 0..head_size];
+        let k_part = k_embed
+            .clone()
+            .slice([0..batch_size, 0..n_kv_head, offset..(offset + len), 0..head_size]);
+        let v_part = v
+            .clone()
+            .slice([0..batch_size, 0..n_kv_head, offset..(offset + len), 0..head_size]);
+        k_buf = k_buf.slice_assign(write_slice.clone(), k_part);
+        v_buf = v_buf.slice_assign(write_slice, v_part);
+        offset += len;
+    }
+    cache.len = (cache.len + new_seq_len).min(cache.capacity);
+    cache.k = Some(k_buf);
+    cache.v = Some(v_buf);
+}
+
+/// Absolute position of every ring slot as an `Int` tensor (`i32::MAX` for
+/// empty slots, masked out by the attention).
+fn cache_col_positions<B: Backend>(cache: &KvCache<B>, device: &B::Device) -> Tensor<B, 1, Int> {
+    let col_pos: Vec<i32> = cache
+        .positions
+        .iter()
+        .map(|&p| if p == usize::MAX { i32::MAX } else { p as i32 })
+        .collect();
+    Tensor::<B, 1, Int>::from_data(TensorData::new(col_pos, [cache.capacity]), device)
 }
 
 #[derive(Clone, Debug)]
@@ -475,13 +456,10 @@ pub struct CausalSelfAttentionConfig {
 impl CausalSelfAttentionConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalSelfAttention<B> {
         let head_dim = self.n_embd / self.n_head;
-        let kv_dim = self.n_kv_head * head_dim;
         let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
 
         CausalSelfAttention {
             q_proj: LinearConfig::new(self.n_embd, self.n_embd).with_bias(true).init(device),
-            k_proj: LinearConfig::new(self.n_embd, kv_dim).with_bias(true).init(device),
-            v_proj: LinearConfig::new(self.n_embd, kv_dim).with_bias(true).init(device),
             out_proj: LinearConfig::new(self.n_embd, self.n_embd).with_bias(false).init(device),
             attn_dropout: DropoutConfig::new(self.dropout).init(),
             resid_dropout: DropoutConfig::new(self.dropout).init(),
@@ -493,6 +471,33 @@ impl CausalSelfAttentionConfig {
             attn_softcap: self.attn_softcap,
             sliding_window: self.sliding_window,
             sink_tokens: self.sink_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct KvProjConfig {
+    pub n_embd: usize,
+    pub n_head: usize,
+    pub n_kv_head: usize,
+    pub n_ctx: usize,
+    pub rope_kind: RopeScalingKind,
+    pub rope_factor: f32,
+}
+
+impl KvProjConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> KvProj<B> {
+        let head_dim = self.n_embd / self.n_head;
+        let kv_dim = self.n_kv_head * head_dim;
+        let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
+        KvProj {
+            k_proj: LinearConfig::new(self.n_embd, kv_dim).with_bias(true).init(device),
+            v_proj: LinearConfig::new(self.n_embd, kv_dim).with_bias(true).init(device),
+            rope_freqs: rope.freqs,
+            rope_mscale: rope.mscale,
+            n_head: self.n_head,
+            n_kv_head: self.n_kv_head,
+            n_embd: self.n_embd,
         }
     }
 }
@@ -543,18 +548,21 @@ pub struct Block<B: Backend> {
 }
 
 impl<B: Backend> Block<B> {
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let x = x.clone() + self.attn.forward(self.input_layernorm.forward(x));
-        x.clone() + self.mlp.forward(self.post_attention_layernorm.forward(x))
-    }
-
-    pub fn forward_with_cache(
+    /// Runs the block with K/V rows already projected by the group leader and
+    /// their absolute column positions.
+    pub fn forward(
         &self,
         x: Tensor<B, 3>,
+        k_full: Tensor<B, 4>,
+        v_full: Tensor<B, 4>,
         start_pos: usize,
-        cache: &mut KvCache<B>,
+        row_pos: Tensor<B, 1, Int>,
+        col_pos: Tensor<B, 1, Int>,
     ) -> Tensor<B, 3> {
-        let x = x.clone() + self.attn.forward_with_cache(self.input_layernorm.forward(x), start_pos, cache);
+        let ln = self.input_layernorm.forward(x.clone());
+        let q = self.attn.query(ln, start_pos);
+        let attn_out = self.attn.attend(q, k_full, v_full, row_pos, col_pos);
+        let x = x + attn_out;
         x.clone() + self.mlp.forward(self.post_attention_layernorm.forward(x))
     }
 }
@@ -603,11 +611,15 @@ impl BlockConfig {
 #[derive(Module, Debug)]
 pub struct Llm<B: Backend> {
     pub embed_tokens: Embedding<B>,
+    /// One K/V projection per sharing group (`ceil(n_layer / kv_share_group)`).
+    pub kv: Vec<KvProj<B>>,
     pub blocks: Vec<Block<B>>,
     pub norm: RmsNorm<B>,
     pub n_ctx: usize,
     /// Position limit: `n_ctx` extended by the active RoPE scaling factor.
     pub max_seq: usize,
+    /// Layers per K/V group (`1` = no cross-layer reuse).
+    pub kv_share_group: usize,
 }
 
 impl<B: Backend> Llm<B> {
@@ -629,23 +641,39 @@ impl<B: Backend> Llm<B> {
         }
     }
 
-    /// Preallocated caches (one per layer) sized to `capacity` positions.
+    /// Index of the K/V group that serves `layer`.
+    fn group_of(&self, layer: usize) -> usize {
+        layer / self.kv_share_group.max(1)
+    }
+
+    /// Preallocated caches (one per K/V group) sized to `capacity` positions.
     pub fn new_kv_caches(&self, capacity: usize, device: &B::Device) -> Vec<KvCache<B>> {
-        self.blocks
+        self.kv
             .iter()
-            .map(|b| {
-                let head_dim = b.attn.n_embd / b.attn.n_head;
-                KvCache::preallocated(1, b.attn.n_kv_head, head_dim, capacity, device)
+            .map(|kv| {
+                let head_dim = kv.n_embd / kv.n_head;
+                KvCache::preallocated(1, kv.n_kv_head, head_dim, capacity, device)
             })
             .collect()
     }
 
     pub fn forward(&self, input: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let tok_emb = self.embed_tokens.forward(input);
+        let [_, seq_len, _] = tok_emb.dims();
+        let device = tok_emb.device();
+        let row_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
+        let col_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
+        let group = self.kv_share_group.max(1);
 
         let mut x = tok_emb;
-        for block in &self.blocks {
-            x = block.forward(x);
+        let mut group_kv: Option<(Tensor<B, 4>, Tensor<B, 4>)> = None;
+        for (i, block) in self.blocks.iter().enumerate() {
+            if i % group == 0 {
+                let ln = block.input_layernorm.forward(x.clone());
+                group_kv = Some(self.kv[self.group_of(i)].forward(ln, 0));
+            }
+            let (k, v) = group_kv.as_ref().expect("group leader computed K/V");
+            x = block.forward(x, k.clone(), v.clone(), 0, row_pos.clone(), col_pos.clone());
         }
 
         let x = self.norm.forward(x);
@@ -661,10 +689,27 @@ impl<B: Backend> Llm<B> {
         caches: &mut [KvCache<B>],
     ) -> Tensor<B, 3> {
         let tok_emb = self.embed_tokens.forward(input);
+        let [_, seq_len, _] = tok_emb.dims();
+        let device = tok_emb.device();
+        let row_pos = Tensor::<B, 1, Int>::arange(
+            start_pos as i64..(start_pos + seq_len) as i64,
+            &device,
+        );
+        let group = self.kv_share_group.max(1);
 
         let mut x = tok_emb;
         for (i, block) in self.blocks.iter().enumerate() {
-            x = block.forward_with_cache(x, start_pos, &mut caches[i]);
+            let g = self.group_of(i);
+            if i % group == 0 {
+                let ln = block.input_layernorm.forward(x.clone());
+                let (k, v) = self.kv[g].forward(ln, start_pos);
+                cache_write(&mut caches[g], k, v, start_pos, block.attn.sink_tokens);
+            }
+            let cache = &caches[g];
+            let k_full = cache.k.clone().expect("kv cache k buffer");
+            let v_full = cache.v.clone().expect("kv cache v buffer");
+            let col_pos = cache_col_positions(cache, &device);
+            x = block.forward(x, k_full, v_full, start_pos, row_pos.clone(), col_pos);
         }
 
         let x = self.norm.forward(x);
@@ -697,6 +742,19 @@ impl ModelConfig {
                 .init(device)
             })
             .collect();
+        let kv: Vec<KvProj<B>> = (0..self.n_kv_groups())
+            .map(|_| {
+                KvProjConfig {
+                    n_embd: self.n_embd,
+                    n_head: self.n_head,
+                    n_kv_head: kv_head,
+                    n_ctx: self.n_ctx,
+                    rope_kind,
+                    rope_factor,
+                }
+                .init(device)
+            })
+            .collect();
 
         // Qwen Normal(0, 0.02) weight initialization for tied word embeddings
         let std = 0.02f64;
@@ -711,10 +769,12 @@ impl ModelConfig {
 
         Llm {
             embed_tokens,
+            kv,
             blocks,
             norm: RmsNorm::new(self.n_embd, device),
             n_ctx: self.n_ctx,
             max_seq,
+            kv_share_group: self.kv_share_group.max(1),
         }
     }
 }
@@ -957,13 +1017,16 @@ mod tests {
     fn assert_cached_matches_full_with_window(
         window: Option<usize>,
         sink_tokens: usize,
+        kv_share_group: usize,
     ) -> (usize, usize) {
         use burn_ndarray::{NdArray, NdArrayDevice};
         let device = NdArrayDevice::Cpu;
-        let mut config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 4, 8, 0.0, 0.0);
         config.sliding_window = window;
         config.sink_tokens = sink_tokens;
+        config.kv_share_group = kv_share_group;
         let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        assert_eq!(model.new_kv_caches(1, &device).len(), config.n_kv_groups());
 
         let tokens: Vec<i32> = vec![3, 5, 7, 11, 13, 17];
         let full = model
@@ -1006,21 +1069,54 @@ mod tests {
 
     #[test]
     fn test_cached_decode_matches_full_without_window() {
-        let (capacity, max_seq) = assert_cached_matches_full_with_window(None, 0);
+        let (capacity, max_seq) = assert_cached_matches_full_with_window(None, 0, 1);
         assert_eq!(capacity, max_seq);
     }
 
     #[test]
     fn test_cached_decode_matches_full_with_ring_window() {
-        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 0);
+        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 0, 1);
         // Bounded cache: only `window` slots, all overwritten by the end.
         assert_eq!(capacity, 2);
     }
 
     #[test]
     fn test_cached_decode_matches_full_with_sinks() {
-        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 1);
+        let (capacity, _) = assert_cached_matches_full_with_window(Some(2), 1, 1);
         assert_eq!(capacity, 3);
+    }
+
+    #[test]
+    fn test_cached_decode_matches_full_with_kv_sharing() {
+        // 4 layers, 2 per group -> 2 caches; training and cached paths must
+        // agree on the shared-K/V computation.
+        let (capacity, _) = assert_cached_matches_full_with_window(None, 0, 2);
+        assert_eq!(capacity, 8);
+    }
+
+    #[test]
+    fn test_kv_sharing_reduces_cache_count() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 4, 8, 0.0, 0.0);
+        config.kv_share_group = 4;
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        assert_eq!(model.new_kv_caches(8, &device).len(), 1);
+        // The grouped model is a different function than the ungrouped one.
+        let input = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(vec![1i32, 2, 3, 4], [1, 4]),
+            &device,
+        );
+        let grouped = model.forward(input.clone()).into_data().to_vec::<f32>().unwrap();
+        config.kv_share_group = 1;
+        let plain: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        let plain_out = plain.forward(input).into_data().to_vec::<f32>().unwrap();
+        let diff = grouped
+            .iter()
+            .zip(plain_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff > 1e-4, "grouped KV must change the computation (diff={diff})");
     }
 
     #[test]

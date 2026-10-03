@@ -97,6 +97,26 @@ pub struct ModelConfig {
     /// Initial tokens kept attendable forever (attention sinks).
     #[serde(default)]
     pub sink_tokens: usize,
+    /// Number of consecutive layers that share one K/V projection and cache
+    /// (cross-layer KV reuse, DeepSeek CSA-style). `1` disables sharing.
+    #[serde(default = "default_kv_share_group")]
+    pub kv_share_group: usize,
+    /// Checkpoint architecture version. Bumped whenever the module layout
+    /// changes; older versions cannot be loaded (records are positional).
+    #[serde(default = "default_arch_version")]
+    pub arch_version: u32,
+}
+
+/// Current module layout. 1 = pre-KV-cache-refactor, 2 = dynamic RoPE +
+/// sliding window, 3 = grouped cross-layer KV projections.
+pub const ARCH_VERSION: u32 = 3;
+
+fn default_kv_share_group() -> usize {
+    1
+}
+
+fn default_arch_version() -> u32 {
+    1
 }
 
 impl ModelConfig {
@@ -145,7 +165,27 @@ impl ModelConfig {
             rope_factor: 1.0,
             sliding_window: None,
             sink_tokens: 0,
+            kv_share_group: 1,
+            arch_version: ARCH_VERSION,
         }
+    }
+
+    /// Number of layer groups (each group owns one K/V projection and cache).
+    pub fn n_kv_groups(&self) -> usize {
+        let group = self.kv_share_group.max(1);
+        self.n_layer.div_ceil(group)
+    }
+
+    /// Rejects checkpoints saved with an incompatible module layout.
+    pub fn check_arch_version(&self, path: &str) -> Result<(), String> {
+        if self.arch_version != ARCH_VERSION {
+            return Err(format!(
+                "checkpoint at {path} uses architecture version {} but this build expects {} \
+                 (module layout changed); retrain from scratch",
+                self.arch_version, ARCH_VERSION
+            ));
+        }
+        Ok(())
     }
 
     /// Parsed RoPE strategy; unknown strings fall back to `none`.
@@ -174,6 +214,7 @@ impl ModelConfig {
 
     /// Total trainable parameters for this architecture (attention biases and
     /// tied embeddings included; MLP hidden size aligned to 256 like the model).
+    /// K/V projections are counted once per sharing group.
     pub fn param_count(&self) -> usize {
         let n_embd = self.n_embd;
         let kv_dim = self.get_n_kv_head() * (n_embd / self.n_head);
@@ -181,14 +222,14 @@ impl ModelConfig {
 
         let embed = self.vocab_size * n_embd;
         let q = n_embd * n_embd + n_embd;
-        let k = n_embd * kv_dim + kv_dim;
-        let v = n_embd * kv_dim + kv_dim;
         let out = n_embd * n_embd;
         let norms = 2 * n_embd;
         let mlp = 3 * n_embd * hidden;
-        let block = q + k + v + out + norms + mlp;
+        let per_layer = q + out + norms + mlp;
+        let kv = n_embd * kv_dim + kv_dim;
+        let per_group = 2 * kv;
 
-        embed + self.n_layer * block + n_embd
+        embed + self.n_layer * per_layer + self.n_kv_groups() * per_group + n_embd
     }
 }
 
@@ -254,5 +295,34 @@ mod tests {
         cfg.set_rope_scaling(RopeScalingKind::None, -2.0);
         assert_eq!(cfg.rope_scaling, None);
         assert_eq!(cfg.rope_factor, 1.0);
+    }
+
+    #[test]
+    fn test_kv_share_groups_and_param_count() {
+        let cfg = ModelConfig::new(8000, 256, 4, Some(2), 4, 256, 0.1, 0.0);
+        assert_eq!(cfg.n_kv_groups(), 4);
+
+        let mut grouped = cfg.clone();
+        grouped.kv_share_group = 2;
+        assert_eq!(grouped.n_kv_groups(), 2);
+
+        // Grouping drops one K/V pair per removed group.
+        let kv_dim = 2 * 64;
+        let pair = 2 * (256 * kv_dim + kv_dim);
+        assert_eq!(cfg.param_count() - grouped.param_count(), 2 * pair);
+    }
+
+    #[test]
+    fn test_arch_version_gate() {
+        let cfg = ModelConfig::new(100, 64, 4, Some(2), 2, 32, 0.0, 0.0);
+        assert!(cfg.check_arch_version("fresh").is_ok());
+
+        // Configs without the field default to version 1 and are rejected.
+        let old = r#"{"vocab_size":100,"n_embd":64,"n_head":4,"n_layer":2,"n_ctx":32}"#;
+        let cfg: ModelConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(cfg.arch_version, 1);
+        assert_eq!(cfg.kv_share_group, 1);
+        let err = cfg.check_arch_version("old.bin").unwrap_err();
+        assert!(err.contains("architecture version"), "{err}");
     }
 }
