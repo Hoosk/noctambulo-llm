@@ -36,6 +36,9 @@ pub(super) struct GenerateRequest {
     /// Compute precision: f32 (default) or f16.
     #[serde(default)]
     dtype: Option<String>,
+    /// KV cache precision: f32 (default), f16, int8 or q4.
+    #[serde(default)]
+    kv_cache_dtype: Option<String>,
 }
 
 fn default_max_new_tokens() -> usize {
@@ -78,6 +81,7 @@ struct Sampling {
     rope_kind: crate::config::RopeScalingKind,
     rope_factor: f32,
     dtype: crate::config::DType,
+    cache_dtype: crate::model::KvCacheDtype,
 }
 
 impl Sampling {
@@ -95,6 +99,12 @@ impl Sampling {
             Some(name) => crate::config::DType::parse(name).map_err(ApiError::bad_request)?,
             None => crate::config::DType::F32,
         };
+        let cache_dtype = match req.kv_cache_dtype.as_deref() {
+            Some(name) => {
+                crate::model::KvCacheDtype::parse(name).map_err(ApiError::bad_request)?
+            }
+            None => crate::model::KvCacheDtype::F32,
+        };
         Ok(Self {
             prompt: req.prompt,
             max_tokens: req.max_tokens,
@@ -106,6 +116,7 @@ impl Sampling {
             rope_kind,
             rope_factor,
             dtype,
+            cache_dtype,
         })
     }
 }
@@ -188,13 +199,22 @@ fn run_generate(
     let tokenizer = crate::data::LlmTokenizer::from_file(tokenizer_path)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
-    match s.dtype {
-        crate::config::DType::F32 => run_generate_backend::<burn::backend::Wgpu>(
+    match (s.dtype, s.cache_dtype) {
+        // An f16 cache needs a backend that really stores f16 (the fused
+        // backend's f16 casts are no-ops).
+        (crate::config::DType::F32, crate::model::KvCacheDtype::F16) => {
+            run_generate_backend::<crate::backend::WgpuHalf<f32>>(
+                config, weights_path, tokenizer, s, stream, tx,
+            )
+        }
+        (crate::config::DType::F32, _) => run_generate_backend::<burn::backend::Wgpu>(
             config, weights_path, tokenizer, s, stream, tx,
         ),
-        crate::config::DType::F16 => run_generate_backend::<crate::backend::WgpuHalf<burn::tensor::f16>>(
-            config, weights_path, tokenizer, s, stream, tx,
-        ),
+        (crate::config::DType::F16, _) => {
+            run_generate_backend::<crate::backend::WgpuHalf<burn::tensor::f16>>(
+                config, weights_path, tokenizer, s, stream, tx,
+            )
+        }
     }
 }
 
@@ -215,7 +235,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
     let record = recorder
         .load(weights_path, &device)
         .map_err(|e| format!("failed to load weights: {e:?}"))?;
-    let model = model.load_record(record);
+    let model = model.load_record(record).align_compute_dtype();
 
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -235,7 +255,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
             s.min_p,
             s.repetition_penalty,
             seed,
-            false,
+            s.cache_dtype,
             &device,
             |chunk| tx.blocking_send(chunk.to_string()).is_ok(),
         )
@@ -254,7 +274,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
         s.min_p,
         s.repetition_penalty,
         seed,
-        false,
+        s.cache_dtype,
         &device,
     )
     .map_err(|e| format!("generate error: {e}"))

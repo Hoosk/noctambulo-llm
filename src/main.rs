@@ -249,9 +249,10 @@ struct TrainArgs {
     /// Explicit --n-embd/--n-head/--n-kv-head/--n-layer/--n-ctx override it.
     #[arg(long)]
     preset: Option<String>,
-    /// Compute precision: f32 (default) or f16 (faster on GPUs that support
-    /// it); bf16 is rejected by the WGPU backend. Records are always stored
-    /// as f32 for portable inference.
+    /// Compute precision. Only f32 is trainable: Burn 0.21's AdamW moment
+    /// estimates underflow in f16 (the first update explodes and the model
+    /// stops learning), so f16 is rejected with a clear error. bf16 is also
+    /// rejected by the WGPU backend. Records are always stored as f32.
     #[arg(long, default_value = "f32")]
     dtype: String,
     /// Batch size
@@ -355,10 +356,14 @@ struct GenerateArgs {
     /// Repetition penalty (1.6 prevents token loops in trained SLMs)
     #[arg(long, default_value_t = 1.6)]
     rep_penalty: f32,
-    /// Compute precision: f32 (default) or f16 (faster on supported GPUs)
+    /// Compute precision: f32 (default) or f16 (non-fused backend; faster on
+    /// supported GPUs, but half-precision logits can flip tokens on weakly
+    /// trained models)
     #[arg(long, default_value = "f32")]
     dtype: String,
-    /// KV cache precision: f32 (default) or f16 (halves the cache memory)
+    /// KV cache precision: f32 (default), f16 (halves memory; automatically
+    /// uses the non-fused backend so the cast really stores f16) or the
+    /// quantized int8 / q4 formats (packed integers + per-block scales)
     #[arg(long, default_value = "f32")]
     kv_cache_dtype: String,
     /// Maximum new tokens to generate
@@ -395,6 +400,7 @@ fn run_generate<B: Backend>(
     weights_path: &Path,
     device: &B::Device,
     args: &GenerateArgs,
+    cache_dtype: crate::model::KvCacheDtype,
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let model: Llm<B> = model_config.init_model(device);
@@ -402,18 +408,8 @@ fn run_generate<B: Backend>(
     let record = recorder
         .load(weights_path.to_path_buf(), device)
         .map_err(|e| format!("Failed to load weights: {:?}", e))?;
-    let model = model.load_record(record);
+    let model = model.load_record(record).align_compute_dtype();
 
-    let cache_f16 = match args.kv_cache_dtype.trim().to_ascii_lowercase().as_str() {
-        "f16" | "fp16" | "half" => true,
-        "f32" | "fp32" | "float32" => false,
-        other => {
-            return Err(format!(
-                "Unknown KV cache dtype '{other}'. Available: f32, f16"
-            )
-            .into())
-        }
-    };
     let result = generate(
         &model,
         tokenizer,
@@ -425,7 +421,7 @@ fn run_generate<B: Backend>(
         args.min_p,
         args.rep_penalty,
         seed,
-        cache_f16,
+        cache_dtype,
         device,
     )?;
 
@@ -803,24 +799,41 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .unwrap_or(42)
             });
 
-            match dtype {
-                DType::F32 => {
+            let cache_dtype = crate::model::KvCacheDtype::parse(&args.kv_cache_dtype)?;
+            match (dtype, cache_dtype) {
+                // An f16 cache needs a backend that really stores f16: the
+                // fused WGPU backend silently keeps f32 values (its f16 casts
+                // are no-ops), so route it through the non-fused backend.
+                (DType::F32, crate::model::KvCacheDtype::F16) => {
+                    run_generate::<crate::backend::WgpuHalf<f32>>(
+                        &model_config,
+                        &tokenizer,
+                        &weights_path,
+                        &device,
+                        &args,
+                        cache_dtype,
+                        seed,
+                    )?;
+                }
+                (DType::F32, _) => {
                     run_generate::<MainBackend>(
                         &model_config,
                         &tokenizer,
                         &weights_path,
                         &device,
                         &args,
+                        cache_dtype,
                         seed,
                     )?;
                 }
-                DType::F16 => {
+                (DType::F16, _) => {
                     run_generate::<MainHalf>(
                         &model_config,
                         &tokenizer,
                         &weights_path,
                         &device,
                         &args,
+                        cache_dtype,
                         seed,
                     )?;
                 }
@@ -844,7 +857,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let record = recorder
                 .load(weights_path, &device)
                 .map_err(|e| format!("Failed to load weights: {:?}", e))?;
-            let model = model.load_record(record);
+            let model = model.load_record(record).align_compute_dtype();
 
             export_to_gguf(&model, &model_config, custom_tokenizer_file, &args.model_name, "exported", args.approx)?;
         }
@@ -892,16 +905,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  FLOPs per Token  : {:.2} GFLOPs", flops_per_token as f64 / 1_000_000_000.0);
             println!("  GQA Cache Saving : {:.1}% KV-cache VRAM reduction", (1.0 - (n_kv_head as f64 / n_head as f64)) * 100.0);
             let head_dim = n_embd / n_head;
-            let (kv_f32, kv_f16) = if model_config.use_mla() {
-                // One latent per token per group; only `k` is cached.
-                let d = model_config.mla_dim();
-                let groups = model_config.n_kv_groups();
-                (d * 4 * groups, d * 2 * groups)
+            let groups = model_config.n_kv_groups();
+            // Standard attention caches K and V; MLA caches only the latent.
+            let (row_len, cached_rows) = if model_config.use_mla() {
+                (model_config.mla_dim(), 1usize)
             } else {
-                (
-                    2 * n_kv_head * head_dim * 4 * n_layer,
-                    2 * n_kv_head * head_dim * 2 * n_layer,
-                )
+                (n_kv_head * head_dim, 2usize)
+            };
+            let kv_bytes = |dtype: crate::model::KvCacheDtype| -> usize {
+                (row_len as f32 * dtype.bytes_per_elem(row_len) * cached_rows as f32
+                    * groups as f32)
+                    .ceil() as usize
             };
             if model_config.use_mla() {
                 println!(
@@ -918,14 +932,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
             let mb = |bytes: usize| bytes as f64 * model_config.n_ctx as f64 / (1024.0 * 1024.0);
-            println!(
-                "  KV Cache (f32)   : {} B/token ({:.2} MB at n_ctx={})",
-                kv_f32, mb(kv_f32), model_config.n_ctx
-            );
-            println!(
-                "  KV Cache (f16)   : {} B/token ({:.2} MB at n_ctx={})",
-                kv_f16, mb(kv_f16), model_config.n_ctx
-            );
+            for (dtype, label) in [
+                (crate::model::KvCacheDtype::F32, "f32 "),
+                (crate::model::KvCacheDtype::F16, "f16 "),
+                (crate::model::KvCacheDtype::Int8, "int8"),
+                (crate::model::KvCacheDtype::Q4, "q4  "),
+            ] {
+                let bytes = kv_bytes(dtype);
+                println!(
+                    "  KV Cache ({label}) : {} B/token ({:.2} MB at n_ctx={})",
+                    bytes,
+                    mb(bytes),
+                    model_config.n_ctx
+                );
+            }
             println!("===============================================================================");
         }
         Commands::Serve(args) => {

@@ -89,7 +89,7 @@ fn run_export(
     let record = recorder
         .load(weights_path.clone(), &device)
         .map_err(|e| format!("failed to load weights: {e:?}"))?;
-    let model = model.load_record(record);
+    let model = model.load_record(record).align_compute_dtype();
 
     crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported", approx, progress, cancelled)
         .map_err(|e| format!("export error: {e}"))

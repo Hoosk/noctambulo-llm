@@ -543,6 +543,14 @@ pub fn train_with_events<B: AutodiffBackend>(
 
     tui::print_info("Initializing model architecture on WGPU device...");
     let mut model = model_config.init_model::<B>(device);
+    if model.embed_tokens.weight.val().dtype() == burn::tensor::DType::F16 {
+        return Err(
+            "f16 training is not supported: Burn 0.21's AdamW moment estimates \
+             underflow in f16 (the first update explodes and the model stops \
+             learning). Train with --dtype f32 (default)."
+                .into(),
+        );
+    }
 
     let resume_state = load_train_state(resume_path);
 
@@ -557,7 +565,7 @@ pub fn train_with_events<B: AutodiffBackend>(
         let record = recorder
             .load(rec_file.clone(), device)
             .map_err(|e| format!("Failed to load checkpoint from {:?}: {:?}", res_path, e))?;
-        model = model.load_record(record);
+        model = model.load_record(record).align_compute_dtype();
         emit_log(tx, "Successfully loaded checkpoint weights!");
     }
 
@@ -656,7 +664,10 @@ pub fn train_with_events<B: AutodiffBackend>(
 
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
-        let mut accum_loss_tensor = Tensor::<B, 1>::zeros([1], device);
+        // Initialized from the first loss so the accumulator keeps the loss
+        // dtype: `Tensor::zeros` would create f32 data even on an f16 backend
+        // (Burn 0.21), and adding it to an f16 loss corrupts the result.
+        let mut accum_loss_tensor: Option<Tensor<B, 1>> = None;
         let mut accum_count = 0usize;
         let mut total_epoch_loss = 0.0f32;
         let mut total_batches = 0usize;
@@ -734,7 +745,11 @@ pub fn train_with_events<B: AutodiffBackend>(
             // Metrics use the unscaled loss; gradients are scaled by the
             // micro-batch window size so the accumulated update equals the mean
             // gradient over the window (true gradient accumulation).
-            accum_loss_tensor = accum_loss_tensor + loss.clone().detach();
+            let detached = loss.clone().detach();
+            accum_loss_tensor = Some(match accum_loss_tensor.take() {
+                Some(acc) => acc + detached,
+                None => detached,
+            });
             accum_count += 1;
 
             let window_len = std::cmp::min(grad_accum, num_batches - window_start);
@@ -752,9 +767,9 @@ pub fn train_with_events<B: AutodiffBackend>(
             let is_log_step = (batch_idx + 1) % log_interval == 0 || batch_idx == num_batches - 1;
             if is_log_step {
                 let interval_loss = accum_loss_tensor
-                    .into_data()
-                    .convert::<f32>()
-                    .to_vec::<f32>()
+                    .as_ref()
+                    .map(|acc| acc.clone().into_data().convert::<f32>().to_vec::<f32>())
+                    .and_then(|r| r.ok())
                     .unwrap_or_default()
                     .first()
                     .copied()
@@ -773,7 +788,7 @@ pub fn train_with_events<B: AutodiffBackend>(
                 }
 
                 // Reset GPU loss accumulator for next interval
-                accum_loss_tensor = Tensor::<B, 1>::zeros([1], device);
+                accum_loss_tensor = None;
                 accum_count = 0;
             }
 
@@ -916,7 +931,7 @@ pub fn train_with_events<B: AutodiffBackend>(
             0.05,
             1.1,
             42 + epoch as u64,
-            false,
+            crate::model::KvCacheDtype::F32,
             device,
         ).ok();
 
@@ -1071,7 +1086,7 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
         let record = recorder
             .load(model_dir.join("model_weights"), device)
             .map_err(|e| format!("Failed to load model record: {:?}", e))?;
-        model.load_record(record)
+        model.load_record(record).align_compute_dtype()
     } else {
         println!("Warning: model_weights.bin not found in {:?}. Evaluating initialized model.", model_dir);
         model
@@ -1189,7 +1204,18 @@ mod tests {
         let model: Llm<TestBackend> = config.init_model(&device);
 
         let full = crate::generate::generate::<NdArray<f32, i32>>(
-            &model.valid(), &tokenizer, "once", 8, 0.9, 40, 0.9, 0.05, 1.1, 7, false, &device,
+            &model.valid(),
+            &tokenizer,
+            "once",
+            8,
+            0.9,
+            40,
+            0.9,
+            0.05,
+            1.1,
+            7,
+            crate::model::KvCacheDtype::F32,
+            &device,
         )
         .unwrap();
 
@@ -1205,7 +1231,7 @@ mod tests {
             0.05,
             1.1,
             7,
-            false,
+            crate::model::KvCacheDtype::F32,
             &device,
             |chunk| {
                 streamed.push_str(chunk);
