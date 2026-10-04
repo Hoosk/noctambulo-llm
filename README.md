@@ -12,7 +12,7 @@
   - **RMSNorm** normalization with precision $\epsilon = 10^{-6}$.
   - **Tied word embeddings** with normal Gaussian initialization $\mathcal{N}(0, 0.02)$ to avoid logit saturation.
   - **Dropout** and **weight decay** ($0.1$) regularization.
-- **GPU acceleration with WGPU / Burn 0.21**: cross-platform execution (Vulkan, Metal, DX12, WebGPU) with optional half-precision compute (`--dtype f16` on the non-fused backend).
+- **GPU acceleration with WGPU / Burn 0.21**: cross-platform execution (Vulkan, Metal, DX12, WebGPU). Training is f32-only (Burn 0.21's f16 optimizer state underflows); generation supports `--dtype f16` on the non-fused backend. The KV cache can be stored as f16, int8 or q4.
 - **Streaming parallel tokenization**: multithreaded line-by-line streaming loading with a byte-level BPE tokenizer, dynamic capacity estimation and error reporting.
 - **Optimized training pipeline**:
   - **Data shuffling** per epoch (Fisher-Yates) for better convergence.
@@ -65,7 +65,7 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--file <path>` | Local plain-text or binary (`.bin`) file to train on | `None` |
 | `--dataset-file <filename>` | File name inside the HF repo | `TinyStories-train.txt` |
 | `--preset <name>` | Architecture preset: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M) | `None` |
-| `--dtype <f32\|f16>` | Compute precision. `f16` speeds up on capable GPUs (non-fused backend); requires stable LR | `f32` |
+| `--dtype <f32\|f16>` | Compute precision. Only `f32` is trainable; `f16` is rejected (Burn 0.21's AdamW state underflows in f16) | `f32` |
 | `--batch-size <n>` | Batch size | `128` |
 | `--epochs <n>` | Number of training epochs | `3` |
 | `--max-tokens <n>` | Maximum tokens to load (`0` = no limit). The Chinchilla reference is ~20 tokens/parameter | `100000000` |
@@ -207,8 +207,8 @@ cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p
 | `--rep-penalty <float>` | Repetition penalty factor for repeated tokens | `1.6` |
 | `--max-tokens <n>` | Maximum number of new tokens to generate | `50` |
 | `--seed <n>` | Pseudo-random generator seed for reproducibility | `None` |
-| `--dtype <kind>` | Compute precision: `f32` or `f16` (KV cache follows it) | `f32` |
-| `--kv-cache-dtype <kind>` | KV cache precision: `f32` or `f16` (halves cache memory) | `f32` |
+| `--dtype <kind>` | Compute precision: `f32` or `f16` (non-fused backend) | `f32` |
+| `--kv-cache-dtype <kind>` | KV cache precision: `f32`, `f16`, `int8` or `q4` (quantized formats pack integers with per-block scales) | `f32` |
 | `--rope-scaling <kind>` | Context extension: `none`, `linear`, `ntk` or `yarn` | `none` |
 | `--rope-factor <float>` | Extension factor (e.g. `2.0` doubles the usable context) | `1.0` |
 
@@ -218,7 +218,7 @@ The web API additionally exposes `POST /api/generate/stream` (SSE), which stream
 
 ### 6. Inspect Model Statistics (`stats`)
 
-Prints the total parameter count, FP32 memory footprint, FLOPs per token, GQA compression and KV cache estimates (f32/f16, in bytes/token and total MB at `n_ctx`):
+Prints the total parameter count, FP32 memory footprint, FLOPs per token, GQA compression and KV cache estimates (f32/f16/int8/q4, in bytes/token and total MB at `n_ctx`):
 
 ```bash
 cargo run --release -- stats

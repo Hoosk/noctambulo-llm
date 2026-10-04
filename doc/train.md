@@ -16,7 +16,7 @@ The `train` subcommand accepts **23 CLI** configuration parameters:
 | `--file <path>` | `Option<String>` | `None` | Path to a local text file on the filesystem to use as the training corpus. |
 | `--dataset-file <filename>` | `String` | `TinyStories-train.txt` | Name of the target file to download and inspect inside the Hugging Face repository. |
 | `--preset <name>` | `Option<String>` | `None` | Architecture preset (`nano`, `tiny`, `small`, `base`); explicit dimension flags take precedence. |
-| `--dtype <name>` | `String` | `f32` | Compute precision (`f32` or `f16`). `f16` uses the unfused `CubeBackend` (burn-fusion 0.21 crashes with half streams on Vulkan) and is usually 2–3× faster; it can destabilize if the LR is high. `bf16` is rejected with a clear error because WGSL does not support it. Checkpoints are saved in f32. |
+| `--dtype <name>` | `String` | `f32` | Compute precision. Only `f32` is trainable: Burn 0.21's AdamW moment estimates underflow in f16 (the first update explodes), so `f16` is rejected with a clear error. `bf16` is also rejected because WGSL does not support it. Checkpoints are saved in f32. |
 | `--batch-size <n>` | `usize` | `128` | Number of sequences per training batch (*batch*). A larger size makes better use of the GPU and accelerates convergence, but requires more VRAM. |
 | `--epochs <n>` | `usize` | `3` | Number of complete passes through the processed dataset. |
 | `--max-tokens <n>` | `usize` | `100000000` (100M) | Maximum number of tokens to load from the dataset. A value of `0` disables the limit and loads the full dataset. The reference Chinchilla budget is ~20 tokens per parameter. |

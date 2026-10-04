@@ -13,7 +13,7 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--file` | `Option<String>`| `None` | Path to a local plain-text or binary (`.bin`) file to train on. |
 | `--dataset-file` | `String` | `"TinyStories-train.txt"` | Target file name inside the HF dataset repository. |
 | `--preset` | `Option<String>` | `None` | Architecture preset: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M). Explicit flags take precedence. |
-| `--dtype` | `String` | `"f32"` | Compute precision: `f32` or `f16`. `bf16` is not supported by the WGPU/WGSL backend (explicit error). Records are always stored in f32. |
+| `--dtype` | `String` | `"f32"` | Compute precision. Only `f32` is trainable: Burn 0.21's AdamW moment estimates underflow in f16, so `f16` is rejected with a clear error. `bf16` is not supported by the WGPU/WGSL backend. Records are always stored in f32. |
 | `--batch-size` | `usize` | `128` | Batch size to process on the GPU before the weight update. |
 | `--epochs` | `usize` | `3` | Number of complete passes through the dataset. With `--resume`, **additional** epochs. |
 | `--max-tokens` | `usize` | `100000000` | Maximum number of tokens to load from the corpus. A value of `0` trains on the full file. The Chinchilla reference is ~20 tokens/parameter. |
@@ -105,8 +105,8 @@ Performs autoregressive text inference using the model loaded from `model_output
 | `--rep-penalty` | `f32` | `1.6` | Repetition penalty. Discourages repeated tokens by dividing their logits. |
 | `--max-tokens` | `usize` | `50` | Maximum number of new tokens to generate. |
 | `--seed` | `Option<u64>` | `None` | Random seed of the Xorshift generator for reproducibility. |
-| `--dtype` | `String` | `"f32"` | Compute precision: `f32` (fused WGPU) or `f16` (non-fused half backend; the KV cache follows the compute dtype). |
-| `--kv-cache-dtype` | `String` | `"f32"` | KV cache precision: `f32` or `f16` (halves the cache memory). The mixed f16 cache is verified on both WGPU backends; with `--dtype f16` the cache is already f16. |
+| `--dtype` | `String` | `"f32"` | Compute precision: `f32` (fused WGPU) or `f16` (non-fused half backend; half-precision logits can flip tokens on weakly trained models). |
+| `--kv-cache-dtype` | `String` | `"f32"` | KV cache precision: `f32`, `f16` (halves memory; automatically runs on the non-fused backend because the fused backend's f16 casts are silent no-ops), `int8` (4 values per i32 word + per-block scales) or `q4` (8 nibbles per i32 word + per-block scales). |
 | `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
 | `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
 
@@ -135,7 +135,7 @@ Downloads a dataset file from Hugging Face Hub; Parquet files are automatically 
 ---
 
 ## 📈 8. `stats` Subcommand Parameters
-Prints the model parameter count, VRAM footprint, FLOPs statistics and KV cache estimates (`KV Cache (f32)` and `KV Cache (f16)`, in bytes/token and total MB at `n_ctx`). It takes no parameters.
+Prints the model parameter count, VRAM footprint, FLOPs statistics and KV cache estimates for every storage format (`f32`, `f16`, `int8`, `q4`, in bytes/token and total MB at `n_ctx`). It takes no parameters.
 
 ---
 
