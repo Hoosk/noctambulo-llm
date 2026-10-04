@@ -13,6 +13,7 @@ export interface GenForm {
   ropeScaling: string;
   ropeFactor: string;
   dtype: string;
+  kvCacheDtype: string;
 }
 
 interface Props {
@@ -120,6 +121,17 @@ export function GenerateForm({
           <Select value={form.dtype} onChange={(e) => onField("dtype", e.target.value)}>
             <option value="f32">f32 · full precision</option>
             <option value="f16">f16 · faster on supported GPUs</option>
+          </Select>
+        </Field>
+        <Field label="KV cache precision">
+          <Select
+            value={form.kvCacheDtype}
+            onChange={(e) => onField("kvCacheDtype", e.target.value)}
+          >
+            <option value="f32">f32 · full precision</option>
+            <option value="f16">f16 · half memory</option>
+            <option value="int8">int8 · quarter memory</option>
+            <option value="q4">q4 · eighth memory</option>
           </Select>
         </Field>
       </div>

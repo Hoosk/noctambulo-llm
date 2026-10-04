@@ -18,6 +18,7 @@ const DEFAULT_FORM: GenForm = {
   ropeScaling: "none",
   ropeFactor: "1",
   dtype: "f32",
+  kvCacheDtype: "f32",
 };
 
 interface RunStatus {
@@ -98,6 +99,7 @@ export function GenerateView() {
           ropeScaling: form.ropeScaling,
           ropeFactor: Number(form.ropeFactor) || 1,
           dtype: form.dtype,
+          kvCacheDtype: form.kvCacheDtype,
         }),
         signal: controller.signal,
       });
