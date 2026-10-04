@@ -1422,46 +1422,52 @@ mod tests {
 
     #[test]
     fn test_f16_cache_close_to_f32_cache() {
-        // Same decode path, only the cache dtype changes: isolates f16
-        // rounding from the batched-vs-single forward differences that WGPU
-        // exhibits regardless of the cache dtype (see ROADMAP known issues).
+        // Same decode path, only the cache dtype changes: isolates f16 rounding
+        // from any backend-level differences between batched and single-token
+        // forwards.
         use crate::backend::WgpuHalf;
-        let device = WgpuDevice::default();
-        let config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
-        let model: Llm<WgpuHalf<f32>> = config.init_model(&device);
-        let tokens: Vec<i32> = vec![3, 5, 7, 11, 13];
 
-        let run = |f16: bool| -> Vec<Vec<f32>> {
-            let mut caches = model.new_kv_caches(8, f16, &device);
-            tokens
-                .iter()
-                .enumerate()
-                .map(|(pos, &tok)| {
-                    let step = Tensor::<WgpuHalf<f32>, 2, Int>::from_data(
-                        TensorData::new(vec![tok], [1, 1]),
-                        &device,
-                    );
-                    model
-                        .forward_with_cache(step, pos, &mut caches)
-                        .into_data()
-                        .to_vec::<f32>()
-                        .unwrap()
-                })
-                .collect()
-        };
-        let f32_logits = run(false);
-        let f16_logits = run(true);
-        for pos in 0..tokens.len() {
-            let diff = f32_logits[pos]
-                .iter()
-                .zip(f16_logits[pos].iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                diff < 5e-2,
-                "f16 cache diverged from f32 cache at pos {pos}: max_diff={diff}"
-            );
+        fn check<B: Backend>(device: &B::Device) {
+            let config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
+            let model: Llm<B> = config.init_model(device);
+            let tokens: Vec<i32> = vec![3, 5, 7, 11, 13];
+
+            let run = |f16: bool| -> Vec<Vec<f32>> {
+                let mut caches = model.new_kv_caches(8, f16, device);
+                tokens
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, &tok)| {
+                        let step = Tensor::<B, 2, Int>::from_data(
+                            TensorData::new(vec![tok], [1, 1]),
+                            device,
+                        );
+                        model
+                            .forward_with_cache(step, pos, &mut caches)
+                            .into_data()
+                            .to_vec::<f32>()
+                            .unwrap()
+                    })
+                    .collect()
+            };
+            let f32_logits = run(false);
+            let f16_logits = run(true);
+            for pos in 0..tokens.len() {
+                let diff = f32_logits[pos]
+                    .iter()
+                    .zip(f16_logits[pos].iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    diff < 5e-2,
+                    "f16 cache diverged from f32 cache at pos {pos}: max_diff={diff}"
+                );
+            }
         }
+
+        let device = WgpuDevice::default();
+        check::<Wgpu>(&device);
+        check::<WgpuHalf<f32>>(&device);
     }
 
     #[test]
@@ -1583,6 +1589,75 @@ mod tests {
             "sink token at position 0 must stay visible at row 3 (diff={diff})"
         );
     }
+    /// Regression test for the burn-wgpu `autotune` GEMV bug: with autotune
+    /// enabled, the M=1 matmul path (token-by-token generation) picked a GEMV
+    /// kernel that returned wrong values for output widths >= 32, so cached
+    /// decoding diverged from the batched forward pass. The non-autotuned
+    /// fallback kernels are exact; this test fails if autotune is re-enabled
+    /// or the fallback regresses.
+    #[test]
+    fn test_wgpu_cached_decode_matches_full_forward() {
+        use crate::backend::WgpuHalf;
+
+        fn check<B: Backend>(device: &B::Device) {
+            let config = ModelConfig::new(50, 32, 4, Some(2), 2, 8, 0.0, 0.0);
+            let model: Llm<B> = config.init_model(device);
+            let input = Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![1i32, 2, 3, 4, 5, 6], [1, 6]),
+                device,
+            );
+            let full = model
+                .forward(input.clone())
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+
+            let mut caches = model.new_kv_caches(model.max_seq_len(), false, device);
+            let cached = model
+                .forward_with_cache(input, 0, &mut caches)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            let prefill_diff = full
+                .iter()
+                .zip(cached.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                prefill_diff < 1e-4,
+                "prefill cache diverged from the full forward: max_diff={prefill_diff}"
+            );
+
+            // One decode step must match the last row of a 7-token forward.
+            let full7 = model
+                .forward(Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(vec![1i32, 2, 3, 4, 5, 6, 7], [1, 7]),
+                    device,
+                ))
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            let step =
+                Tensor::<B, 2, Int>::from_data(TensorData::new(vec![7i32], [1, 1]), device);
+            let step_logits = model
+                .forward_with_cache(step, 6, &mut caches)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            let vocab = 50;
+            let step_diff = full7[6 * vocab..7 * vocab]
+                .iter()
+                .zip(step_logits.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                step_diff < 1e-4,
+                "single-token decode diverged from the full forward: max_diff={step_diff}"
+            );
+        }
+
+        let device = WgpuDevice::default();
+        check::<Wgpu>(&device);
+        check::<WgpuHalf<f32>>(&device);
+    }
 }
-
-

@@ -10,7 +10,11 @@ cuda = ["burn/cuda"]
 
 [dependencies]
 # Deep Learning (última versión disponible en crates.io)
-burn = { version = "0.21", features = ["wgpu", "train", "autodiff", "fusion"] }
+# `default-features = false` disables burn-wgpu's default `autotune` feature.
+# Autotune benchmarks speed only and on WGPU it selects a GEMV kernel that
+# returns wrong results for M=1 (token-by-token generation); the non-autotuned
+# fallback kernels are exact. Re-enable once the upstream kernel is fixed.
+burn = { version = "0.21", default-features = false, features = ["std", "wgpu", "train", "autodiff", "fusion"] }
 
 
 # Tokenización y acceso a Hugging Face
