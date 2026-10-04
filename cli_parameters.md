@@ -106,7 +106,7 @@ Performs autoregressive text inference using the model loaded from `model_output
 | `--max-tokens` | `usize` | `50` | Maximum number of new tokens to generate. |
 | `--seed` | `Option<u64>` | `None` | Random seed of the Xorshift generator for reproducibility. |
 | `--dtype` | `String` | `"f32"` | Compute precision: `f32` (fused WGPU) or `f16` (non-fused half backend; the KV cache follows the compute dtype). |
-| `--kv-cache-dtype` | `String` | `"f32"` | KV cache precision: `f32` or `f16` (halves the cache memory). The mixed f16 cache is only reliable on the non-fused backend; with `--dtype f16` the cache is already f16. |
+| `--kv-cache-dtype` | `String` | `"f32"` | KV cache precision: `f32` or `f16` (halves the cache memory). The mixed f16 cache is verified on both WGPU backends; with `--dtype f16` the cache is already f16. |
 | `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
 | `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
 
