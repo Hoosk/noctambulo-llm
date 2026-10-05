@@ -134,6 +134,10 @@ export interface ModelInfo {
   params_m: number;
   size_mb: number;
   default: boolean;
+  arch_version: number;
+  compatible: boolean;
+  steps: number | null;
+  best_val_loss: number | null;
 }
 
 export interface ModelFile {

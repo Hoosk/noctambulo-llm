@@ -25,6 +25,10 @@ pub(super) struct ModelInfo {
     params_m: f64,
     size_mb: f64,
     default: bool,
+    arch_version: u32,
+    compatible: bool,
+    steps: Option<u64>,
+    best_val_loss: Option<f64>,
 }
 
 fn model_meta(dir: &Path) -> Option<ModelInfo> {
@@ -38,6 +42,16 @@ fn model_meta(dir: &Path) -> Option<ModelInfo> {
     let size_mb = weights_path.metadata().ok()?.len() as f64 / (1024.0 * 1024.0);
 
     let params = cfg.param_count();
+    let (steps, best_val_loss) = std::fs::read_to_string(dir.join("train_state.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .map(|v| {
+            (
+                v.get("global_step").and_then(|x| x.as_u64()),
+                v.get("best_val_loss").and_then(|x| x.as_f64()),
+            )
+        })
+        .unwrap_or((None, None));
 
     Some(ModelInfo {
         dir: dir.to_string_lossy().to_string(),
@@ -50,6 +64,10 @@ fn model_meta(dir: &Path) -> Option<ModelInfo> {
         params_m: params as f64 / 1_000_000.0,
         size_mb,
         default: dir.file_name().unwrap_or_default() == "model_output",
+        arch_version: cfg.arch_version,
+        compatible: cfg.arch_version == crate::config::ARCH_VERSION,
+        steps,
+        best_val_loss,
     })
 }
 
@@ -266,6 +284,76 @@ pub(super) async fn model_file(
         bytes,
     )
         .into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ModelImportRequest {
+    /// Path to the GGUF file relative to the server working directory.
+    gguf_path: String,
+    /// Output model directory under the models root (default: GGUF stem).
+    #[serde(default)]
+    output_dir: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[allow(clippy::unused_async)]
+pub(super) async fn model_import(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ModelImportRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_token(&state.server, &headers, None)?;
+    ensure_idle(&state)?;
+
+    if !is_safe_rel_path(&req.gguf_path) {
+        return Err(ApiError::bad_request(
+            "invalid GGUF path (must be relative with no traversal)",
+        ));
+    }
+    let gguf = std::path::PathBuf::from(&req.gguf_path);
+    if !gguf.is_file() {
+        return Err(ApiError::not_found(format!(
+            "GGUF file not found: {}",
+            req.gguf_path
+        )));
+    }
+
+    let name = req
+        .output_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            gguf.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "imported_model".to_string())
+        });
+    if !is_safe_child_name(&name) || name.starts_with('.') {
+        return Err(ApiError::bad_request("invalid output directory name"));
+    }
+    let out = state.server.models_dir.join(&name);
+    if out.exists() && !req.force {
+        return Err(ApiError::conflict(format!(
+            "'{name}' already exists (enable overwrite to replace it)"
+        )));
+    }
+
+    let force = req.force;
+    let out_clone = out.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
+        crate::import::import_gguf::<crate::backend::MainBackend>(&gguf, &out_clone, force, &device)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("import task failed: {e}")))?;
+    result.map_err(ApiError::bad_request)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "dir": out.to_string_lossy(),
+        "name": name,
+    })))
 }
 
 #[derive(Deserialize)]

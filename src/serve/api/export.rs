@@ -91,6 +91,17 @@ fn run_export(
         .map_err(|e| format!("failed to load weights: {e:?}"))?;
     let model = model.load_record(record).align_compute_dtype();
 
-    crate::export::export_to_gguf(&model, &config, "custom_tokenizer.json", model_name, "exported", approx, progress, cancelled)
-        .map_err(|e| format!("export error: {e}"))
+    let tokenizer_path = crate::data::resolve_tokenizer_path(Some(model_dir.as_path()))
+        .unwrap_or_else(|| std::path::PathBuf::from("custom_tokenizer.json"));
+    crate::export::export_to_gguf(
+        &model,
+        &config,
+        &tokenizer_path.to_string_lossy(),
+        model_name,
+        "exported",
+        approx,
+        progress,
+        cancelled,
+    )
+    .map_err(|e| format!("export error: {e}"))
 }

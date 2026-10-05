@@ -36,6 +36,32 @@ impl LlmDecodeStream<'_> {
     }
 }
 
+/// Path of the tokenizer that belongs to `model_dir`, falling back to the
+/// working directory and `None` (caller may use the Hugging Face fallback).
+/// Models exported/imported as GGUF carry their own tokenizer, which may use a
+/// different vocabulary ordering than the current working directory.
+pub fn resolve_tokenizer_path(model_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = model_dir {
+        let candidate = dir.join("custom_tokenizer.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let cwd = PathBuf::from("custom_tokenizer.json");
+    cwd.is_file().then_some(cwd)
+}
+
+/// Load the tokenizer that belongs to `model_dir` (see
+/// [`resolve_tokenizer_path`]), falling back to the Qwen2.5 HF tokenizer.
+pub fn resolve_tokenizer(
+    model_dir: Option<&Path>,
+) -> Result<LlmTokenizer, Box<dyn std::error::Error + Send + Sync>> {
+    match resolve_tokenizer_path(model_dir) {
+        Some(path) => LlmTokenizer::from_file(path),
+        None => LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B"),
+    }
+}
+
 impl LlmTokenizer {
     /// Incremental decoder for token-by-token streaming.
     pub fn decode_stream(&self, skip_special_tokens: bool) -> LlmDecodeStream<'_> {

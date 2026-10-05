@@ -6,7 +6,7 @@ use burn::tensor::{DType, ElementConversion, FloatDType, Int, Tensor, TensorData
 
 /// True when the backend computes in f16. Burn 0.21 creates f32 tensors from
 /// `from_data`/`zeros` even on an f16 backend, so callers must normalize them.
-fn backend_is_f16<B: Backend>() -> bool {
+pub(crate) fn backend_is_f16<B: Backend>() -> bool {
     std::any::TypeId::of::<B::FloatElem>() == std::any::TypeId::of::<burn::tensor::f16>()
 }
 

@@ -17,6 +17,47 @@ const GGUF_TYPE_ARRAY: u32 = 9;
 const GGML_TYPE_F32: u32 = 0;
 const ALIGNMENT: u64 = 32;
 
+/// Inverse of [`permute_rope_weight`]: restores the original row order from a
+/// RoPE-permuted weight (`out[2i] = in[i]`, `out[2i + 1] = in[i + half]`).
+pub(crate) fn unpermute_rope_weight(
+    data: &[f32],
+    n_heads: usize,
+    head_size: usize,
+    cols: usize,
+) -> Vec<f32> {
+    let half_dim = head_size / 2;
+    let mut out = vec![0.0f32; data.len()];
+
+    for r_head in 0..n_heads {
+        for i in 0..half_dim {
+            let r_in1 = r_head * head_size + 2 * i;
+            let r_in2 = r_head * head_size + 2 * i + 1;
+            let r_out1 = r_head * head_size + i;
+            let r_out2 = r_head * head_size + i + half_dim;
+
+            for c in 0..cols {
+                out[r_out1 * cols + c] = data[r_in1 * cols + c];
+                out[r_out2 * cols + c] = data[r_in2 * cols + c];
+            }
+        }
+    }
+    out
+}
+
+/// Inverse of [`permute_rope_bias`].
+pub(crate) fn unpermute_rope_bias(bias: &[f32], n_heads: usize, head_size: usize) -> Vec<f32> {
+    let half_dim = head_size / 2;
+    let mut out = vec![0.0f32; bias.len()];
+
+    for r_head in 0..n_heads {
+        for i in 0..half_dim {
+            out[r_head * head_size + i] = bias[r_head * head_size + 2 * i];
+            out[r_head * head_size + i + half_dim] = bias[r_head * head_size + 2 * i + 1];
+        }
+    }
+    out
+}
+
 fn write_gguf_string<W: Write>(w: &mut W, s: &str) -> std::io::Result<usize> {
     let bytes = s.as_bytes();
     let len = bytes.len() as u64;
@@ -25,7 +66,7 @@ fn write_gguf_string<W: Write>(w: &mut W, s: &str) -> std::io::Result<usize> {
     Ok(8 + bytes.len())
 }
 
-fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut transposed = vec![0.0f32; data.len()];
     for r in 0..rows {
         for c in 0..cols {
@@ -35,7 +76,7 @@ fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     transposed
 }
 
-fn permute_rope_weight(data: &[f32], n_heads: usize, head_size: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn permute_rope_weight(data: &[f32], n_heads: usize, head_size: usize, cols: usize) -> Vec<f32> {
     let half_dim = head_size / 2;
     let mut out = vec![0.0f32; data.len()];
 
@@ -55,7 +96,7 @@ fn permute_rope_weight(data: &[f32], n_heads: usize, head_size: usize, cols: usi
     out
 }
 
-fn permute_rope_bias(bias: &[f32], n_heads: usize, head_size: usize) -> Vec<f32> {
+pub(crate) fn permute_rope_bias(bias: &[f32], n_heads: usize, head_size: usize) -> Vec<f32> {
     let half_dim = head_size / 2;
     let mut out = vec![0.0f32; bias.len()];
 

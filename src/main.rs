@@ -2,6 +2,7 @@ mod backend;
 mod config;
 mod data;
 mod export;
+mod import;
 mod generate;
 mod model;
 mod serve;
@@ -108,6 +109,8 @@ enum Commands {
     Generate(GenerateArgs),
     /// Export model weights and metadata to GGUF format
     Export(ExportArgs),
+    /// Import a GGUF export back into the native model format
+    Import(ImportArgs),
     /// Print model parameter count, VRAM footprint, and FLOPs statistics
     Stats,
     /// Serve a web UI to control training/generate/export from the browser
@@ -339,6 +342,9 @@ struct TrainArgs {
 
 #[derive(Args)]
 struct GenerateArgs {
+    /// Directory containing the model (config.json + model_weights.bin)
+    #[arg(long, default_value = "model_output")]
+    model_dir: String,
     /// Prompt text for completion
     prompt: String,
     /// Sampling temperature (0.9 works best for the trained SLM)
@@ -389,6 +395,18 @@ struct ExportArgs {
     /// approximation (duplicated K/V weights; not bit-identical to the engine).
     #[arg(long)]
     approx: bool,
+}
+
+#[derive(Args)]
+struct ImportArgs {
+    /// Path to the GGUF file (e.g. exported/kuro-neko-v2.gguf)
+    gguf: String,
+    /// Output model directory (default: the GGUF file stem)
+    #[arg(long)]
+    output_dir: Option<String>,
+    /// Overwrite the output directory if it already contains a model
+    #[arg(long)]
+    force: bool,
 }
 
 /// Load a checkpoint and run greedy/sampled generation on any backend, so the
@@ -734,11 +752,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 sources[0].clone()
             };
 
-            let tokenizer = if Path::new(custom_tokenizer_file).exists() {
-                LlmTokenizer::from_file(custom_tokenizer_file)?
-            } else {
-                LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
-            };
+            let tokenizer = data::resolve_tokenizer(Some(Path::new(&args.model_dir)))?;
 
             let rope_kind = RopeScalingKind::parse(&args.rope_scaling)?;
             let rope_override = if rope_kind != RopeScalingKind::None
@@ -762,11 +776,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
         }
         Commands::Generate(args) => {
-            let config_path = Path::new(output_dir).join("config.json");
-            let weights_path = Path::new(output_dir).join("model_weights");
+            let config_path = Path::new(&args.model_dir).join("config.json");
+            let weights_path = Path::new(&args.model_dir).join("model_weights");
 
             if !config_path.exists() {
-                println!("Error: Model files not found in '{}'. Run 'cargo run train' first.", output_dir);
+                println!("Error: Model files not found in '{}'. Run 'cargo run train' first.", args.model_dir);
                 return Ok(());
             }
 
@@ -783,11 +797,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
 
-            let tokenizer = if Path::new(custom_tokenizer_file).exists() {
-                LlmTokenizer::from_file(custom_tokenizer_file)?
-            } else {
-                LlmTokenizer::from_hf("Qwen/Qwen2.5-0.5B")?
-            };
+            let tokenizer = data::resolve_tokenizer(Some(Path::new(&args.model_dir)))?;
 
             let dtype = DType::parse(&args.dtype)?;
             tui::print_info(&format!("Compute precision: {}", dtype.as_str()));
@@ -859,7 +869,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map_err(|e| format!("Failed to load weights: {:?}", e))?;
             let model = model.load_record(record).align_compute_dtype();
 
-            export_to_gguf(&model, &model_config, custom_tokenizer_file, &args.model_name, "exported", args.approx)?;
+            let tokenizer_path = data::resolve_tokenizer_path(Some(Path::new(output_dir)))
+                .unwrap_or_else(|| std::path::PathBuf::from(custom_tokenizer_file));
+            export_to_gguf(
+                &model,
+                &model_config,
+                &tokenizer_path.to_string_lossy(),
+                &args.model_name,
+                "exported",
+                args.approx,
+            )?;
+        }
+        Commands::Import(args) => {
+            let gguf_path = Path::new(&args.gguf);
+            let output_dir = args.output_dir.clone().unwrap_or_else(|| {
+                gguf_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "imported_model".to_string())
+            });
+            import::import_gguf::<MainBackend>(gguf_path, Path::new(&output_dir), args.force, &device)?;
         }
         Commands::Stats => {
             let config_path = Path::new(output_dir).join("config.json");

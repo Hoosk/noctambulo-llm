@@ -195,8 +195,7 @@ fn run_generate(
     // keeps whatever the checkpoint config declares.
     config.set_rope_scaling(s.rope_kind, s.rope_factor);
 
-    let tokenizer_path = "custom_tokenizer.json";
-    let tokenizer = crate::data::LlmTokenizer::from_file(tokenizer_path)
+    let tokenizer = crate::data::resolve_tokenizer(Some(model_dir.as_path()))
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     match (s.dtype, s.cache_dtype) {

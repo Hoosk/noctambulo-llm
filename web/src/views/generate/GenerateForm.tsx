@@ -50,8 +50,9 @@ export function GenerateForm({
               <option value="">no models</option>
             ) : (
               models.map((m) => (
-                <option key={m.dir} value={m.dir}>
+                <option key={m.dir} value={m.dir} disabled={!m.compatible}>
                   {m.name} · {m.params_m.toFixed(1)}M
+                  {m.compatible ? "" : " · incompatible (older architecture)"}
                 </option>
               ))
             )}

@@ -103,6 +103,11 @@ export const api = {
     request<ModelFilesResponse>(`/api/models/files?dir=${encodeURIComponent(dir)}`),
   modelFileUrl: (dir: string, file: string) =>
     `/api/models/file?dir=${encodeURIComponent(dir)}&file=${encodeURIComponent(file)}`,
+  importModel: (body: { ggufPath: string; outputDir?: string; force?: boolean }) =>
+    request<{ status: string; dir: string; name: string }>("/api/models/import", {
+      method: "POST",
+      json: body,
+    }),
   renameModel: (dir: string, newName: string) =>
     request<{ status: string; dir: string; name?: string }>("/api/models/rename", {
       method: "POST",
