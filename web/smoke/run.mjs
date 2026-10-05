@@ -191,6 +191,7 @@ function cleanup() {
   const paths = [
     resolve(opts.modelsDir, SCRATCH),
     resolve(opts.modelsDir, SCRATCH_RENAMED),
+    resolve(opts.modelsDir, `${SCRATCH}_imported`),
     resolve(opts.modelsDir, RUN_DIR),
     resolve(opts.datasetsDir, MIX_FILE),
   ];
@@ -241,6 +242,11 @@ try {
 
   // --- D6: Train form exposes optimizer/loss controls ----------------------
   await clickNav("Train");
+  // The wizard mounts only the active step; open the Training step first.
+  await evaluate(
+    `[...document.querySelectorAll('main button')].find((b) => b.textContent.includes('Training'))?.click()`,
+  );
+  await sleep(400);
   await setField("Weight decay", "0.2");
   await setField("Label smoothing", "0.1");
   await setField("Z-loss", "0.001");
@@ -267,6 +273,8 @@ try {
     /live telemetry/i.test(devices) && /system memory/i.test(devices) && /process cpu/i.test(devices),
     "system + process counters",
   );
+  const systemOk = /system/i.test(devices) && /cores/i.test(devices) && /kernel/i.test(devices);
+  record("E4b host system card", systemOk, "CPU, cores, OS/kernel");
 
   // --- E6/E3: weighted combine, .bin rejection, share %, op progress -------
   await clickNav("Datasets");
@@ -398,6 +406,26 @@ try {
       .then(() => true)
       .catch(() => false);
     record("E3 export op progress + result", exportOk, "gguf produced");
+
+    // E8: import the GGUF just exported and verify the model list marks it compatible.
+    const importedName = `${SCRATCH}_imported`;
+    const impRes = await apiFetch("/api/models/import", {
+      method: "POST",
+      body: JSON.stringify({
+        ggufPath: `exported/${SCRATCH_RENAMED}.gguf`,
+        outputDir: importedName,
+      }),
+    });
+    const impBody = await impRes.json().catch(() => null);
+    const modelsRes = await apiFetch("/api/models");
+    const modelsList = await modelsRes.json().catch(() => []);
+    const imported = modelsList.find((m) => m.name === importedName);
+    record(
+      "E8 import GGUF",
+      impRes.ok && imported?.compatible === true && imported?.arch_version === 4,
+      impBody?.error ?? `compatible=${imported?.compatible}`,
+    );
+    await apiFetch(`/api/models/${encodeURIComponent(importedName)}`, { method: "DELETE" });
 
     await evaluate(`(() => {
       const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH_RENAMED)}));

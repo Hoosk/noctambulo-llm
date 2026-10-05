@@ -123,6 +123,31 @@ export interface CheckpointInfo {
   modified_unix: number;
 }
 
+export interface DiskInfo {
+  name: string;
+  mount_point: string;
+  total_bytes: number;
+  available_bytes: number;
+}
+
+export interface SystemInfo {
+  hostname: string;
+  os_name: string;
+  os_version: string;
+  kernel_version: string;
+  cpu_brand: string;
+  cpu_physical_cores: number | null;
+  cpu_logical_cores: number;
+  cpu_frequency_mhz: number;
+  total_memory_bytes: number;
+  used_memory_bytes: number;
+  total_swap_bytes: number;
+  used_swap_bytes: number;
+  uptime_secs: number;
+  load_average: [number, number, number];
+  disks: DiskInfo[];
+}
+
 export interface ModelInfo {
   dir: string;
   name: string;

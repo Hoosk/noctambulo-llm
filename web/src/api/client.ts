@@ -12,6 +12,7 @@ import type {
   OpStatus,
   RunRecord,
   RunSummary,
+  SystemInfo,
   Telemetry,
   TrainRequestBody,
   TrainStatus,
@@ -98,6 +99,7 @@ export const api = {
     request<{ opId: string; status: string }>("/api/datasets/combine", { method: "POST", json: body }),
   getDevices: () => request<DeviceInfo[]>("/api/devices"),
   getTelemetry: () => request<Telemetry>("/api/telemetry"),
+  getSystem: () => request<SystemInfo>("/api/system"),
   getModels: () => request<ModelInfo[]>("/api/models"),
   getModelFiles: (dir: string) =>
     request<ModelFilesResponse>(`/api/models/files?dir=${encodeURIComponent(dir)}`),

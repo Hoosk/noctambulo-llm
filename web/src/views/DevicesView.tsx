@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
-import type { DeviceInfo, Telemetry } from "../api/types";
+import type { DeviceInfo, SystemInfo, Telemetry } from "../api/types";
 import { Icon, type IconName } from "../components/Icon";
 import { Badge, ViewHeader, type Tone } from "../components/ui";
 import { fmtBytes, fmtDur } from "../lib/format";
@@ -88,6 +88,84 @@ function Meter({
 }
 
 const pctOf = (part: number, total: number) => (total > 0 ? (part / total) * 100 : 0);
+
+function SystemCard() {
+  const [system, setSystem] = useState<SystemInfo | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getSystem()
+      .then((res) => {
+        if (!cancelled) setSystem(res);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : "unknown");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (error) return <p className="text-sm text-rose-400 mb-6">System info error: {error}</p>;
+  if (!system) return null;
+
+  const ramUsed = system.used_memory_bytes;
+  const cpuLabel = system.cpu_physical_cores
+    ? `${system.cpu_physical_cores} physical / ${system.cpu_logical_cores} logical`
+    : `${system.cpu_logical_cores} logical`;
+
+  return (
+    <div className="glass-card rounded-2xl p-5 mb-6">
+      <div className="flex items-center justify-between gap-3 mb-4">
+        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">System</h3>
+        <span className="text-xs text-slate-500 font-mono truncate">
+          {system.hostname} · up {fmtDur(system.uptime_secs)}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4">
+        <div className="sm:col-span-2">
+          <InfoRow label="CPU" value={system.cpu_brand || "unknown"} />
+          <InfoRow label="Cores" value={cpuLabel} />
+          <InfoRow
+            label="Max frequency"
+            value={system.cpu_frequency_mhz > 0 ? `${system.cpu_frequency_mhz} MHz` : "—"}
+          />
+          <InfoRow
+            label="Load average"
+            value={system.load_average.map((v) => v.toFixed(2)).join(" · ")}
+          />
+          <InfoRow label="OS" value={`${system.os_name} ${system.os_version}`} />
+          <InfoRow label="Kernel" value={system.kernel_version} />
+        </div>
+        <Meter
+          label="System memory (RAM)"
+          detail={`${fmtBytes(ramUsed)} / ${fmtBytes(system.total_memory_bytes)}`}
+          pct={pctOf(ramUsed, system.total_memory_bytes)}
+          tone="violet"
+        />
+        {system.total_swap_bytes > 0 ? (
+          <Meter
+            label="Swap"
+            detail={`${fmtBytes(system.used_swap_bytes)} / ${fmtBytes(system.total_swap_bytes)}`}
+            pct={pctOf(system.used_swap_bytes, system.total_swap_bytes)}
+            tone="emerald"
+          />
+        ) : null}
+        {system.disks.map((disk) => (
+          <Meter
+            key={`${disk.mount_point}-${disk.name}`}
+            label={`Disk ${disk.mount_point}`}
+            detail={`${fmtBytes(disk.total_bytes - disk.available_bytes)} / ${fmtBytes(disk.total_bytes)}`}
+            pct={pctOf(disk.total_bytes - disk.available_bytes, disk.total_bytes)}
+            tone="sky"
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function TelemetryCard() {
   const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
@@ -196,7 +274,8 @@ export function DevicesView() {
 
   return (
     <>
-      <ViewHeader title="GPU Devices" subtitle="WGPU adapters detected on the server host." />
+      <ViewHeader title="GPU Devices" subtitle="WGPU adapters and host system information." />
+      <SystemCard />
       <TelemetryCard />
       {error ? <p className="text-sm text-rose-400 mb-4">Error: {error}</p> : null}
       {loaded && devices.length === 0 && !error ? (

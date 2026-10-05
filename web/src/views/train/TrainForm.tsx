@@ -15,6 +15,7 @@ interface FormState {
   batch: string;
   lr: string;
   maxTokens: string;
+  preset: string;
   nCtx: string;
   nEmbd: string;
   nHead: string;
@@ -36,6 +37,13 @@ interface FormState {
   outputDir: string;
 }
 
+const PRESETS: Record<string, { nEmbd: string; nHead: string; nKvHead: string; nLayer: string; nCtx: string }> = {
+  nano: { nEmbd: "128", nHead: "4", nKvHead: "2", nLayer: "4", nCtx: "256" },
+  tiny: { nEmbd: "256", nHead: "4", nKvHead: "2", nLayer: "4", nCtx: "256" },
+  small: { nEmbd: "512", nHead: "8", nKvHead: "2", nLayer: "8", nCtx: "512" },
+  base: { nEmbd: "768", nHead: "12", nKvHead: "4", nLayer: "12", nCtx: "1024" },
+};
+
 const DEFAULT_FORM: FormState = {
   file: "",
   device: "DefaultDevice",
@@ -45,13 +53,14 @@ const DEFAULT_FORM: FormState = {
   batch: "32",
   lr: "0.00005",
   maxTokens: "10000000",
+  preset: "tiny",
   nCtx: "256",
   nEmbd: "256",
   nHead: "4",
   nLayer: "4",
   valSplit: "0.02",
   gradAccum: "1",
-  nKvHead: "0",
+  nKvHead: "2",
   dropout: "0.1",
   attnSoftcap: "0",
   slidingWindow: "0",
@@ -74,6 +83,66 @@ const NOTICE_CLASSES: Record<NoticeTone, string> = {
   warn: "text-amber-300",
   error: "text-rose-400",
 };
+
+const STEPS = ["Data & device", "Architecture", "Training", "Review"] as const;
+
+function hiddenDim(nEmbd: number): number {
+  return Math.ceil(Math.ceil((8 * nEmbd) / 3) / 256) * 256;
+}
+
+/** Mirrors ModelConfig::param_count so the wizard shows the real size. */
+function paramCount(f: FormState): number {
+  const nEmbd = Number(f.nEmbd) || 0;
+  const nHead = Number(f.nHead) || 1;
+  const nKvHead = Number(f.nKvHead) || nHead;
+  const nLayer = Number(f.nLayer) || 0;
+  const vocab = 8000;
+  const kvDim = Math.max(1, Math.floor(nKvHead * (nEmbd / Math.max(1, nHead))));
+  const hidden = hiddenDim(nEmbd);
+  const perLayer = nEmbd * nEmbd + nEmbd + nEmbd * nEmbd + 2 * nEmbd + 3 * nEmbd * hidden;
+  const mla = Number(f.mlaLatentDim) || 0;
+  const group = Math.max(1, Number(f.kvShareGroup) || 1);
+  const groups = Math.ceil(nLayer / group);
+  const perGroup = mla > 0 ? nEmbd * mla + 2 * kvDim * mla : 2 * (nEmbd * kvDim + kvDim);
+  return vocab * nEmbd + nLayer * perLayer + groups * perGroup + nEmbd;
+}
+
+function validateStep(step: number, f: FormState, datasets: DatasetInfo[]): string | null {
+  if (step === 0) {
+    const file = f.file || datasets[0]?.name || "";
+    if (!file) return "Select a dataset to train on.";
+    if (!f.outputDir.trim()) return "Set an output directory for the finished model.";
+    if (!f.saveDir.trim()) return "Set a checkpoint directory.";
+  }
+  if (step === 1) {
+    const nEmbd = Number(f.nEmbd);
+    const nHead = Number(f.nHead);
+    const nKvHead = Number(f.nKvHead);
+    const nLayer = Number(f.nLayer);
+    const nCtx = Number(f.nCtx);
+    if (!Number.isFinite(nEmbd) || nEmbd < 16 || nEmbd % 16 !== 0)
+      return "n_embd must be a multiple of 16 (>= 16).";
+    if (!Number.isFinite(nHead) || nHead < 1) return "n_head must be at least 1.";
+    if (nEmbd % nHead !== 0) return "n_embd must be divisible by n_head.";
+    if (!Number.isFinite(nKvHead) || nKvHead < 1) return "KV heads must be at least 1.";
+    if (nHead % nKvHead !== 0) return "n_head must be divisible by the number of KV heads (GQA).";
+    if (!Number.isFinite(nLayer) || nLayer < 1) return "n_layer must be at least 1.";
+    if (!Number.isFinite(nCtx) || nCtx < 16) return "n_ctx must be at least 16.";
+    const window = Number(f.slidingWindow) || 0;
+    if (window > nCtx) return "The sliding window cannot exceed n_ctx.";
+    const mla = Number(f.mlaLatentDim) || 0;
+    if (mla > 0 && mla > nEmbd / nHead) return "The MLA latent cannot exceed the attention head size.";
+  }
+  if (step === 2) {
+    if (!(Number(f.lr) > 0)) return "Learning rate must be greater than 0.";
+    if (!(Number(f.batch) >= 1)) return "Batch size must be at least 1.";
+    if (!(Number(f.epochs) >= 1)) return "Epochs must be at least 1.";
+    const val = Number(f.valSplit);
+    if (!(val >= 0 && val < 1)) return "Validation split must be in [0, 1).";
+    if (!(Number(f.gradAccum) >= 1)) return "Gradient accumulation must be at least 1.";
+  }
+  return null;
+}
 
 function buildTrainBody(
   form: FormState,
@@ -142,11 +211,19 @@ export function TrainForm() {
   const [resumeOn, setResumeOn] = useState(false);
   const [checkpoints, setCheckpoints] = useState<CheckpointInfo[] | null>(null);
   const [resumePath, setResumePath] = useState("");
+  const [step, setStep] = useState(0);
   const [notice, setNotice] = useState<{ text: string; tone: NoticeTone }>({ text: "", tone: "muted" });
   const [busy, setBusy] = useState(false);
   const epochsSynced = useRef(false);
 
   const set = (key: keyof FormState, value: string) => setForm((f) => ({ ...f, [key]: value }));
+
+  const applyPreset = (name: string) => {
+    setForm((f) => {
+      const preset = PRESETS[name];
+      return preset ? { ...f, preset: name, ...preset } : { ...f, preset: "custom" };
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -197,8 +274,26 @@ export function TrainForm() {
     if (resumeOn) void loadCheckpoints(value);
   };
 
+  const next = () => {
+    const error = validateStep(step, form, datasets);
+    if (error) {
+      setNotice({ text: error, tone: "error" });
+      return;
+    }
+    setNotice({ text: "", tone: "muted" });
+    setStep((s) => Math.min(s + 1, STEPS.length - 1));
+  };
+
   const start = async () => {
     if (busy) return;
+    for (let s = 0; s < STEPS.length; s += 1) {
+      const error = validateStep(s, form, datasets);
+      if (error) {
+        setStep(s);
+        setNotice({ text: error, tone: "error" });
+        return;
+      }
+    }
     const { body, error } = buildTrainBody(form, datasets, resumeOn, resumePath);
     if (!body) {
       setNotice({ text: error ?? "Invalid configuration.", tone: "error" });
@@ -236,192 +331,319 @@ export function TrainForm() {
   return (
     <div className="glass-card rounded-2xl p-5 lg:sticky lg:top-6 self-start min-w-0">
       <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4">
-        Configuration
+        Training wizard
       </h3>
-      <ConfigFields
-        form={form}
-        set={set}
-        datasets={datasets}
-        devices={devices}
-        onSaveDirChange={onSaveDirChange}
-      />
-      <ResumePicker
-        resumeOn={resumeOn}
-        checkpoints={checkpoints}
-        resumePath={resumePath}
-        saveDir={form.saveDir}
-        onToggle={toggleResume}
-        onSelect={setResumePath}
-      />
-      <TrainActions
-        running={running}
-        paused={job.paused}
-        stopping={job.stopping}
-        busy={busy}
-        onStart={() => void start()}
-        onTogglePause={() =>
-          void (job.paused
-            ? action(api.resumeTrain, "Resuming…", "ok")
-            : action(api.pauseTrain, "Pausing…", "warn"))
-        }
-        onStop={() => void action(api.stopTrain, "Stopping…", "warn")}
-      />
+
+      <ol className="mb-5 flex items-center gap-1.5">
+        {STEPS.map((label, i) => (
+          <li key={label} className="flex-1 min-w-0">
+            <button
+              type="button"
+              onClick={() => setStep(i)}
+              className={`w-full rounded-lg px-2 py-1.5 text-[11px] transition ${
+                i === step
+                  ? "bg-violet-500/20 text-violet-200"
+                  : i < step
+                    ? "text-emerald-300 hover:bg-slate-800/60"
+                    : "text-slate-500 hover:bg-slate-800/60"
+              }`}
+            >
+              <span className="tnum mr-1">{i + 1}.</span>
+              <span className="truncate">{label}</span>
+            </button>
+          </li>
+        ))}
+      </ol>
+
+      {step === 0 ? (
+        <StepData
+          form={form}
+          set={set}
+          datasets={datasets}
+          devices={devices}
+          onSaveDirChange={onSaveDirChange}
+          resumeOn={resumeOn}
+          checkpoints={checkpoints}
+          resumePath={resumePath}
+          onToggleResume={toggleResume}
+          onSelectResume={setResumePath}
+        />
+      ) : null}
+      {step === 1 ? <StepArchitecture form={form} set={set} onPreset={applyPreset} /> : null}
+      {step === 2 ? <StepTraining form={form} set={set} /> : null}
+      {step === 3 ? (
+        <StepReview form={form} datasets={datasets} resumeOn={resumeOn} resumePath={resumePath} />
+      ) : null}
+
+      <div className="mt-5 flex gap-2">
+        {step > 0 ? (
+          <Button variant="ghost" className="flex-1" onClick={() => setStep((s) => s - 1)}>
+            Back
+          </Button>
+        ) : null}
+        {step < STEPS.length - 1 ? (
+          <Button variant="primary" className="flex-1" onClick={next}>
+            Next
+          </Button>
+        ) : (
+          <Button variant="primary" className="flex-1" disabled={busy || running} onClick={() => void start()}>
+            {busy ? "Starting…" : "Start training"}
+          </Button>
+        )}
+      </div>
+
+      <div className="flex gap-2 mt-2">
+        <Button
+          variant={job.paused ? "success" : "warn"}
+          className="flex-1"
+          disabled={!running || job.stopping}
+          onClick={() =>
+            void (job.paused
+              ? action(api.resumeTrain, "Resuming…", "ok")
+              : action(api.pauseTrain, "Pausing…", "warn"))
+          }
+        >
+          {job.paused ? "Resume" : "Pause"}
+        </Button>
+        <Button
+          variant="danger"
+          className="flex-1"
+          disabled={!running || job.stopping}
+          onClick={() => void action(api.stopTrain, "Stopping…", "warn")}
+        >
+          {job.stopping ? "Stopping…" : "Stop"}
+        </Button>
+      </div>
+
       <p className={`text-xs mt-3 ${NOTICE_CLASSES[notice.tone]}`}>{notice.text}</p>
     </div>
   );
 }
 
-interface ConfigFieldsProps {
+interface StepDataProps {
   form: FormState;
   set: (key: keyof FormState, value: string) => void;
   datasets: DatasetInfo[];
   devices: DeviceInfo[];
   onSaveDirChange: (value: string) => void;
+  resumeOn: boolean;
+  checkpoints: CheckpointInfo[] | null;
+  resumePath: string;
+  onToggleResume: (enabled: boolean) => void;
+  onSelectResume: (path: string) => void;
 }
 
-function ConfigFields({ form, set, datasets, devices, onSaveDirChange }: ConfigFieldsProps) {
+function StepData({
+  form,
+  set,
+  datasets,
+  devices,
+  onSaveDirChange,
+  resumeOn,
+  checkpoints,
+  resumePath,
+  onToggleResume,
+  onSelectResume,
+}: StepDataProps) {
   const selectedDataset = form.file || datasets[0]?.name || "";
+  const resumeDisabled = !resumeOn || checkpoints === null || checkpoints.length === 0;
   return (
     <>
-      <div className="mb-3">
-        <Field label="Dataset">
-          <Select value={selectedDataset} onChange={(e) => set("file", e.target.value)}>
-            {datasets.length === 0 ? (
-              <option value="">no datasets</option>
-            ) : (
-              datasets.map((d) => (
-                <option key={d.name} value={d.name}>
-                  {d.name}
+      <Field label="Dataset">
+        <Select value={selectedDataset} onChange={(e) => set("file", e.target.value)}>
+          {datasets.length === 0 ? (
+            <option value="">no datasets</option>
+          ) : (
+            datasets.map((d) => (
+              <option key={d.name} value={d.name}>
+                {d.name}
+              </option>
+            ))
+          )}
+        </Select>
+      </Field>
+      <p className="text-[11px] text-slate-500 mt-1 mb-3">
+        Datasets are tokenized with the working-directory tokenizer; 1 epoch over 10M tokens is a good default.
+      </p>
+
+      <Field label="Device">
+        <Select value={form.device} onChange={(e) => set("device", e.target.value)}>
+          {devices.length === 0 ? (
+            <option value="DefaultDevice">DefaultDevice</option>
+          ) : (
+            devices.map((d) => {
+              const selector = d.selector || d.name;
+              return (
+                <option key={selector} value={selector}>
+                  {selector}
                 </option>
-              ))
-            )}
-          </Select>
-        </Field>
-      </div>
-
-      <div className="mb-3">
-        <Field label="Device">
-          <Select value={form.device} onChange={(e) => set("device", e.target.value)}>
-            {devices.length === 0 ? (
-              <option value="DefaultDevice">DefaultDevice</option>
-            ) : (
-              devices.map((d) => {
-                const selector = d.selector || d.name;
-                return (
-                  <option key={selector} value={selector}>
-                    {selector}
-                  </option>
-                );
-              })
-            )}
-          </Select>
-        </Field>
-      </div>
-
-      <div className="mb-4">
-        <Field label="Compute precision (dtype)">
-          <Select value={form.dtype} onChange={(e) => set("dtype", e.target.value)}>
-            <option value="f32">f32 · full precision</option>
-            <option value="f16">f16 · faster on supported GPUs</option>
-          </Select>
-        </Field>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
-        <NumberField label="Epochs" min={1} value={form.epochs} onChange={(v) => set("epochs", v)} />
-        <NumberField label="Batch" min={1} value={form.batch} onChange={(v) => set("batch", v)} />
-        <NumberField label="LR" step={0.00001} min={0} value={form.lr} onChange={(v) => set("lr", v)} />
-        <NumberField label="Max tokens" min={0} value={form.maxTokens} onChange={(v) => set("maxTokens", v)} />
-        <NumberField label="n_ctx" min={16} value={form.nCtx} onChange={(v) => set("nCtx", v)} />
-        <NumberField label="n_embd" min={16} value={form.nEmbd} onChange={(v) => set("nEmbd", v)} />
-        <NumberField label="n_head" min={1} value={form.nHead} onChange={(v) => set("nHead", v)} />
-        <NumberField label="n_layer" min={1} value={form.nLayer} onChange={(v) => set("nLayer", v)} />
-        <NumberField label="Val split" step={0.01} min={0} max={0.9} value={form.valSplit} onChange={(v) => set("valSplit", v)} />
-        <NumberField label="Grad accum" min={1} value={form.gradAccum} onChange={(v) => set("gradAccum", v)} />
-        <NumberField label="KV heads (GQA)" min={0} value={form.nKvHead} onChange={(v) => set("nKvHead", v)} />
-        <NumberField label="Dropout" step={0.05} min={0} max={0.9} value={form.dropout} onChange={(v) => set("dropout", v)} />
-        <NumberField label="Attn softcap" step={1} min={0} value={form.attnSoftcap} onChange={(v) => set("attnSoftcap", v)} />
-        <NumberField label="Sliding window" step={1} min={0} value={form.slidingWindow} onChange={(v) => set("slidingWindow", v)} />
-        <NumberField label="Sink tokens" step={1} min={0} value={form.sinkTokens} onChange={(v) => set("sinkTokens", v)} />
-        <NumberField label="KV share group" step={1} min={1} value={form.kvShareGroup} onChange={(v) => set("kvShareGroup", v)} />
-        <NumberField label="MLA latent dim" step={16} min={0} value={form.mlaLatentDim} onChange={(v) => set("mlaLatentDim", v)} />
-        <NumberField label="Seq warmup steps" min={0} value={form.seqWarmup} onChange={(v) => set("seqWarmup", v)} />
-        <NumberField label="Early stop (epochs)" min={0} value={form.earlyStop} onChange={(v) => set("earlyStop", v)} />
-        <NumberField label="Weight decay" step={0.01} min={0} value={form.weightDecay} onChange={(v) => set("weightDecay", v)} />
-        <NumberField label="Label smoothing" step={0.01} min={0} max={0.9} value={form.labelSmoothing} onChange={(v) => set("labelSmoothing", v)} />
-        <NumberField label="Z-loss" step={0.0001} min={0} value={form.zLoss} onChange={(v) => set("zLoss", v)} />
-      </div>
+              );
+            })
+          )}
+        </Select>
+      </Field>
 
       <div className="grid grid-cols-2 gap-3 mt-3">
-        <Field label="Save dir">
+        <Field label="Save dir (checkpoints)">
           <Input type="text" value={form.saveDir} onChange={(e) => onSaveDirChange(e.target.value)} />
         </Field>
-        <Field label="Output dir">
+        <Field label="Output dir (model)">
           <Input type="text" value={form.outputDir} onChange={(e) => set("outputDir", e.target.value)} />
         </Field>
+      </div>
+
+      <div className="mt-4">
+        <label className="flex items-center gap-2.5 text-xs text-slate-400 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={resumeOn}
+            onChange={(e) => onToggleResume(e.target.checked)}
+            className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+          />
+          Resume weights from a checkpoint (warm start)
+        </label>
+        <div className="mt-1.5">
+          <Select value={resumePath} onChange={(e) => onSelectResume(e.target.value)} disabled={resumeDisabled}>
+            <option value="">{checkpointPlaceholder(resumeOn, checkpoints, form.saveDir)}</option>
+            {(checkpoints ?? []).map((cp) => (
+              <option key={cp.path} value={cp.path}>
+                {cp.name} · {fmtBytes(cp.size_bytes)}
+              </option>
+            ))}
+          </Select>
+        </div>
       </div>
     </>
   );
 }
 
-interface ResumePickerProps {
-  resumeOn: boolean;
-  checkpoints: CheckpointInfo[] | null;
-  resumePath: string;
-  saveDir: string;
-  onToggle: (enabled: boolean) => void;
-  onSelect: (path: string) => void;
-}
-
-function ResumePicker({ resumeOn, checkpoints, resumePath, saveDir, onToggle, onSelect }: ResumePickerProps) {
-  const disabled = !resumeOn || checkpoints === null || checkpoints.length === 0;
+function StepArchitecture({
+  form,
+  set,
+  onPreset,
+}: {
+  form: FormState;
+  set: (key: keyof FormState, value: string) => void;
+  onPreset: (name: string) => void;
+}) {
+  const custom = form.preset === "custom";
+  const params = paramCount(form);
   return (
-    <div className="mt-4">
-      <label className="flex items-center gap-2.5 text-xs text-slate-400 cursor-pointer select-none">
-        <input
-          type="checkbox"
-          checked={resumeOn}
-          onChange={(e) => onToggle(e.target.checked)}
-          className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
-        />
-        Resume weights from checkpoint (warm start)
-      </label>
-      <div className="mt-1.5">
-        <Select value={resumePath} onChange={(e) => onSelect(e.target.value)} disabled={disabled}>
-          <option value="">{checkpointPlaceholder(resumeOn, checkpoints, saveDir)}</option>
-          {(checkpoints ?? []).map((cp) => (
-            <option key={cp.path} value={cp.path}>
-              {cp.name} · {fmtBytes(cp.size_bytes)}
-            </option>
-          ))}
+    <>
+      <Field label="Preset">
+        <Select value={form.preset} onChange={(e) => onPreset(e.target.value)}>
+          <option value="nano">nano · ~2M params</option>
+          <option value="tiny">tiny · ~5.5M params</option>
+          <option value="small">small · ~30M params</option>
+          <option value="base">base · ~100M params</option>
+          <option value="custom">custom · set dimensions manually</option>
         </Select>
+      </Field>
+      <p className="text-[11px] text-slate-500 mt-1 mb-3">
+        Presets mirror the CLI. Estimated size:{" "}
+        <span className="text-slate-300 tnum font-mono">{(params / 1e6).toFixed(2)}M params</span>
+        {" · "}
+        <span className="text-slate-300 tnum font-mono">{fmtBytes(params * 4)}</span> f32 weights.
+      </p>
+
+      <div className="grid grid-cols-2 gap-3">
+        <NumberField label="n_embd" min={16} value={form.nEmbd} onChange={(v) => set("nEmbd", v)} disabled={!custom} />
+        <NumberField label="n_head" min={1} value={form.nHead} onChange={(v) => set("nHead", v)} disabled={!custom} />
+        <NumberField label="KV heads (GQA)" min={1} value={form.nKvHead} onChange={(v) => set("nKvHead", v)} disabled={!custom} />
+        <NumberField label="n_layer" min={1} value={form.nLayer} onChange={(v) => set("nLayer", v)} disabled={!custom} />
+        <NumberField label="n_ctx" min={16} value={form.nCtx} onChange={(v) => set("nCtx", v)} disabled={!custom} />
+        <NumberField label="Dropout" step={0.05} min={0} max={0.9} value={form.dropout} onChange={(v) => set("dropout", v)} />
       </div>
-    </div>
+
+      <details className="mt-4 rounded-xl border border-slate-800/70 bg-slate-950/30 px-3 py-2">
+        <summary className="text-xs text-slate-400 cursor-pointer select-none">
+          Attention & cache (advanced)
+        </summary>
+        <div className="grid grid-cols-2 gap-3 mt-3">
+          <NumberField label="Sliding window" step={1} min={0} value={form.slidingWindow} onChange={(v) => set("slidingWindow", v)} />
+          <NumberField label="Sink tokens" step={1} min={0} value={form.sinkTokens} onChange={(v) => set("sinkTokens", v)} />
+          <NumberField label="KV share group" step={1} min={1} value={form.kvShareGroup} onChange={(v) => set("kvShareGroup", v)} />
+          <NumberField label="MLA latent dim" step={16} min={0} value={form.mlaLatentDim} onChange={(v) => set("mlaLatentDim", v)} />
+          <NumberField label="Attn softcap" step={1} min={0} value={form.attnSoftcap} onChange={(v) => set("attnSoftcap", v)} />
+        </div>
+        <p className="text-[10px] text-slate-500 mt-2">
+          Sliding window + sinks bound the KV cache. KV share group reuses K/V projections across layers.
+          MLA compresses K/V into a latent (mutually exclusive with GQA in practice: set KV heads = heads
+          when using MLA).
+        </p>
+      </details>
+    </>
   );
 }
 
-interface TrainActionsProps {
-  running: boolean;
-  paused: boolean;
-  stopping: boolean;
-  busy: boolean;
-  onStart: () => void;
-  onTogglePause: () => void;
-  onStop: () => void;
+function StepTraining({
+  form,
+  set,
+}: {
+  form: FormState;
+  set: (key: keyof FormState, value: string) => void;
+}) {
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-3">
+        <NumberField label="Epochs" min={1} value={form.epochs} onChange={(v) => set("epochs", v)} />
+        <NumberField label="Batch" min={1} value={form.batch} onChange={(v) => set("batch", v)} />
+        <NumberField label="LR" step={0.00001} min={0} value={form.lr} onChange={(v) => set("lr", v)} />
+        <NumberField label="Max tokens" min={0} value={form.maxTokens} onChange={(v) => set("maxTokens", v)} />
+        <NumberField label="Val split" step={0.01} min={0} max={0.9} value={form.valSplit} onChange={(v) => set("valSplit", v)} />
+        <NumberField label="Grad accum" min={1} value={form.gradAccum} onChange={(v) => set("gradAccum", v)} />
+        <NumberField label="Seq warmup steps" min={0} value={form.seqWarmup} onChange={(v) => set("seqWarmup", v)} />
+        <NumberField label="Early stop (epochs)" min={0} value={form.earlyStop} onChange={(v) => set("earlyStop", v)} />
+      </div>
+      <details className="mt-4 rounded-xl border border-slate-800/70 bg-slate-950/30 px-3 py-2">
+        <summary className="text-xs text-slate-400 cursor-pointer select-none">
+          Regularization (advanced)
+        </summary>
+        <div className="grid grid-cols-2 gap-3 mt-3">
+          <NumberField label="Weight decay" step={0.01} min={0} value={form.weightDecay} onChange={(v) => set("weightDecay", v)} />
+          <NumberField label="Label smoothing" step={0.01} min={0} max={0.9} value={form.labelSmoothing} onChange={(v) => set("labelSmoothing", v)} />
+          <NumberField label="Z-loss" step={0.0001} min={0} value={form.zLoss} onChange={(v) => set("zLoss", v)} />
+        </div>
+      </details>
+    </>
+  );
 }
 
-function TrainActions({ running, paused, stopping, busy, onStart, onTogglePause, onStop }: TrainActionsProps) {
+function StepReview({
+  form,
+  datasets,
+  resumeOn,
+  resumePath,
+}: {
+  form: FormState;
+  datasets: DatasetInfo[];
+  resumeOn: boolean;
+  resumePath: string;
+}) {
+  const file = form.file || datasets[0]?.name || "—";
+  const params = paramCount(form);
+  const rows: [string, string][] = [
+    ["Dataset", file],
+    ["Device", form.device],
+    ["Preset", form.preset],
+    ["Architecture", `d ${form.nEmbd} · heads ${form.nHead} · kv ${form.nKvHead} · layers ${form.nLayer} · ctx ${form.nCtx}`],
+    ["Params (f32)", `${(params / 1e6).toFixed(2)}M · ${fmtBytes(params * 4)}`],
+    ["Schedule", `${form.epochs} epoch(s) · batch ${form.batch} · lr ${form.lr} · accum ${form.gradAccum}`],
+    ["Token budget", Number(form.maxTokens) > 0 ? Number(form.maxTokens).toLocaleString() : "full dataset"],
+    ["Validation split", form.valSplit],
+    ["Precision", "f32 (f16 training is not supported)"],
+    ["Output", form.outputDir],
+    ["Checkpoints", form.saveDir],
+    ["Resume", resumeOn && resumePath ? resumePath : "no"],
+  ];
   return (
-    <div className="flex gap-3 mt-5">
-      <Button variant="primary" className="flex-1" disabled={running || busy} onClick={onStart}>
-        {busy ? "Starting…" : "Start"}
-      </Button>
-      <Button variant={paused ? "success" : "warn"} className="flex-1" disabled={!running || stopping} onClick={onTogglePause}>
-        {paused ? "Resume" : "Pause"}
-      </Button>
-      <Button variant="danger" className="flex-1" disabled={!running || stopping} onClick={onStop}>
-        {stopping ? "Stopping…" : "Stop"}
-      </Button>
+    <div className="rounded-xl border border-slate-800/70 bg-slate-950/30 divide-y divide-slate-800/60">
+      {rows.map(([label, value]) => (
+        <div key={label} className="flex justify-between gap-3 px-3 py-2 text-xs">
+          <span className="text-slate-500">{label}</span>
+          <span className="text-slate-300 font-mono text-right truncate">{value}</span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -433,6 +655,7 @@ function NumberField({
   min,
   max,
   step,
+  disabled,
 }: {
   label: string;
   value: string;
@@ -440,10 +663,19 @@ function NumberField({
   min?: number;
   max?: number;
   step?: number;
+  disabled?: boolean;
 }) {
   return (
     <Field label={label}>
-      <Input type="number" min={min} max={max} step={step} value={value} onChange={(e) => onChange(e.target.value)} />
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        disabled={disabled}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
     </Field>
   );
 }
