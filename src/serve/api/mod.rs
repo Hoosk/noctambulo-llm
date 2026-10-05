@@ -12,6 +12,7 @@ mod ops;
 mod paths;
 mod runs;
 mod telemetry;
+mod system;
 mod train;
 
 use std::sync::Arc;
@@ -48,6 +49,7 @@ pub fn router(state: Arc<ServerState>) -> (Router, Arc<JobRegistry>) {
         .route("/api/logout", post(logout))
         .route("/api/devices", get(devices))
         .route("/api/telemetry", get(telemetry::telemetry))
+        .route("/api/system", get(system::system))
         .route("/api/datasets", get(datasets))
         .route("/api/datasets/download", post(dataset_download))
         .route("/api/datasets/search", get(dataset_search))

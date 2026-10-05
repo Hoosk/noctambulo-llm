@@ -1435,7 +1435,7 @@ dependencies = [
  "ratatui",
  "rstest",
  "serde",
- "sysinfo",
+ "sysinfo 0.38.4",
  "systemstat",
  "thiserror 2.0.19",
  "tracing-appender",
@@ -2239,7 +2239,7 @@ dependencies = [
  "log",
  "paste",
  "serde",
- "sysinfo",
+ "sysinfo 0.38.4",
  "tracel-llvm",
  "tracel-llvm-bundler",
 ]
@@ -4542,6 +4542,7 @@ dependencies = [
  "reqwest 0.13.4",
  "serde",
  "serde_json",
+ "sysinfo 0.39.6",
  "tokenizers 0.23.1",
  "tokio",
  "tower 0.4.13",
@@ -5364,6 +5365,17 @@ dependencies = [
  "bitflags 2.13.1",
  "block2",
  "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-open-directory"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb82bed227edf5201dfedf072bba4015a33d3d4a98519837295a90f0a23f676d"
+dependencies = [
+ "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
 ]
 
@@ -7311,6 +7323,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sysinfo"
+version = "0.39.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2071df9448915b71c4fe6d25deaf1c22f12bd234f01540b77312bb8e41361e6"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "objc2-open-directory",
+ "windows",
+]
+
+[[package]]
 name = "system-configuration"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9237,7 +9264,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
- "sysinfo",
+ "sysinfo 0.38.4",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
