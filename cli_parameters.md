@@ -93,11 +93,12 @@ Trains a byte-level BPE tokenizer based on a text corpus.
 ---
 
 ## 🔮 5. `generate` Subcommand Parameters
-Performs autoregressive text inference using the model loaded from `model_output/`.
+Performs autoregressive text inference using the model loaded from `--model-dir` (`model_output/` by default). The tokenizer is resolved from the model directory first (`custom_tokenizer.json`), so imported/self-contained models use their own vocabulary.
 
 | Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
 | `<prompt>` | `String` | *Required* | Initial seed text from which the model will continue the generation. |
+| `--model-dir` | `String` | `"model_output"` | Directory containing `config.json` + `model_weights.bin` (+ optional `custom_tokenizer.json`). |
 | `--temp` | `f32` | `0.9` | Sampling temperature. Controls the randomness of the prediction. |
 | `--top-k` | `usize` | `60` | Top-K sampling. Limits the selection to the $K$ most probable tokens. |
 | `--top-p` | `f32` | `0.9` | Top-P sampling (Nucleus Sampling). Limits the selection to tokens whose cumulative probability reaches $P$. |
@@ -122,7 +123,20 @@ Exports weights to GGUF v3 binary format for external inference.
 
 ---
 
-## ⬇️ 7. `download` Subcommand Parameters
+## 📥 7. `import` Subcommand Parameters
+Imports a GGUF file produced by `export` (or a compatible llama-style GGUF with f32/f16 tensors) back into the native format: `config.json`, `model_weights.bin` and a `custom_tokenizer.json` rebuilt from the GGUF vocabulary. Useful to recover models that only survive as GGUF files.
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `<gguf>` | `String` | *Required* | Path to the `.gguf` file to import. |
+| `--output-dir` | `String` | GGUF file stem | Directory (under the models root) that will receive the imported model. |
+| `--force` | `bool` (flag) | `false` | Overwrite the output directory if it already contains a model. |
+
+The inverse of the exporter is exact (transposes + GPT-NeoX RoPE row permutation are inverted); quantized GGUFs (Q4/Q8...) are rejected with a clear error.
+
+---
+
+## ⬇️ 8. `download` Subcommand Parameters
 Downloads a dataset file from Hugging Face Hub; Parquet files are automatically text-extracted.
 
 | Parameter | Type | Default | Technical Description / Function |
@@ -134,12 +148,12 @@ Downloads a dataset file from Hugging Face Hub; Parquet files are automatically 
 
 ---
 
-## 📈 8. `stats` Subcommand Parameters
+## 📈 9. `stats` Subcommand Parameters
 Prints the model parameter count, VRAM footprint, FLOPs statistics and KV cache estimates for every storage format (`f32`, `f16`, `int8`, `q4`, in bytes/token and total MB at `n_ctx`). It takes no parameters.
 
 ---
 
-## 🌐 9. `serve` Subcommand Parameters
+## 🌐 10. `serve` Subcommand Parameters
 Serves the web console (React build in `web/dist`) and the JSON/SSE API to control training, generation, and export from the browser.
 
 | Parameter | Type | Default | Technical Description / Function |

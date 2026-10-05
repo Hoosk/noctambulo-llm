@@ -245,6 +245,23 @@ The resulting `.gguf` file is saved to `exported/kuro-neko-2026.gguf` and can be
 
 ---
 
+### 8. Import a GGUF Back (`import`)
+
+Rebuilds a native model (`config.json` + `model_weights.bin` + `custom_tokenizer.json`) from a GGUF export, so a model that only survives as GGUF can be generated, evaluated or resumed:
+
+```bash
+cargo run --release -- import exported/kuro-neko-v3.gguf --output-dir imported_v3
+```
+
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `--output-dir <name>` | Directory under the models root that receives the model | GGUF file stem |
+| `--force` | Overwrite the output directory if it already contains a model | off |
+
+The export transforms (weight transposes and the GPT-NeoX RoPE row permutation) are inverted exactly; quantized GGUFs are rejected. The web Models view offers the same operation via **Import GGUF**.
+
+---
+
 ### 8. Download a Dataset (`download`)
 
 Downloads a single dataset file from Hugging Face Hub; Parquet files are automatically text-extracted:
