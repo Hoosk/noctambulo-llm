@@ -130,6 +130,13 @@ export interface DiskInfo {
   available_bytes: number;
 }
 
+export interface AcceleratorInfo {
+  name: string;
+  driver: string;
+  pci_id: string;
+  slot: string;
+}
+
 export interface SystemInfo {
   hostname: string;
   os_name: string;
@@ -139,6 +146,8 @@ export interface SystemInfo {
   cpu_physical_cores: number | null;
   cpu_logical_cores: number;
   cpu_frequency_mhz: number;
+  cpu_usage_pct: number;
+  cpu_per_core: number[];
   total_memory_bytes: number;
   used_memory_bytes: number;
   total_swap_bytes: number;
@@ -146,6 +155,7 @@ export interface SystemInfo {
   uptime_secs: number;
   load_average: [number, number, number];
   disks: DiskInfo[];
+  accelerators: AcceleratorInfo[];
 }
 
 export interface ModelInfo {
@@ -274,6 +284,7 @@ export interface TelemetryMemory {
 export interface TelemetryProcess {
   rss_bytes: number;
   cpu_pct: number | null;
+  gpu_pct: number | null;
   threads: number;
   uptime_secs: number;
 }
@@ -283,6 +294,7 @@ export interface TelemetryGpu {
   name: string;
   used_bytes: number;
   total_bytes: number;
+  utilization_pct: number | null;
   source: string;
 }
 

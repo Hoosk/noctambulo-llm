@@ -127,6 +127,29 @@ function SystemCard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-4">
         <div className="sm:col-span-2">
           <InfoRow label="CPU" value={system.cpu_brand || "unknown"} />
+          <div className="mt-2 mb-1">
+            <Meter
+              label="CPU usage"
+              detail={`${system.cpu_usage_pct.toFixed(1)}%`}
+              pct={system.cpu_usage_pct}
+              tone="violet"
+            />
+          </div>
+          {system.cpu_per_core.length > 0 ? (
+            <div className="mb-2">
+              <div className="text-[10px] text-slate-600 mb-1">Per-core</div>
+              <div className="flex items-end gap-[3px] h-8">
+                {system.cpu_per_core.map((usage, i) => (
+                  <div
+                    key={i}
+                    title={`core ${i}: ${usage.toFixed(0)}%`}
+                    className="flex-1 min-w-[3px] rounded-sm bg-gradient-to-t from-violet-600 to-fuchsia-400 transition-all duration-300"
+                    style={{ height: `${Math.max(4, Math.min(100, usage))}%` }}
+                  />
+                ))}
+              </div>
+            </div>
+          ) : null}
           <InfoRow label="Cores" value={cpuLabel} />
           <InfoRow
             label="Max frequency"
@@ -138,6 +161,13 @@ function SystemCard() {
           />
           <InfoRow label="OS" value={`${system.os_name} ${system.os_version}`} />
           <InfoRow label="Kernel" value={system.kernel_version} />
+          {system.accelerators.map((acc) => (
+            <InfoRow
+              key={`${acc.pci_id}-${acc.slot}`}
+              label="Accelerator"
+              value={`${acc.name}${acc.driver ? ` · ${acc.driver}` : ""}${acc.pci_id ? ` · ${acc.pci_id}` : ""}`}
+            />
+          ))}
         </div>
         <Meter
           label="System memory (RAM)"
@@ -217,19 +247,31 @@ function TelemetryCard() {
           pct={pctOf(process.rss_bytes, memory.total_bytes)}
           tone="emerald"
         />
-        <div>
-          <div className="flex justify-between gap-3 text-xs mb-1">
-            <span className="text-slate-500">Process CPU</span>
-            <span className="text-slate-400 tnum font-mono">
-              {process.cpu_pct != null ? `${process.cpu_pct.toFixed(1)}% of one core` : "sampling…"}
-            </span>
+        <div className="grid grid-cols-2 gap-x-8">
+          <div>
+            <div className="flex justify-between gap-3 text-xs mb-1">
+              <span className="text-slate-500">Process CPU</span>
+              <span className="text-slate-400 tnum font-mono">
+                {process.cpu_pct != null ? `${process.cpu_pct.toFixed(1)}% of one core` : "sampling…"}
+              </span>
+            </div>
+          </div>
+          <div>
+            <div className="flex justify-between gap-3 text-xs mb-1">
+              <span className="text-slate-500">Process GPU</span>
+              <span className="text-slate-400 tnum font-mono">
+                {process.gpu_pct != null ? `${process.gpu_pct.toFixed(1)}% busy` : "—"}
+              </span>
+            </div>
           </div>
         </div>
         {gpus.map((gpu) => (
           <Meter
             key={`${gpu.source}-${gpu.index}`}
             label={`${gpu.name} VRAM (${gpu.source})`}
-            detail={`${fmtBytes(gpu.used_bytes)} / ${fmtBytes(gpu.total_bytes)}`}
+            detail={`${fmtBytes(gpu.used_bytes)} / ${fmtBytes(gpu.total_bytes)}${
+              gpu.utilization_pct != null ? ` · ${gpu.utilization_pct.toFixed(0)}% util` : ""
+            }`}
             pct={pctOf(gpu.used_bytes, gpu.total_bytes)}
             tone="sky"
           />

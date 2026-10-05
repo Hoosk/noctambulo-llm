@@ -1798,8 +1798,19 @@ mod tests {
             &config, &tokenizer, &corpus, 8, 4, 0, &init, &out, &device,
         );
         assert!(!losses.is_empty(), "no progress events emitted");
-        let first = losses.first().unwrap().1;
-        let last = losses.last().unwrap().1;
+        // Early progress events can carry a provisional avg_loss of 0 before
+        // the first loss sync; ignore them when picking the baseline/final.
+        let first = losses
+            .iter()
+            .map(|(_, l)| *l)
+            .find(|l| *l > 0.0)
+            .unwrap_or(losses.first().unwrap().1);
+        let last = losses
+            .iter()
+            .rev()
+            .map(|(_, l)| *l)
+            .find(|l| *l > 0.0)
+            .unwrap_or(losses.last().unwrap().1);
         eprintln!(
             "[OVERFIT] avg_loss {first:.4} -> {last:.4} over {} steps (chance ~ {:.2})",
             losses.len(),

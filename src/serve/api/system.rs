@@ -15,6 +15,14 @@ pub(super) struct DiskInfo {
 }
 
 #[derive(Serialize)]
+pub(super) struct AcceleratorInfo {
+    name: String,
+    driver: String,
+    pci_id: String,
+    slot: String,
+}
+
+#[derive(Serialize)]
 pub(super) struct SystemInfo {
     hostname: String,
     os_name: String,
@@ -24,6 +32,10 @@ pub(super) struct SystemInfo {
     cpu_physical_cores: Option<usize>,
     cpu_logical_cores: usize,
     cpu_frequency_mhz: u64,
+    /// System-wide CPU usage across all cores (percent).
+    cpu_usage_pct: f64,
+    /// Per-logical-core usage in the same order as the kernel reports them.
+    cpu_per_core: Vec<f64>,
     total_memory_bytes: u64,
     used_memory_bytes: u64,
     total_swap_bytes: u64,
@@ -31,11 +43,51 @@ pub(super) struct SystemInfo {
     uptime_secs: u64,
     load_average: [f64; 3],
     disks: Vec<DiskInfo>,
+    /// NPUs / AI accelerators exposed through the Linux accel subsystem.
+    accelerators: Vec<AcceleratorInfo>,
+}
+
+/// NPUs register under `/sys/class/accel` (Intel VPU, etc.). They have no
+/// standard utilization counter, but listing them makes the hardware visible.
+fn accelerators() -> Vec<AcceleratorInfo> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/class/accel") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let text = std::fs::read_to_string(entry.path().join("device/uevent")).unwrap_or_default();
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}=")))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        let pci_id = field("PCI_ID");
+        let name = match pci_id.as_str() {
+            "8086:7D1D" | "8086:7D1E" | "8086:643E" => "Intel AI Boost (NPU)".to_string(),
+            "" => entry.file_name().to_string_lossy().to_string(),
+            other => format!("AI accelerator ({other})"),
+        };
+        out.push(AcceleratorInfo {
+            name,
+            driver: field("DRIVER"),
+            pci_id,
+            slot: field("PCI_SLOT_NAME"),
+        });
+    }
+    out
 }
 
 fn collect() -> SystemInfo {
     let mut sys = System::new_all();
     sys.refresh_all();
+    // CPU usage is delta-based: take a second sample after a short pause so the
+    // first request already reports a real percentage instead of 0.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    sys.refresh_cpu_usage();
+    let cpu_usage_pct = sys.global_cpu_usage() as f64;
+    let cpu_per_core: Vec<f64> = sys.cpus().iter().map(|c| c.cpu_usage() as f64).collect();
 
     let cpus = sys.cpus();
     let cpu_brand = cpus
@@ -65,6 +117,8 @@ fn collect() -> SystemInfo {
         cpu_physical_cores: System::physical_core_count(),
         cpu_logical_cores: cpus.len(),
         cpu_frequency_mhz,
+        cpu_usage_pct,
+        cpu_per_core,
         total_memory_bytes: sys.total_memory(),
         used_memory_bytes: sys.used_memory(),
         total_swap_bytes: sys.total_swap(),
@@ -72,6 +126,7 @@ fn collect() -> SystemInfo {
         uptime_secs: System::uptime(),
         load_average: [load.one, load.five, load.fifteen],
         disks,
+        accelerators: accelerators(),
     }
 }
 

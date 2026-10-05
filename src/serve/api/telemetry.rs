@@ -22,6 +22,9 @@ pub(super) struct ProcessInfo {
     rss_bytes: u64,
     /// Percent of a single core; `None` on the first sample (no baseline yet).
     cpu_pct: Option<f64>,
+    /// Percent of wall time the process kept the GPU busy (from DRM fdinfo).
+    /// `None` when the driver exposes no engine counters or on the first sample.
+    gpu_pct: Option<f64>,
     threads: usize,
     uptime_secs: u64,
 }
@@ -32,6 +35,10 @@ pub(super) struct GpuMemory {
     name: String,
     used_bytes: u64,
     total_bytes: u64,
+    /// System-wide GPU utilization when the driver exposes it (`nvidia-smi`,
+    /// AMD `gpu_busy_percent`); `None` otherwise (e.g. Intel i915 needs
+    /// CAP_PERFMON, so the process GPU counter is reported instead).
+    utilization_pct: Option<f64>,
     /// Where the numbers came from (`nvidia-smi` or `sysfs`).
     source: String,
 }
@@ -46,6 +53,9 @@ pub(super) struct Telemetry {
 
 /// `(sampled_at, cpu_ticks)` of the previous call, for delta-based CPU%.
 static CPU_SAMPLE: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
+
+/// `(sampled_at, engine_ns)` of the previous call, for delta-based process GPU%.
+static GPU_SAMPLE: std::sync::Mutex<Option<(Instant, u64)>> = std::sync::Mutex::new(None);
 
 fn clk_tck() -> u64 {
     unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 }.max(1)
@@ -108,21 +118,56 @@ fn parse_nvidia_smi(text: &str) -> Vec<GpuMemory> {
     text.lines()
         .filter_map(|line| {
             let cols: Vec<&str> = line.split(',').map(str::trim).collect();
-            if cols.len() < 4 {
+            if cols.len() < 5 {
                 return None;
             }
             let index = cols[0].parse().ok()?;
-            let used_mib: u64 = cols[2].parse().ok()?;
-            let total_mib: u64 = cols[3].parse().ok()?;
+            let utilization_pct = cols[2].parse::<f64>().ok();
+            let used_mib: u64 = cols[3].parse().ok()?;
+            let total_mib: u64 = cols[4].parse().ok()?;
             Some(GpuMemory {
                 index,
                 name: cols[1].to_string(),
                 used_bytes: used_mib * 1024 * 1024,
                 total_bytes: total_mib * 1024 * 1024,
+                utilization_pct,
                 source: "nvidia-smi".into(),
             })
         })
         .collect()
+}
+
+/// Max busy time across the DRM engines this process has open, from
+/// `/proc/self/fdinfo/*` (`drm-engine-<name>: <ns> ns`). Works without root on
+/// i915/xe/amdgpu and complements the system-wide counters.
+fn process_gpu_busy_ns() -> Option<u64> {
+    let entries = std::fs::read_dir("/proc/self/fdinfo").ok()?;
+    let mut max_ns: Option<u64> = None;
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix("drm-engine-") else {
+                continue;
+            };
+            let Some((key, value)) = rest.split_once(':') else {
+                continue;
+            };
+            if key.starts_with("capacity") {
+                continue;
+            }
+            let Some(ns) = value
+                .trim()
+                .strip_suffix("ns")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            else {
+                continue;
+            };
+            max_ns = Some(max_ns.map_or(ns, |m| m.max(ns)));
+        }
+    }
+    max_ns
 }
 
 /// AMD (and some other drivers) expose VRAM counters through DRM sysfs.
@@ -145,11 +190,15 @@ fn sysfs_gpus() -> Vec<GpuMemory> {
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok());
         if let (Some(used_bytes), Some(total_bytes)) = (used, total) {
+            let utilization_pct = std::fs::read_to_string(dev.join("gpu_busy_percent"))
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok());
             out.push(GpuMemory {
                 index,
                 name,
                 used_bytes,
                 total_bytes,
+                utilization_pct,
                 source: "sysfs".into(),
             });
             index += 1;
@@ -208,6 +257,27 @@ fn collect() -> Telemetry {
         pct
     };
 
+    // Process GPU usage needs two engine samples, like CPU%.
+    let gpu_pct = {
+        let mut sample = GPU_SAMPLE.lock().unwrap();
+        let previous = *sample;
+        let now = Instant::now();
+        let busy_ns = process_gpu_busy_ns();
+        let pct = previous.and_then(|(then, then_ns)| {
+            let dt = now.duration_since(then).as_secs_f64();
+            let now_ns = busy_ns?;
+            if dt > 0.0 && now_ns >= then_ns {
+                Some((now_ns - then_ns) as f64 / 1e9 / dt * 100.0)
+            } else {
+                None
+            }
+        });
+        if let Some(ns) = busy_ns {
+            *sample = Some((now, ns));
+        }
+        pct
+    };
+
     let uptime_secs = std::fs::read_to_string("/proc/uptime")
         .ok()
         .and_then(|text| parse_uptime(&text))
@@ -220,7 +290,7 @@ fn collect() -> Telemetry {
 
     let mut gpus = std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=index,name,memory.used,memory.total",
+            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -236,6 +306,12 @@ fn collect() -> Telemetry {
             "No GPU memory counters exposed by the OS on this system; only process and system memory are reported."
                 .into(),
         );
+    } else if gpus.iter().all(|g| g.utilization_pct.is_none()) {
+        notes.push(
+            "System-wide GPU utilization is not exposed by this driver (Intel needs CAP_PERFMON); \
+             'Process GPU' shows this server's own engine busy time."
+                .into(),
+        );
     }
 
     Telemetry {
@@ -243,6 +319,7 @@ fn collect() -> Telemetry {
         process: ProcessInfo {
             rss_bytes: rss_pages * page_size(),
             cpu_pct,
+            gpu_pct,
             threads,
             uptime_secs,
         },
@@ -289,12 +366,13 @@ mod tests {
 
     #[test]
     fn test_parse_nvidia_smi_csv() {
-        let text = "0, NVIDIA GeForce RTX 4090, 1234, 24564\n1, NVIDIA A100, 0, 81920\n";
+        let text = "0, NVIDIA GeForce RTX 4090, 37, 1234, 24564\n1, NVIDIA A100, 0, 0, 81920\n";
         let gpus = parse_nvidia_smi(text);
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].index, 0);
         assert_eq!(gpus[0].name, "NVIDIA GeForce RTX 4090");
         assert_eq!(gpus[0].used_bytes, 1234 * 1024 * 1024);
+        assert_eq!(gpus[0].utilization_pct, Some(37.0));
         assert_eq!(gpus[1].total_bytes, 81920 * 1024 * 1024);
         assert_eq!(gpus[0].source, "nvidia-smi");
     }
