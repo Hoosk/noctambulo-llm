@@ -84,7 +84,7 @@ const NOTICE_CLASSES: Record<NoticeTone, string> = {
   error: "text-rose-400",
 };
 
-const STEPS = ["Data & device", "Architecture", "Training", "Review"] as const;
+const STEPS = ["Data", "Model", "Train", "Review"] as const;
 
 function hiddenDim(nEmbd: number): number {
   return Math.ceil(Math.ceil((8 * nEmbd) / 3) / 256) * 256;
@@ -329,18 +329,18 @@ export function TrainForm() {
   const running = job.status === "running";
 
   return (
-    <div className="glass-card rounded-2xl p-5 lg:sticky lg:top-6 self-start min-w-0">
+    <div className="glass-card rounded-2xl p-5 self-start min-w-0">
       <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4">
         Training wizard
       </h3>
 
-      <ol className="mb-5 flex items-center gap-1.5">
+      <ol className="mb-5 grid grid-cols-4 gap-1">
         {STEPS.map((label, i) => (
-          <li key={label} className="flex-1 min-w-0">
+          <li key={label} className="min-w-0">
             <button
               type="button"
               onClick={() => setStep(i)}
-              className={`w-full rounded-lg px-2 py-1.5 text-[11px] transition ${
+              className={`w-full min-w-0 truncate rounded-lg px-1 py-1.5 text-[10px] leading-tight transition ${
                 i === step
                   ? "bg-violet-500/20 text-violet-200"
                   : i < step
@@ -348,8 +348,7 @@ export function TrainForm() {
                     : "text-slate-500 hover:bg-slate-800/60"
               }`}
             >
-              <span className="tnum mr-1">{i + 1}.</span>
-              <span className="truncate">{label}</span>
+              {i + 1}. {label}
             </button>
           </li>
         ))}

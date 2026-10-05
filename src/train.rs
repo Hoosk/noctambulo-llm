@@ -221,7 +221,20 @@ impl TextDataset {
         custom_step: Option<usize>,
         max_tokens: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let (mut tokens, mut total_bytes) = tokenizer.encode_file_streaming(path, max_tokens)?;
+        Self::from_file_with_progress(path, tokenizer, n_ctx, custom_step, max_tokens, None, None)
+    }
+
+    pub fn from_file_with_progress<P: AsRef<Path>>(
+        path: P,
+        tokenizer: &LlmTokenizer,
+        n_ctx: usize,
+        custom_step: Option<usize>,
+        max_tokens: Option<usize>,
+        progress: Option<&dyn Fn(u64, u64)>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (mut tokens, mut total_bytes) =
+            tokenizer.encode_file_streaming_with_progress(path, max_tokens, progress, cancel)?;
         if let Some(limit) = max_tokens {
             if limit > 0 && tokens.len() > limit {
                 tui::print_warning(&format!("Limiting training dataset to {} tokens.", tui::format_number(limit)));
@@ -522,7 +535,33 @@ pub fn train_with_events<B: AutodiffBackend>(
     pause: Option<&Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_dataset = if let Some(path) = dataset_path {
-        TextDataset::from_file(path, tokenizer, model_config.n_ctx, custom_step, max_tokens)?
+        emit_log(tx, format!("Loading dataset '{}'...", path.display()));
+        let last_pct = std::cell::Cell::new(-10i64);
+        let progress = |read: u64, total: u64| {
+            let pct = read.saturating_mul(100).checked_div(total).unwrap_or(100) as i64;
+            if pct >= last_pct.get() + 5 {
+                last_pct.set(pct);
+                emit_log(
+                    tx,
+                    format!(
+                        "Tokenizing dataset: {pct}% ({:.0}/{:.0} MB)",
+                        read as f64 / 1_048_576.0,
+                        total as f64 / 1_048_576.0
+                    ),
+                );
+            }
+        };
+        let dataset = TextDataset::from_file_with_progress(
+            path,
+            tokenizer,
+            model_config.n_ctx,
+            custom_step,
+            max_tokens,
+            Some(&progress),
+            Some(cancel.as_ref()),
+        )?;
+        emit_log(tx, format!("Dataset ready: {} tokens.", dataset.tokens.len()));
+        dataset
     } else if let Some(text) = raw_text {
         TextDataset::from_raw_text(text, tokenizer, model_config.n_ctx, custom_step, max_tokens)
     } else {

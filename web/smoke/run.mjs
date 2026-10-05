@@ -244,7 +244,7 @@ try {
   await clickNav("Train");
   // The wizard mounts only the active step; open the Training step first.
   await evaluate(
-    `[...document.querySelectorAll('main button')].find((b) => b.textContent.includes('Training'))?.click()`,
+    `[...document.querySelectorAll('main button')].find((b) => b.textContent.includes('Train'))?.click()`,
   );
   await sleep(400);
   await setField("Weight decay", "0.2");

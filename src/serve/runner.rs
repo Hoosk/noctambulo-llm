@@ -216,6 +216,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
                     );
                 }
                 TrainingEvent::Stopped { reason, .. } => {
+                    forwarder_state.push_log(format!("Stopped: {reason}"), start_unix());
                     let failed = reason.to_lowercase().contains("error");
                     forwarder_state.runs.finish(
                         &run_id_fwd,
@@ -306,8 +307,14 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
         };
 
         if let Err(e) = result {
+            let text = e.to_string();
+            let reason = if text.contains("cancelled") {
+                "Stopped by user".to_string()
+            } else {
+                format!("Training error: {text}")
+            };
             let _ = tx.send(TrainingEvent::Stopped {
-                reason: format!("Training error: {e}"),
+                reason,
                 epoch: 0,
                 batch: 0,
             });

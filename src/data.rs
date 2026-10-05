@@ -121,7 +121,23 @@ impl LlmTokenizer {
         file_path: P,
         max_tokens: Option<usize>,
     ) -> Result<(Vec<u32>, u64), Box<dyn std::error::Error + Send + Sync>> {
-        let (tokens, bytes, _duplicates) = self.encode_file_streaming_opts(file_path, max_tokens, false)?;
+        let (tokens, bytes, _duplicates) =
+            self.encode_file_streaming_opts(file_path, max_tokens, false, None, None)?;
+        Ok((tokens, bytes))
+    }
+
+    /// Streaming text encoding with a `(bytes_read, total_bytes)` progress
+    /// callback and cooperative cancellation, so long tokenization runs can be
+    /// reported to the training log and stopped by the user.
+    pub fn encode_file_streaming_with_progress<P: AsRef<Path>>(
+        &self,
+        file_path: P,
+        max_tokens: Option<usize>,
+        progress: Option<&dyn Fn(u64, u64)>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(Vec<u32>, u64), Box<dyn std::error::Error + Send + Sync>> {
+        let (tokens, bytes, _duplicates) =
+            self.encode_file_streaming_opts(file_path, max_tokens, false, progress, cancel)?;
         Ok((tokens, bytes))
     }
 
@@ -136,7 +152,7 @@ impl LlmTokenizer {
         file_path: P,
         max_tokens: Option<usize>,
     ) -> Result<(Vec<u32>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
-        self.encode_file_streaming_opts(file_path, max_tokens, true)
+        self.encode_file_streaming_opts(file_path, max_tokens, true, None, None)
     }
 
     fn encode_file_streaming_opts<P: AsRef<Path>>(
@@ -144,6 +160,8 @@ impl LlmTokenizer {
         file_path: P,
         max_tokens: Option<usize>,
         dedupe: bool,
+        progress: Option<&dyn Fn(u64, u64)>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(Vec<u32>, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
         let path = file_path.as_ref();
 
@@ -174,12 +192,25 @@ impl LlmTokenizer {
         let mut last_update = Instant::now();
 
         tui::print_tokenization_start(total_bytes);
+        if let Some(callback) = progress {
+            callback(0, total_bytes);
+        }
 
         let batch_line_capacity = 8192;
         let mut line_batch: Vec<String> = Vec::with_capacity(batch_line_capacity);
         let mut batch_bytes = 0u64;
 
-        for line in reader.lines() {
+        let lines = reader.lines().flat_map(|line| match line {
+            Ok(l) => split_utf8_chunks(l, 256 * 1024)
+                .into_iter()
+                .map(Ok)
+                .collect::<Vec<_>>(),
+            Err(e) => vec![Err(e)],
+        });
+        for line in lines {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err("cancelled by user".into());
+            }
             let line = line?;
             let line_len = line.len() as u64 + 1;
             batch_bytes += line_len;
@@ -217,7 +248,10 @@ impl LlmTokenizer {
                 }
             }
 
-            if line_batch.len() >= batch_line_capacity {
+            // Flush by bytes as well as by line count: datasets with very long
+            // lines (JSON/parquet dumps) would otherwise hold megabytes in a
+            // single encode_batch call, freezing progress and cancellation.
+            if line_batch.len() >= batch_line_capacity || batch_bytes >= 4 * 1024 * 1024 {
                 bytes_read += batch_bytes;
                 batch_bytes = 0;
 
@@ -269,6 +303,9 @@ impl LlmTokenizer {
                         eta_min,
                         eta_s,
                     );
+                    if let Some(callback) = progress {
+                        callback(bytes_read, total_bytes);
+                    }
                 }
             }
         }
@@ -296,6 +333,9 @@ impl LlmTokenizer {
         let mb_total = total_bytes as f64 / 1_048_576.0;
         let mb_per_sec = if elapsed_secs > 0.0 { mb_total / elapsed_secs } else { 0.0 };
 
+        if let Some(callback) = progress {
+            callback(total_bytes, total_bytes);
+        }
         tui::print_tokenization_complete(
             mb_total,
             mb_per_sec,
@@ -1177,6 +1217,29 @@ pub fn prepare_binary_dataset<P1: AsRef<Path>, P2: AsRef<Path>>(
     Ok(())
 }
 
+/// Split a string into owned UTF-8-safe pieces of at most `max_bytes`. Long
+/// lines (concatenated JSON/text dumps can be hundreds of MB) would otherwise
+/// reach `encode_batch` whole, freezing progress and cooperative cancellation.
+fn split_utf8_chunks(s: String, max_bytes: usize) -> Vec<String> {
+    if s.len() <= max_bytes {
+        return vec![s];
+    }
+    let mut out = Vec::with_capacity(s.len() / max_bytes + 1);
+    let mut start = 0usize;
+    while start < s.len() {
+        let mut end = (start + max_bytes).min(s.len());
+        while end < s.len() && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = s.len();
+        }
+        out.push(s[start..end].to_string());
+        start = end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,6 +1360,20 @@ mod tests {
         )
         .unwrap();
         LlmTokenizer::from_file(&tokenizer_path).unwrap()
+    }
+
+    #[test]
+    fn test_split_utf8_chunks_respects_boundaries() {
+        let text = "aé漢".repeat(1000);
+        let pieces = split_utf8_chunks(text.clone(), 7);
+        assert!(pieces.len() > 1);
+        for piece in &pieces {
+            assert!(piece.len() <= 7);
+        }
+        assert_eq!(pieces.concat(), text);
+
+        let short = "hello".to_string();
+        assert_eq!(split_utf8_chunks(short.clone(), 16), vec![short]);
     }
 
     #[test]

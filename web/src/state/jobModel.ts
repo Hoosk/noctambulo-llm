@@ -195,6 +195,18 @@ export function mergeStatus(prev: JobInfo, s: TrainStatus): { job: JobInfo; even
   if (!s.running && next.status === "running") {
     next = { ...next, status: "idle", paused: false, message: "Job lost (server restarted?)" };
   }
+  // The server knows a worker is alive before the first `Started` event (the
+  // dataset may still be tokenizing), so trust `running` and leave the
+  // previous terminal state behind.
+  if (s.running && next.status !== "running") {
+    next = {
+      ...next,
+      status: "running",
+      paused: false,
+      stopping: false,
+      message: next.message || "Preparing dataset…",
+    };
+  }
 
   const ev = s.last_event;
   if (!ev) return { job: next, event: null };

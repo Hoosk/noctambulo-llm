@@ -43,7 +43,6 @@ function jobStats(job: JobInfo): StatItem[] {
     { label: "Speed", value: job.batchesPerSec != null ? `${job.batchesPerSec.toFixed(1)} b/s` : "—", icon: "zap", tone: "sky" },
     { label: "ETA", value: fmtDur(job.etaSecs), icon: "clock", tone: "amber" },
     { label: "Elapsed", value: fmtDur(job.elapsedSecs), icon: "clock", tone: "slate" },
-    { label: "Progress", value: `${job.pct.toFixed(1)}%`, icon: "gauge", tone: "violet" },
   ];
 }
 
@@ -66,16 +65,26 @@ function StatsGrid({ job }: { job: JobInfo }) {
 
 function ProgressBar({ job }: { job: JobInfo }) {
   const running = job.status === "running";
+  // Until the first Progress event the worker is still tokenizing the dataset;
+  // there is no percentage yet, so show an indeterminate bar instead of 0%.
+  const preparing = running && job.step === 0;
   const shimmer = running && !job.paused && !job.stopping;
   return (
     <div className="mt-5">
-      <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-2">Progress</h4>
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+          {preparing ? "Preparing dataset (tokenizing)…" : "Progress"}
+        </h4>
+        {preparing ? null : (
+          <span className="text-[11px] text-slate-500 tnum font-mono">{job.pct.toFixed(1)}%</span>
+        )}
+      </div>
       <div className="h-2.5 rounded-full bg-slate-800/80 overflow-hidden">
         <div
           className={`h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-all duration-300 ${
             shimmer ? "progress-shimmer" : ""
-          }`}
-          style={{ width: `${job.pct || 0}%` }}
+          } ${preparing ? "animate-pulse" : ""}`}
+          style={{ width: preparing ? "100%" : `${job.pct || 0}%` }}
         />
       </div>
     </div>
