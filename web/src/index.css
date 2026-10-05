@@ -48,6 +48,26 @@ body {
   background-attachment: fixed;
 }
 
+/* Tailwind v4's preflight leaves buttons on the default cursor. This UI is
+   click-heavy (nav, steppers, cards, selects, disclosures), so restore the
+   hand cursor on every interactive control and a blocked cursor when disabled. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  summary,
+  select:not(:disabled),
+  input[type="checkbox"]:not(:disabled),
+  input[type="radio"]:not(:disabled),
+  label[for] {
+    cursor: pointer;
+  }
+  button:disabled,
+  select:disabled,
+  input:disabled {
+    cursor: not-allowed;
+  }
+}
+
 @utility glass-card {
   background: rgba(15, 23, 42, 0.62);
   border: 1px solid rgba(51, 65, 85, 0.55);
