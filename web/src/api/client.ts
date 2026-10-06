@@ -87,10 +87,10 @@ export const api = {
     request<DatasetHit[]>(`/api/datasets/search?q=${encodeURIComponent(q)}`),
   getRepoFiles: (repo: string) =>
     request<RepoFiles>(`/api/datasets/repo-files?repo=${encodeURIComponent(repo)}`),
-  downloadDataset: (repoId: string, filename = "") =>
-    request<{ opId: string; status: string; file: string }>("/api/datasets/download", {
+  downloadDataset: (repoId: string, filenames: string[] = []) =>
+    request<{ opId: string; status: string; files: string[] }>("/api/datasets/download", {
       method: "POST",
-      json: { repoId, filename },
+      json: { repoId, filenames },
     }),
   renameDataset: (from: string, to: string) =>
     request<{ status: string }>("/api/datasets/rename", { method: "POST", json: { from, to } }),

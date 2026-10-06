@@ -22,6 +22,7 @@ export function DownloadCard({ onDownloaded }: { onDownloaded: () => void }) {
   const { cancelOp } = useAppState();
   const [repoId, setRepoId] = useState("");
   const [filename, setFilename] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
   const [repoFiles, setRepoFiles] = useState<RepoFiles | null>(null);
   const [listing, setListing] = useState(false);
   const [notice, setNotice] = useState<{ text: string; tone: NoticeTone }>({ text: "", tone: "muted" });
@@ -51,6 +52,7 @@ export function DownloadCard({ onDownloaded }: { onDownloaded: () => void }) {
     try {
       const res = await api.getRepoFiles(repo);
       setRepoFiles(res.files.length > 0 ? res : null);
+      setSelected(res.default ? [res.default] : []);
     } catch {
       setRepoFiles(null);
     } finally {
@@ -67,7 +69,8 @@ export function DownloadCard({ onDownloaded }: { onDownloaded: () => void }) {
     setBusy(true);
     setNotice({ text: "Starting download…", tone: "muted" });
     try {
-      const res = await api.downloadDataset(repo, filename.trim());
+      const files = repoFiles ? selected : filename.trim() ? [filename.trim()] : [];
+      const res = await api.downloadDataset(repo, files);
       setOpId(res.opId);
     } catch (e) {
       setNotice({ text: `Error: ${e instanceof Error ? e.message : "unknown"}`, tone: "error" });
@@ -89,18 +92,14 @@ export function DownloadCard({ onDownloaded }: { onDownloaded: () => void }) {
             onChange={(e) => {
               setRepoId(e.target.value);
               setRepoFiles(null);
+              setSelected([]);
             }}
             onBlur={() => void loadFiles()}
           />
         </Field>
         <Field label={repoFiles ? "File" : "File (optional)"}>
           {repoFiles ? (
-            <FilePicker
-              files={repoFiles.files}
-              value={filename}
-              onChange={setFilename}
-              autoLabel={repoFiles.default ? `Auto · ${repoFiles.default}` : "Auto · best training file"}
-            />
+            <FilePicker files={repoFiles.files} selected={selected} onChange={setSelected} />
           ) : (
             <Input
               placeholder={listing ? "loading files…" : "auto · best training file"}

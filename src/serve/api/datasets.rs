@@ -69,27 +69,34 @@ pub(super) async fn datasets(
 pub(super) struct DatasetDownloadRequest {
     repo_id: String,
     #[serde(default)]
-    filename: String,
+    filenames: Vec<String>,
 }
 
-/// Resolve the file to download: the explicit one, or the best training file
-/// of the repo when the request omits it.
-async fn resolve_download_file(repo_id: &str, filename: &str) -> Result<String, ApiError> {
-    let requested = filename.trim();
+/// Resolve the files to download: the explicit ones, or the best training
+/// file of the repo when the request omits them.
+async fn resolve_download_files(repo_id: &str, filenames: &[String]) -> Result<Vec<String>, ApiError> {
+    let requested: Vec<String> = filenames
+        .iter()
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect();
     if !requested.is_empty() {
-        return Ok(requested.to_string());
+        return Ok(requested);
     }
     let repo = repo_id.to_string();
     let files = tokio::task::spawn_blocking(move || crate::data::hf_repo_files(&repo))
         .await
         .map_err(|e| ApiError::internal(format!("repo listing task failed: {e}")))?
         .map_err(ApiError::bad_gateway)?;
-    crate::data::pick_default_dataset_file(&files).ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "No usable data file found in '{repo_id}' ({} files). Pick one explicitly.",
-            files.len()
-        ))
-    })
+    crate::data::pick_default_dataset_file(&files)
+        .map(|file| vec![file])
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "No usable data file found in '{repo_id}' ({} files). Pick one explicitly.",
+                files.len()
+            ))
+        })
 }
 
 pub(super) async fn dataset_download(
@@ -102,35 +109,62 @@ pub(super) async fn dataset_download(
     if repo_id.is_empty() {
         return Err(ApiError::bad_request("repoId is required"));
     }
-    let filename = resolve_download_file(&repo_id, &req.filename).await?;
+    let files = resolve_download_files(&repo_id, &req.filenames).await?;
+    let label = if files.len() == 1 {
+        format!("{repo_id} · {}", files[0])
+    } else {
+        format!("{repo_id} · {} files", files.len())
+    };
 
     // Long downloads run as background operations so the UI can follow byte
     // progress (and cancel) instead of holding a request open for minutes.
-    let op = state.ops.start("download", &format!("{repo_id} · {filename}"));
+    let op = state.ops.start("download", &label);
     let op_id = op.id().to_string();
-    let file_for_op = filename.clone();
+    let files_for_op = files.clone();
     tokio::task::spawn_blocking(move || {
-        let progress = |phase: &str, done: u64, total: u64| op.progress(phase, done, total, "bytes");
-        let cancelled = || op.is_cancelled();
-        match crate::data::download_dataset_streaming(&repo_id, &file_for_op, &progress, &cancelled) {
-            Ok(path) => {
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                op.finish(
-                    &format!("Downloaded {name}"),
-                    Some(serde_json::json!({ "path": path.to_string_lossy(), "name": name })),
-                );
-            }
-            Err(e) => {
-                if op.is_cancelled() {
-                    op.cancelled();
-                } else {
-                    op.fail(&e.to_string());
+        let total_files = files_for_op.len();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for (i, file) in files_for_op.iter().enumerate() {
+            let prefix = if total_files > 1 {
+                format!("file {}/{total_files} · ", i + 1)
+            } else {
+                String::new()
+            };
+            let progress = |phase: &str, done: u64, total: u64| {
+                op.progress(&format!("{prefix}{phase}"), done, total, "bytes");
+            };
+            let cancelled = || op.is_cancelled();
+            match crate::data::download_dataset_streaming(&repo_id, file, &progress, &cancelled) {
+                Ok(path) => paths.push(path),
+                Err(e) => {
+                    if op.is_cancelled() {
+                        op.cancelled();
+                    } else {
+                        op.fail(&format!("{file}: {e}"));
+                    }
+                    return;
                 }
             }
         }
+        let names: Vec<String> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+            .collect();
+        let message = if names.len() == 1 {
+            format!("Downloaded {}", names[0])
+        } else {
+            format!("Downloaded {} files", names.len())
+        };
+        op.finish(
+            &message,
+            Some(serde_json::json!({
+                "paths": paths.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+                "names": names,
+            })),
+        );
     });
 
-    Ok(Json(serde_json::json!({ "opId": op_id, "status": "started", "file": filename })))
+    Ok(Json(serde_json::json!({ "opId": op_id, "status": "started", "files": files })))
 }
 
 #[derive(Deserialize)]

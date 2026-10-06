@@ -19,16 +19,18 @@ function SearchRow({ hit, onDownloaded }: { hit: DatasetHit; onDownloaded: () =>
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [files, setFiles] = useState<RepoFiles | null>(null);
-  const [pick, setPick] = useState("");
+  const [selected, setSelected] = useState<string[]>([]);
   const language = hit.tags[0]?.replace("language:", "");
 
-  const download = async (filename: string) => {
-    if (busy) return;
+  const download = async () => {
+    if (busy || selected.length === 0) return;
     setBusy(true);
     try {
-      const res = await api.downloadDataset(hit.id, filename);
-      toast.success(`Downloading ${hit.id} · ${res.file}…`);
+      const res = await api.downloadDataset(hit.id, selected);
+      const what = res.files.length === 1 ? res.files[0] : `${res.files.length} files`;
+      toast.success(`Downloading ${hit.id} · ${what}…`);
       setFiles(null);
+      setSelected([]);
       onDownloaded();
     } catch (e) {
       toast.error(`Download failed: ${e instanceof Error ? e.message : "unknown"}`);
@@ -49,10 +51,16 @@ function SearchRow({ hit, onDownloaded }: { hit: DatasetHit; onDownloaded: () =>
         return;
       }
       setFiles(res);
-      setPick(res.default ?? res.files[0]);
+      setSelected([res.default ?? res.files[0]]);
     } catch {
-      setBusy(false);
-      await download("");
+      // Listing failed: let the backend resolve the best training file itself.
+      try {
+        await api.downloadDataset(hit.id, []);
+        toast.success(`Downloading ${hit.id} · auto-selected file…`);
+        onDownloaded();
+      } catch (e) {
+        toast.error(`Download failed: ${e instanceof Error ? e.message : "unknown"}`);
+      }
       return;
     } finally {
       setBusy(false);
@@ -85,21 +93,26 @@ function SearchRow({ hit, onDownloaded }: { hit: DatasetHit; onDownloaded: () =>
       </div>
       {files ? (
         <div className="mt-3 space-y-2">
-          <FilePicker files={files.files} value={pick} onChange={setPick} />
+          <FilePicker files={files.files} selected={selected} onChange={setSelected} />
           <div className="flex items-center gap-2">
-            <span className="flex-1 min-w-0 text-[11px] text-slate-500 font-mono truncate">{pick}</span>
+            <span className="flex-1 min-w-0 text-[11px] text-slate-500">
+              {selected.length} file{selected.length === 1 ? "" : "s"} selected
+            </span>
             <Button
               variant="primary"
               className="px-3 py-1.5 text-xs shrink-0"
-              disabled={busy}
-              onClick={() => void download(pick)}
+              disabled={busy || selected.length === 0}
+              onClick={() => void download()}
             >
               {busy ? "Starting…" : "Download"}
             </Button>
             <Button
               variant="ghost"
               className="px-3 py-1.5 text-xs shrink-0"
-              onClick={() => setFiles(null)}
+              onClick={() => {
+                setFiles(null);
+                setSelected([]);
+              }}
             >
               Cancel
             </Button>
