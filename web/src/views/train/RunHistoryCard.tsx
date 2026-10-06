@@ -6,6 +6,7 @@ import { LineChart, type ChartSeries } from "../../components/LineChart";
 import { Badge, type Tone } from "../../components/ui";
 import { fmtNum } from "../../lib/format";
 import { useAppState } from "../../state/appContext";
+import { LastRunStrip } from "./LastRunStrip";
 
 const COLORS = ["#8b5cf6", "#38bdf8", "#f59e0b", "#34d399", "#fb7185"];
 const MAX_SELECTED = 3;
@@ -128,6 +129,8 @@ export function RunHistoryCard() {
       <p className="text-xs text-slate-500 mb-4">
         Select up to {MAX_SELECTED} runs to overlay their training loss curves.
       </p>
+
+      <LastRunStrip />
 
       {loaded && runs.length === 0 ? (
         <div className="p-8 rounded-xl border border-dashed border-slate-700/70 text-center text-slate-500 text-sm">

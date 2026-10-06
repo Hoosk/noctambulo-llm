@@ -41,7 +41,15 @@ export function GenerateView() {
     api
       .getModels()
       .then((list) => {
-        if (!cancelled) setModels(list);
+        if (cancelled) return;
+        setModels(list);
+        // A persisted selection can point at a model that no longer exists
+        // (deleted/renamed outside the UI): fall back to the default model.
+        setModelDir((current) =>
+          current && list.some((m) => m.dir === current)
+            ? current
+            : (list.find((m) => m.default)?.dir ?? list[0]?.dir ?? ""),
+        );
       })
       .catch((e: unknown) => {
         if (!cancelled) {
@@ -55,7 +63,9 @@ export function GenerateView() {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  const selectedDir = modelDir || models.find((m) => m.default)?.dir || models[0]?.dir || "";
+  const selectedDir = models.some((m) => m.dir === modelDir)
+    ? modelDir
+    : (models.find((m) => m.default)?.dir ?? models[0]?.dir ?? "");
   const onField = (key: keyof GenForm, value: string) => setForm((f) => ({ ...f, [key]: value }));
 
   const run = async () => {

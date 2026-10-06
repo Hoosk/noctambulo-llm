@@ -68,12 +68,28 @@ pub(super) async fn datasets(
 #[serde(rename_all = "camelCase")]
 pub(super) struct DatasetDownloadRequest {
     repo_id: String,
-    #[serde(default = "default_download_filename")]
+    #[serde(default)]
     filename: String,
 }
 
-fn default_download_filename() -> String {
-    "TinyStories-train.txt".into()
+/// Resolve the file to download: the explicit one, or the best training file
+/// of the repo when the request omits it.
+async fn resolve_download_file(repo_id: &str, filename: &str) -> Result<String, ApiError> {
+    let requested = filename.trim();
+    if !requested.is_empty() {
+        return Ok(requested.to_string());
+    }
+    let repo = repo_id.to_string();
+    let files = tokio::task::spawn_blocking(move || crate::data::hf_repo_files(&repo))
+        .await
+        .map_err(|e| ApiError::internal(format!("repo listing task failed: {e}")))?
+        .map_err(ApiError::bad_gateway)?;
+    crate::data::pick_default_dataset_file(&files).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "No usable data file found in '{repo_id}' ({} files). Pick one explicitly.",
+            files.len()
+        ))
+    })
 }
 
 pub(super) async fn dataset_download(
@@ -86,20 +102,17 @@ pub(super) async fn dataset_download(
     if repo_id.is_empty() {
         return Err(ApiError::bad_request("repoId is required"));
     }
-    let filename = if req.filename.trim().is_empty() {
-        default_download_filename()
-    } else {
-        req.filename.clone()
-    };
+    let filename = resolve_download_file(&repo_id, &req.filename).await?;
 
     // Long downloads run as background operations so the UI can follow byte
     // progress (and cancel) instead of holding a request open for minutes.
     let op = state.ops.start("download", &format!("{repo_id} · {filename}"));
     let op_id = op.id().to_string();
+    let file_for_op = filename.clone();
     tokio::task::spawn_blocking(move || {
         let progress = |phase: &str, done: u64, total: u64| op.progress(phase, done, total, "bytes");
         let cancelled = || op.is_cancelled();
-        match crate::data::download_dataset_streaming(&repo_id, &filename, &progress, &cancelled) {
+        match crate::data::download_dataset_streaming(&repo_id, &file_for_op, &progress, &cancelled) {
             Ok(path) => {
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 op.finish(
@@ -117,7 +130,38 @@ pub(super) async fn dataset_download(
         }
     });
 
-    Ok(Json(serde_json::json!({ "opId": op_id, "status": "started" })))
+    Ok(Json(serde_json::json!({ "opId": op_id, "status": "started", "file": filename })))
+}
+
+#[derive(Deserialize)]
+pub(super) struct RepoFilesQuery {
+    repo: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct RepoFilesResponse {
+    files: Vec<String>,
+    default: Option<String>,
+}
+
+/// File listing of a HF dataset repo, so the UI can offer the real files
+/// instead of guessing names.
+pub(super) async fn dataset_repo_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<RepoFilesQuery>,
+) -> Result<Json<RepoFilesResponse>, ApiError> {
+    check_token(&state.server, &headers, None)?;
+    let repo = params.repo.trim().to_string();
+    if repo.is_empty() {
+        return Err(ApiError::bad_request("repo is required"));
+    }
+    let files = tokio::task::spawn_blocking(move || crate::data::hf_repo_files(&repo))
+        .await
+        .map_err(|e| ApiError::internal(format!("repo listing task failed: {e}")))?
+        .map_err(ApiError::bad_gateway)?;
+    let default = crate::data::pick_default_dataset_file(&files);
+    Ok(Json(RepoFilesResponse { files, default }))
 }
 
 #[derive(Deserialize)]

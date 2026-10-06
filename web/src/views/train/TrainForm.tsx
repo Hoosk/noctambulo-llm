@@ -229,7 +229,11 @@ export function TrainForm() {
     let cancelled = false;
     Promise.allSettled([api.getDatasets(), api.getDevices()]).then(([ds, dv]) => {
       if (cancelled) return;
-      if (ds.status === "fulfilled") setDatasets(ds.value);
+      // Biggest corpora first: the default selection should not be a tiny
+      // test fixture.
+      if (ds.status === "fulfilled") {
+        setDatasets([...ds.value].sort((a, b) => b.size_bytes - a.size_bytes));
+      }
       if (dv.status === "fulfilled") setDevices(dv.value);
     });
     return () => {
@@ -317,15 +321,6 @@ export function TrainForm() {
     }
   };
 
-  const action = async (run: () => Promise<unknown>, done: string, tone: NoticeTone) => {
-    try {
-      await run();
-      setNotice({ text: done, tone });
-    } catch (e) {
-      setNotice({ text: `Error: ${e instanceof Error ? e.message : "unknown"}`, tone: "error" });
-    }
-  };
-
   const running = job.status === "running";
 
   return (
@@ -389,29 +384,6 @@ export function TrainForm() {
             {busy ? "Starting…" : "Start training"}
           </Button>
         )}
-      </div>
-
-      <div className="flex gap-2 mt-2">
-        <Button
-          variant={job.paused ? "success" : "warn"}
-          className="flex-1"
-          disabled={!running || job.stopping}
-          onClick={() =>
-            void (job.paused
-              ? action(api.resumeTrain, "Resuming…", "ok")
-              : action(api.pauseTrain, "Pausing…", "warn"))
-          }
-        >
-          {job.paused ? "Resume" : "Pause"}
-        </Button>
-        <Button
-          variant="danger"
-          className="flex-1"
-          disabled={!running || job.stopping}
-          onClick={() => void action(api.stopTrain, "Stopping…", "warn")}
-        >
-          {job.stopping ? "Stopping…" : "Stop"}
-        </Button>
       </div>
 
       <p className={`text-xs mt-3 ${NOTICE_CLASSES[notice.tone]}`}>{notice.text}</p>

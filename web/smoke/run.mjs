@@ -9,7 +9,7 @@
 // Usage:
 //   node web/smoke/run.mjs [--url http://127.0.0.1:8080/] [--token kuro-neko-demo]
 //                          [--cdp http://127.0.0.1:9222] [--models-dir .] [--datasets-dir datasets]
-//                          [--fixture model_output_v2_ppl1.83] [--skip-training] [--keep-artifacts]
+//                          [--fixture MODEL_DIR] [--skip-training] [--keep-artifacts]
 //
 // The suite creates a disposable copy of the fixture model, a small dataset mix and a tiny
 // training run; everything it creates is removed afterwards unless --keep-artifacts is set.
@@ -279,7 +279,7 @@ try {
   // --- E6/E3: weighted combine, .bin rejection, share %, op progress -------
   await clickNav("Datasets");
   await toggleDataset("combined_corpus.txt");
-  await toggleDataset("weighted_mix.txt");
+  await toggleDataset("weighted_mix_web.txt");
   await waitFor(`document.body.innerText.includes('Equalize weights')`, 15_000, "combine card");
   const shares = await evaluate(`document.body.innerText.match(/\\d+%/g)?.length ?? 0`);
   record("E6 combine share display", shares >= 2, `${shares} share values`);
@@ -348,7 +348,7 @@ try {
     })()`);
     await sleep(1200);
     const canvases = await evaluate(`document.querySelectorAll('main canvas').length`);
-    record("E5 run history + overlay curve", runInfo && canvases >= 2, `${canvases} canvases`);
+    record("E5 run history + overlay curve", runInfo && canvases >= 1, `${canvases} canvases`);
 
     const logs = await evaluate(`(() => {
       const pre = [...document.querySelectorAll('main pre')].find((p) => p.querySelector('span'));

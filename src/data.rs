@@ -433,22 +433,65 @@ pub fn download_dataset_from_hf(repo_id: &str, filename: &str) -> Result<PathBuf
     Err(format!("Failed to download dataset from HF repo '{}': {:?}", repo_id, last_err.unwrap()).into())
 }
 
-/// Candidate file names tried in order for a requested HF dataset file.
-fn hf_candidates(filename: &str) -> Vec<String> {
-    let mut out = vec![filename.to_string()];
-    for cand in [
-        "TinyStories-train.txt",
-        "stories_00.json",
-        "tinystories.jsonl",
-        "spanish_stories.txt",
-        "train.txt",
-        "data.txt",
-    ] {
-        if cand != filename {
-            out.push(cand.to_string());
-        }
+/// File names inside a Hugging Face dataset repo (`siblings[].rfilename`).
+pub fn hf_repo_files(repo_id: &str) -> Result<Vec<String>, String> {
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("kuro-neko-llm/0.1")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("https://huggingface.co/api/datasets/{repo_id}");
+    let mut req = client.get(&url);
+    if let Some(t) = &token {
+        req = req.bearer_auth(t);
     }
-    out
+    let resp = req.send().map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HF API status {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+    Ok(body
+        .get("siblings")
+        .and_then(|s| s.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| f.get("rfilename").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Best default training file out of a repo listing: real text data first,
+/// then Parquet (text is extracted after download), then JSON/CSV. Prefers
+/// files with `train` in the name and ignores hidden/README files.
+pub fn pick_default_dataset_file(files: &[String]) -> Option<String> {
+    let usable = |f: &&String| {
+        let name = f.rsplit('/').next().unwrap_or(f);
+        !name.starts_with('.')
+            && !name.eq_ignore_ascii_case("readme.md")
+            && !name.eq_ignore_ascii_case("config.json")
+    };
+    let pick = |exts: &[&str], prefer_train: bool| {
+        files
+            .iter()
+            .filter(usable)
+            .find(|f| {
+                let lower = f.to_lowercase();
+                exts.iter().any(|e| lower.ends_with(e)) && (!prefer_train || lower.contains("train"))
+            })
+            .cloned()
+    };
+    pick(&[".txt"], true)
+        .or_else(|| pick(&[".parquet"], true))
+        .or_else(|| pick(&[".jsonl", ".json"], true))
+        .or_else(|| pick(&[".csv"], true))
+        .or_else(|| pick(&[".txt"], false))
+        .or_else(|| pick(&[".parquet"], false))
+        .or_else(|| pick(&[".jsonl", ".json"], false))
+        .or_else(|| pick(&[".csv"], false))
 }
 
 fn encode_path_segment(s: &str) -> String {
@@ -464,7 +507,9 @@ fn encode_path_segment(s: &str) -> String {
 
 /// Streaming HF download with byte-level progress and cooperative
 /// cancellation. Keeps the same cache naming as `download_dataset_from_hf`, so
-/// files already cached by the CLI are reused.
+/// files already cached by the CLI are reused. Parquet files are converted to
+/// a sibling `_text.txt` (one document per line) and that path is returned, so
+/// web downloads are directly usable by the trainer.
 ///
 /// `progress(phase, done_bytes, total_bytes)` is called while downloading
 /// (`total_bytes == 0` when the server does not send a content length);
@@ -476,91 +521,86 @@ pub fn download_dataset_streaming(
     progress: &dyn Fn(&str, u64, u64),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let candidates = hf_candidates(filename);
+    let dataset_name = format!("dataset_{}_{}", repo_id.replace('/', "_"), filename.replace('/', "_"));
 
     // 1. Local cache first (root, then datasets/) to avoid re-downloading.
-    for cand in &candidates {
-        let dataset_name = format!("dataset_{}_{}", repo_id.replace('/', "_"), cand.replace('/', "_"));
-        for base in [PathBuf::from("."), PathBuf::from("datasets")] {
-            let cached = base.join(&dataset_name);
-            if cached.is_file() {
-                return Ok(cached);
-            }
+    let mut local_cache: Option<PathBuf> = None;
+    for base in [PathBuf::from("."), PathBuf::from("datasets")] {
+        let cached = base.join(&dataset_name);
+        if cached.is_file() {
+            local_cache = Some(cached);
+            break;
         }
     }
 
-    let datasets_dir = PathBuf::from("datasets");
-    std::fs::create_dir_all(&datasets_dir)?;
+    let local_cache = match local_cache {
+        Some(cached) => cached,
+        None => {
+            let datasets_dir = PathBuf::from("datasets");
+            std::fs::create_dir_all(&datasets_dir)?;
+            let local_cache = datasets_dir.join(&dataset_name);
 
-    let token = std::env::var("HF_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("kuro-neko-llm/0.1")
-        .build()?;
+            let token = std::env::var("HF_TOKEN")
+                .ok()
+                .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
+            let client = reqwest::blocking::Client::builder()
+                .user_agent("kuro-neko-llm/0.1")
+                .build()?;
 
-    let mut last_err: Option<String> = None;
-    for cand in candidates {
-        if cancelled() {
-            return Err("cancelled by user".into());
-        }
-        let dataset_name = format!("dataset_{}_{}", repo_id.replace('/', "_"), cand.replace('/', "_"));
-        let local_cache = datasets_dir.join(&dataset_name);
-        let encoded: Vec<String> = cand.split('/').map(encode_path_segment).collect();
-        let url = format!(
-            "https://huggingface.co/datasets/{}/resolve/main/{}",
-            repo_id,
-            encoded.join("/")
-        );
+            let encoded: Vec<String> = filename.split('/').map(encode_path_segment).collect();
+            let url = format!(
+                "https://huggingface.co/datasets/{}/resolve/main/{}",
+                repo_id,
+                encoded.join("/")
+            );
 
-        progress(&format!("requesting {cand}"), 0, 0);
-        let mut req = client.get(&url);
-        if let Some(t) = &token {
-            req = req.bearer_auth(t);
-        }
-        let mut resp = match req.send() {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = Some(format!("{cand}: {e}"));
-                continue;
+            progress(&format!("requesting {filename}"), 0, 0);
+            let mut req = client.get(&url);
+            if let Some(t) = &token {
+                req = req.bearer_auth(t);
             }
-        };
-        if !resp.status().is_success() {
-            last_err = Some(format!("{cand}: HTTP {}", resp.status()));
-            continue;
-        }
+            let mut resp = req.send().map_err(|e| format!("{filename}: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("Failed to download '{filename}' from '{repo_id}': HTTP {}", resp.status()).into());
+            }
 
-        let total = resp.content_length().unwrap_or(0);
-        let tmp = local_cache.with_extension("part");
-        let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
-        let mut buf = vec![0u8; 1 << 16];
-        let mut done = 0u64;
-        loop {
-            if cancelled() {
-                drop(file);
-                let _ = std::fs::remove_file(&tmp);
-                return Err("cancelled by user".into());
+            let total = resp.content_length().unwrap_or(0);
+            let tmp = local_cache.with_extension("part");
+            let mut file = std::io::BufWriter::with_capacity(1 << 20, File::create(&tmp)?);
+            let mut buf = vec![0u8; 1 << 16];
+            let mut done = 0u64;
+            loop {
+                if cancelled() {
+                    drop(file);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err("cancelled by user".into());
+                }
+                let n = resp.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])?;
+                done += n as u64;
+                progress(&format!("downloading {filename}"), done, total);
             }
-            let n = resp.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            file.write_all(&buf[..n])?;
-            done += n as u64;
-            progress(&format!("downloading {cand}"), done, total);
+            file.flush()?;
+            drop(file);
+            std::fs::rename(&tmp, &local_cache)?;
+            local_cache
         }
-        file.flush()?;
-        drop(file);
-        std::fs::rename(&tmp, &local_cache)?;
-        return Ok(local_cache);
+    };
+
+    if local_cache.extension().is_some_and(|e| e == "parquet") {
+        let stem = local_cache.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let txt = local_cache.with_file_name(format!("{stem}_text.txt"));
+        if !txt.is_file() {
+            progress("extracting text", 0, 0);
+            extract_parquet_text_column(&local_cache, &txt)?;
+        }
+        return Ok(txt);
     }
 
-    Err(format!(
-        "Failed to download dataset from HF repo '{}': {}",
-        repo_id,
-        last_err.unwrap_or_else(|| "no candidate file found".into())
-    )
-    .into())
+    Ok(local_cache)
 }
 
 /// Extracts text documents from a Parquet file (column `text`, falling back
@@ -1318,6 +1358,31 @@ mod tests {
         assert_eq!(vocab, 100);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_pick_default_dataset_file() {
+        // Text wins over parquet, hidden/README files are ignored and `train`
+        // files are preferred over validation splits.
+        let files = vec![
+            ".gitattributes".to_string(),
+            "README.md".to_string(),
+            "data/validation-00000-of-00001.parquet".to_string(),
+            "data/train-00000-of-00002.parquet".to_string(),
+            "data/train-00001-of-00002.parquet".to_string(),
+        ];
+        assert_eq!(
+            pick_default_dataset_file(&files).as_deref(),
+            Some("data/train-00000-of-00002.parquet")
+        );
+
+        let files = vec!["data/train.parquet".to_string(), "data/train.txt".to_string()];
+        assert_eq!(pick_default_dataset_file(&files).as_deref(), Some("data/train.txt"));
+
+        let files = vec!["README.md".to_string(), "config.json".to_string()];
+        assert_eq!(pick_default_dataset_file(&files), None);
+
+        assert_eq!(pick_default_dataset_file(&[]), None);
     }
 
     #[test]

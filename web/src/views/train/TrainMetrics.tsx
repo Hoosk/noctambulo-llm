@@ -1,34 +1,21 @@
-import { useEffect, useRef } from "react";
+import { useState } from "react";
 import type { JobInfo } from "../../state/jobModel";
+import { api } from "../../api/client";
+import { Button } from "../../components/Button";
 import { LineChart, type ChartSeries } from "../../components/LineChart";
 import { Badge, StatCard, type Tone } from "../../components/ui";
 import type { IconName } from "../../components/Icon";
 import { fmtDur } from "../../lib/format";
 import { useAppState } from "../../state/appContext";
-
-interface BadgeInfo {
-  tone: Tone;
-  label: string;
-  pulse?: boolean;
-}
+import { useToast } from "../../state/toastContext";
+import { jobBadge } from "./jobBadge";
+import { LogPanel } from "./LogPanel";
 
 interface StatItem {
   label: string;
   value: string;
   icon: IconName;
   tone: Tone;
-}
-
-function jobBadge(job: JobInfo): BadgeInfo {
-  if (job.status === "running") {
-    if (job.paused) return { tone: "amber", label: "paused" };
-    if (job.stopping) return { tone: "amber", label: "stopping" };
-    return { tone: "violet", label: "training", pulse: true };
-  }
-  if (job.status === "done") return { tone: "emerald", label: "completed" };
-  if (job.status === "stopped") return { tone: "amber", label: "stopped" };
-  if (job.status === "error") return { tone: "rose", label: "error" };
-  return { tone: "slate", label: "idle" };
 }
 
 function jobStats(job: JobInfo): StatItem[] {
@@ -46,13 +33,6 @@ function jobStats(job: JobInfo): StatItem[] {
   ];
 }
 
-function lineClass(line: string): string {
-  if (/error|panic|failed|fatal/i.test(line)) return "text-rose-400";
-  if (/warn/i.test(line)) return "text-amber-300";
-  if (/^== |checkpoint/i.test(line)) return "text-violet-300";
-  return "text-slate-400";
-}
-
 function StatsGrid({ job }: { job: JobInfo }) {
   return (
     <div className="grid min-w-0 grid-cols-2 sm:grid-cols-3 gap-3 mb-5">
@@ -65,10 +45,11 @@ function StatsGrid({ job }: { job: JobInfo }) {
 
 function ProgressBar({ job }: { job: JobInfo }) {
   const running = job.status === "running";
+  if (!running) return null;
   // Until the first Progress event the worker is still tokenizing the dataset;
   // there is no percentage yet, so show an indeterminate bar instead of 0%.
-  const preparing = running && job.step === 0;
-  const shimmer = running && !job.paused && !job.stopping;
+  const preparing = job.step === 0;
+  const shimmer = !job.paused && !job.stopping;
   return (
     <div className="mt-5">
       <div className="flex items-center justify-between gap-3 mb-2">
@@ -102,36 +83,6 @@ function PreviewPane({ text }: { text: string }) {
   );
 }
 
-function LogPanel() {
-  const { job } = useAppState();
-  const nodeRef = useRef<HTMLPreElement | null>(null);
-
-  // Lines arrive live over SSE (plus backfill on reconnect), so the panel only
-  // needs to keep itself scrolled to the bottom.
-  useEffect(() => {
-    const node = nodeRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
-  }, [job.logs]);
-
-  return (
-    <details className="mt-5 group" open>
-      <summary className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 cursor-pointer select-none hover:text-slate-300 transition">
-        Worker logs
-      </summary>
-      <pre
-        ref={nodeRef}
-        className="mt-2 p-3 rounded-xl bg-black/40 border border-slate-800/70 text-[11px] font-mono leading-relaxed whitespace-pre-wrap h-44 overflow-y-auto"
-      >
-        {job.logs.map((entry) => (
-          <span key={entry.id} className={`block ${lineClass(entry.text)}`}>
-            {entry.text}
-          </span>
-        ))}
-      </pre>
-    </details>
-  );
-}
-
 function lossSeries(job: JobInfo): ChartSeries[] {
   const series: ChartSeries[] = [
     { label: "train loss", points: job.lossPoints, color: "#8b5cf6" },
@@ -144,21 +95,70 @@ function lossSeries(job: JobInfo): ChartSeries[] {
 
 export function TrainMetrics() {
   const { job } = useAppState();
+  const toast = useToast();
+  const [acting, setActing] = useState(false);
   const badge = jobBadge(job);
+  const running = job.status === "running";
+
+  const act = async (fn: () => Promise<unknown>, done: string) => {
+    if (acting) return;
+    setActing(true);
+    try {
+      await fn();
+      toast.success(done);
+    } catch (e) {
+      toast.error(`Error: ${e instanceof Error ? e.message : "unknown"}`);
+    } finally {
+      setActing(false);
+    }
+  };
 
   return (
     <div className="glass-card rounded-2xl p-5 min-w-0">
-      <div className="flex items-center justify-between gap-3 mb-5">
-        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Live metrics</h3>
-        <Badge tone={badge.tone} pulse={badge.pulse}>
-          {badge.label}
-        </Badge>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
+        <div className="flex items-center gap-3">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            Live metrics
+          </h3>
+          <Badge tone={badge.tone} pulse={badge.pulse}>
+            {badge.label}
+          </Badge>
+        </div>
+        {running ? (
+          <div className="flex gap-2">
+            <Button
+              variant={job.paused ? "success" : "warn"}
+              className="px-3 py-1.5 text-xs"
+              disabled={job.stopping || acting}
+              onClick={() =>
+                void (job.paused
+                  ? act(api.resumeTrain, "Resuming…")
+                  : act(api.pauseTrain, "Pausing…"))
+              }
+            >
+              {job.paused ? "Resume" : "Pause"}
+            </Button>
+            <Button
+              variant="danger"
+              className="px-3 py-1.5 text-xs"
+              disabled={job.stopping || acting}
+              onClick={() => void act(api.stopTrain, "Stopping…")}
+            >
+              {job.stopping ? "Stopping…" : "Stop"}
+            </Button>
+          </div>
+        ) : null}
       </div>
       <StatsGrid job={job} />
       <LineChart series={lossSeries(job)} />
       <ProgressBar job={job} />
       <PreviewPane text={job.preview} />
-      <LogPanel />
+      <details className="mt-5 group" open>
+        <summary className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 cursor-pointer select-none hover:text-slate-300 transition">
+          Worker logs
+        </summary>
+        <LogPanel />
+      </details>
     </div>
   );
 }

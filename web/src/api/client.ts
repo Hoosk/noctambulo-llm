@@ -10,6 +10,7 @@ import type {
   ModelFilesResponse,
   ModelInfo,
   OpStatus,
+  RepoFiles,
   RunRecord,
   RunSummary,
   SystemInfo,
@@ -84,8 +85,10 @@ export const api = {
     request<DatasetDetail>(`/api/datasets/info/${encodeURIComponent(name)}`),
   searchDatasets: (q: string) =>
     request<DatasetHit[]>(`/api/datasets/search?q=${encodeURIComponent(q)}`),
-  downloadDataset: (repoId: string, filename: string) =>
-    request<{ opId: string; status: string }>("/api/datasets/download", {
+  getRepoFiles: (repo: string) =>
+    request<RepoFiles>(`/api/datasets/repo-files?repo=${encodeURIComponent(repo)}`),
+  downloadDataset: (repoId: string, filename = "") =>
+    request<{ opId: string; status: string; file: string }>("/api/datasets/download", {
       method: "POST",
       json: { repoId, filename },
     }),

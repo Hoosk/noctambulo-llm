@@ -40,7 +40,15 @@ export function ExportView() {
     api
       .getModels()
       .then((list) => {
-        if (!cancelled) setModels(list);
+        if (cancelled) return;
+        setModels(list);
+        // Self-heal a stale persisted selection (model deleted/renamed outside
+        // the UI) so Export never posts a non-existent model dir.
+        setModelDir((current) =>
+          current && list.some((m) => m.dir === current)
+            ? current
+            : (list.find((m) => m.default)?.dir ?? list[0]?.dir ?? ""),
+        );
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(e instanceof Error ? e.message : "unknown");
@@ -50,7 +58,9 @@ export function ExportView() {
     };
   }, []);
 
-  const selectedDir = modelDir || models.find((m) => m.default)?.dir || models[0]?.dir || "";
+  const selectedDir = models.some((m) => m.dir === modelDir)
+    ? modelDir
+    : (models.find((m) => m.default)?.dir ?? models[0]?.dir ?? "");
 
   const run = async () => {
     if (running || !selectedDir) return;

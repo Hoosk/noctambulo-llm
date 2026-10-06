@@ -86,6 +86,11 @@ export interface DatasetHit {
   tags: string[];
 }
 
+export interface RepoFiles {
+  files: string[];
+  default: string | null;
+}
+
 export interface DatasetDetail {
   name: string;
   size_bytes: number;

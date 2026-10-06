@@ -28,8 +28,8 @@ use crate::serve::state::ServerState;
 
 use auth::{login, logout, ping};
 use datasets::{
-    dataset_combine, dataset_delete, dataset_download, dataset_info, dataset_rename, dataset_search,
-    datasets,
+    dataset_combine, dataset_delete, dataset_download, dataset_info, dataset_rename,
+    dataset_repo_files, dataset_search, datasets,
 };
 use devices::devices;
 use download::download;
@@ -52,6 +52,7 @@ pub fn router(state: Arc<ServerState>) -> (Router, Arc<JobRegistry>) {
         .route("/api/system", get(system::system))
         .route("/api/datasets", get(datasets))
         .route("/api/datasets/download", post(dataset_download))
+        .route("/api/datasets/repo-files", get(dataset_repo_files))
         .route("/api/datasets/search", get(dataset_search))
         .route("/api/datasets/rename", post(dataset_rename))
         .route("/api/datasets/combine", post(dataset_combine))
