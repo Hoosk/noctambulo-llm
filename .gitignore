@@ -5,21 +5,22 @@
 flamegraph.svg
 heaptrack.*
 
-# Datasets pesados y archivos de datos locales
-datasets/
-dataset_*.txt
-uploads/
+# Datasets pesados y archivos de datos locales (solo en la raíz del repo:
+# sin el slash inicial esto también ignoraba web/src/views/datasets/)
+/datasets/
+/dataset_*.txt
+/uploads/
 
 # Salidas y checkpoints del modelo (cualquier variante)
-model_output*/
-exported/
-checkpoints*/
+/model_output*/
+/exported/
+/checkpoints*/
 *.bin
 
 # Tokenizers y artefactos de entrenamiento
-custom_tokenizer*.json
+/custom_tokenizer*.json
 *.log
-sessions/
+/sessions/
 
 # Configuración sensible (tokens del servidor serve)
 .env
@@ -45,7 +46,7 @@ web/dist/
 
 # Estado del servidor web
 .kuro/
-logs/
+/logs/
 
 # OS y módulos del sistema
 .DS_Store
