@@ -1,6 +1,102 @@
 use crate::config::EvictionGeometry;
 use crate::data::LlmTokenizer;
 use crate::model::{KvCache, KvCacheDtype, Llm};
+
+/// Runtime heavy-hitter eviction options: the trained geometry plus the
+/// optional host-RAM spill archive and budget-growth schedule. Growth starts
+/// from `geometry.budget` and adds `grow_rows` rows every `grow_interval`
+/// processed tokens until `max_budget`; every new slot is filled by replaying
+/// the highest-score spilled rows.
+#[derive(Clone, Copy, Debug)]
+pub struct EvictionOptions {
+    pub geometry: EvictionGeometry,
+    /// Archive evicted rows in host RAM instead of discarding them.
+    pub spill: bool,
+    /// Physical cache rows (replay ceiling). `0` = the initial budget.
+    pub max_budget: usize,
+    /// Rows added to the resident budget per growth step (0 = no growth).
+    pub grow_rows: usize,
+    /// Processed tokens between growth steps (0 = no growth).
+    pub grow_interval: usize,
+}
+
+impl From<EvictionGeometry> for EvictionOptions {
+    fn from(geometry: EvictionGeometry) -> Self {
+        Self {
+            geometry,
+            spill: false,
+            max_budget: 0,
+            grow_rows: 0,
+            grow_interval: 0,
+        }
+    }
+}
+
+impl EvictionOptions {
+    /// Physical cache capacity (replay ceiling), clamped to the context by the
+    /// caller.
+    pub fn capacity(&self) -> usize {
+        if self.max_budget > 0 {
+            self.max_budget.max(self.geometry.budget)
+        } else {
+            self.geometry.budget
+        }
+    }
+
+    /// Rejects impossible combinations before any model is loaded.
+    pub fn validate(&self) -> Result<(), String> {
+        if (self.spill || self.grow_rows > 0 || self.max_budget > 0)
+            && self.geometry.budget == 0
+        {
+            return Err("KV spill/growth requires heavy-hitter eviction (kv_eviction=h2o)".into());
+        }
+        if self.max_budget > 0 && self.max_budget < self.geometry.budget {
+            return Err(format!(
+                "kv_max_budget ({}) cannot be smaller than the initial budget ({})",
+                self.max_budget, self.geometry.budget
+            ));
+        }
+        if self.grow_rows > 0 && self.geometry.budget == self.capacity() {
+            return Err(
+                "kv_grow needs kv_max_budget greater than the initial budget".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Advances the budget-growth schedule: adds `grow_rows` rows to every cache
+/// budget each `grow_interval` processed tokens (spill replay fills the slots).
+/// Returns the number of replayed rows.
+fn advance_growth<B: Backend>(
+    caches: &mut [KvCache<B>],
+    grow_rows: usize,
+    grow_interval: usize,
+    since_growth: &mut usize,
+    processed: usize,
+) -> usize {
+    if grow_rows == 0 || grow_interval == 0 {
+        return 0;
+    }
+    *since_growth += processed;
+    let mut replayed = 0;
+    while *since_growth >= grow_interval {
+        *since_growth -= grow_interval;
+        let mut grew = false;
+        for cache in caches.iter_mut() {
+            if cache.budget < cache.capacity {
+                replayed += cache.grow_and_replay(grow_rows);
+                grew = true;
+            } else {
+                replayed += cache.replay_spilled();
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    replayed
+}
 use burn::tensor::backend::Backend;
 use burn::tensor::{Int, Tensor, TensorData};
 use std::time::Instant;
@@ -165,7 +261,7 @@ pub fn generate<B: Backend>(
     repetition_penalty: f32,
     seed: u64,
     cache_dtype: KvCacheDtype,
-    eviction: Option<EvictionGeometry>,
+    eviction: Option<EvictionOptions>,
     device: &B::Device,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     generate_streaming(
@@ -190,7 +286,7 @@ pub fn generate_streaming<B: Backend>(
     repetition_penalty: f32,
     seed: u64,
     cache_dtype: KvCacheDtype,
-    eviction: Option<EvictionGeometry>,
+    eviction: Option<EvictionOptions>,
     device: &B::Device,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -202,11 +298,11 @@ pub fn generate_streaming<B: Backend>(
 
     // `max_seq_len` is the trained context window extended by the active RoPE
     // scaling factor (equal to `n_ctx` when scaling is off); the cache
-    // capacity is the eviction budget when heavy-hitter eviction is enabled,
-    // otherwise the per-layer size bounded by the sliding window.
+    // capacity is the eviction budget (or its replay ceiling when the budget
+    // grows), otherwise the per-layer size bounded by the sliding window.
     let max_seq = model.max_seq_len();
-    let capacity = match eviction {
-        Some(geo) => geo.budget.min(max_seq),
+    let capacity = match &eviction {
+        Some(opts) => opts.capacity().min(max_seq),
         None => model.kv_capacity(),
     };
     if tokens.len() > max_seq {
@@ -225,28 +321,69 @@ pub fn generate_streaming<B: Backend>(
     let mut decode_stream = tokenizer.decode_stream(true);
 
     let mut caches: Vec<KvCache<B>> = model.new_kv_caches(capacity, cache_dtype, device);
-    if let Some(geo) = eviction {
+    let mut since_growth = 0usize;
+    if let Some(opts) = &eviction {
+        let geo = opts.geometry;
+        let budget = geo.budget.min(capacity);
         for cache in caches.iter_mut() {
-            cache.enable_eviction(geo.recent);
+            cache.enable_eviction_with(geo.recent, budget, opts.spill);
         }
+        let growth = if opts.grow_rows > 0 && opts.grow_interval > 0 {
+            format!(
+                ", growing to {} rows ({} every {} tokens)",
+                capacity, opts.grow_rows, opts.grow_interval
+            )
+        } else {
+            String::new()
+        };
+        let spill = if opts.spill { ", spill to host RAM" } else { "" };
         println!(
-            "\n[KV cache: heavy-hitter eviction, budget {} rows ({} sinks, {} recent, {} hitters)]",
-            capacity, geo.sinks, geo.recent, capacity.saturating_sub(geo.sinks + geo.recent)
+            "\n[KV cache: heavy-hitter eviction, budget {} rows ({} sinks, {} recent, {} hitters){growth}{spill}]",
+            budget,
+            geo.sinks,
+            geo.recent,
+            budget.saturating_sub(geo.sinks + geo.recent)
         );
     }
 
-    // 1. Prefill Phase: process the prompt in chunks of at most `capacity`
-    // tokens so a ring cache never sees duplicate slots in a single call.
+    // 1. Prefill Phase: process the prompt in chunks that are homogeneous for
+    // the cache policy. A ring cache takes at most `capacity` rows per call;
+    // with eviction, a call either appends only (chunk <= free rows) or evicts
+    // only (chunk <= evictable rows = budget - sinks - recent), so a victim is
+    // always available and no slot is written twice in one call.
     let prompt_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let prompt_len = prompt_i32.len();
     let mut last_logits: Option<Tensor<B, 3>> = None;
     let mut pos = 0;
     while pos < prompt_len {
-        let chunk = (prompt_len - pos).min(capacity);
+        let step = if caches[0].eviction_enabled() {
+            let free = caches[0].budget.saturating_sub(caches[0].len);
+            let evictable = caches[0]
+                .budget
+                .saturating_sub(caches[0].recent + model.sink_tokens())
+                .max(1);
+            if free > 0 {
+                free.min(evictable)
+            } else {
+                evictable
+            }
+        } else {
+            capacity
+        };
+        let chunk = (prompt_len - pos).min(step);
         let chunk_data = prompt_i32[pos..(pos + chunk)].to_vec();
         let input =
             Tensor::<B, 2, Int>::from_data(TensorData::new(chunk_data, [1, chunk]), device);
         let logits = model.forward_with_cache(input, pos, &mut caches);
+        if let Some(opts) = &eviction {
+            advance_growth(
+                &mut caches,
+                opts.grow_rows,
+                opts.grow_interval,
+                &mut since_growth,
+                chunk,
+            );
+        }
         if pos + chunk == prompt_len {
             last_logits = Some(logits.slice([0..1, (chunk - 1)..chunk]));
         }
@@ -300,6 +437,15 @@ pub fn generate_streaming<B: Backend>(
         let input = Tensor::<B, 2, Int>::from_data(input_data, device);
 
         let logits = model.forward_with_cache(input, start_pos, &mut caches);
+        if let Some(opts) = &eviction {
+            advance_growth(
+                &mut caches,
+                opts.grow_rows,
+                opts.grow_interval,
+                &mut since_growth,
+                1,
+            );
+        }
         let last_logits = logits.slice([0..1, 0..1]);
         let mut logits_vec: Vec<f32> = last_logits
             .into_data()
@@ -337,6 +483,32 @@ pub fn generate_streaming<B: Backend>(
     let speed = if elapsed > 0.0 { generated_count as f64 / elapsed } else { 0.0 };
 
     let decoded_text = tokenizer.decode(&tokens)?;
+    if let Some(opts) = &eviction {
+        if opts.spill || opts.grow_rows > 0 {
+            let spilled: usize = caches.iter().map(|c| c.spilled_total).sum();
+            let replayed: usize = caches.iter().map(|c| c.replayed_total).sum();
+            let pending: usize = caches
+                .iter()
+                .filter_map(|c| c.spill.as_ref())
+                .map(|s| s.len())
+                .sum();
+            let bytes: usize = caches
+                .iter()
+                .filter_map(|c| c.spill.as_ref())
+                .map(|s| s.bytes())
+                .sum();
+            let budget = caches.first().map(|c| c.budget).unwrap_or(0);
+            println!(
+                "\n[KV spill: {} rows archived in host RAM ({:.2} MB), {} replayed, {} still spilled; resident budget {} / {} rows]",
+                spilled,
+                bytes as f64 / (1024.0 * 1024.0),
+                replayed,
+                pending,
+                budget,
+                capacity
+            );
+        }
+    }
     println!(
         "\n[Generation Complete: {} tokens generated in {:.2}s ({:.1} tokens/sec)]",
         generated_count, elapsed, speed
@@ -388,6 +560,37 @@ mod tests {
 
         let token = sample_logits(&mut logits, &tokens, 0.001, 1, 1.0, 0.0, 1.0, &mut rng);
         assert_eq!(token, 1); // highest score index is 1
+    }
+
+    #[test]
+    fn test_eviction_options_validate() {
+        let geometry = EvictionGeometry { budget: 128, recent: 16, sinks: 4, hitters: 108 };
+        let base = EvictionOptions::from(geometry);
+        assert!(base.validate().is_ok());
+        assert_eq!(base.capacity(), 128);
+
+        // Spill alone is always valid; growth needs headroom.
+        assert!(EvictionOptions { spill: true, ..base }.validate().is_ok());
+        let err = EvictionOptions { grow_rows: 32, ..base }
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("kv_max_budget"), "{err}");
+
+        let ok = EvictionOptions {
+            spill: true,
+            max_budget: 512,
+            grow_rows: 32,
+            grow_interval: 64,
+            ..base
+        };
+        assert!(ok.validate().is_ok());
+        assert_eq!(ok.capacity(), 512);
+
+        // The ceiling cannot undercut the initial budget.
+        let err = EvictionOptions { max_budget: 64, ..base }
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("smaller"), "{err}");
     }
 }
 

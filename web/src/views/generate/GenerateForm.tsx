@@ -17,6 +17,10 @@ export interface GenForm {
   kvEviction: string;
   kvBudget: string;
   kvRecent: string;
+  kvSpill: boolean;
+  kvMaxBudget: string;
+  kvGrow: string;
+  kvGrowInterval: string;
 }
 
 interface Props {
@@ -24,7 +28,7 @@ interface Props {
   modelDir: string;
   onModelChange: (dir: string) => void;
   form: GenForm;
-  onField: (key: keyof GenForm, value: string) => void;
+  onField: (key: keyof GenForm, value: string | boolean) => void;
   busy: boolean;
   onRun: () => void;
   onStop: () => void;
@@ -173,6 +177,55 @@ export function GenerateForm({
         Heavy-hitter eviction bounds the cache to the budget, keeping sinks, recent tokens and the rows
         with the highest accumulated attention. Empty/0 keeps the checkpoint config.
       </p>
+
+      <details className="mt-2 rounded-xl border border-slate-800/70 bg-slate-950/30 px-3 py-2">
+        <summary className="text-xs text-slate-400 cursor-pointer select-none">
+          Spill to host RAM (advanced)
+        </summary>
+        <label className="flex items-center gap-2.5 text-xs text-slate-400 cursor-pointer select-none mt-3">
+          <input
+            type="checkbox"
+            checked={form.kvSpill}
+            onChange={(e) => onField("kvSpill", e.target.checked)}
+            className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+          />
+          Archive evicted rows in host RAM and replay them
+        </label>
+        <div className="grid grid-cols-3 gap-3 mt-3">
+          <Field label="Max budget (rows)">
+            <Input
+              type="number"
+              min={0}
+              step={64}
+              placeholder="= budget"
+              value={form.kvMaxBudget}
+              onChange={(e) => onField("kvMaxBudget", e.target.value)}
+            />
+          </Field>
+          <Field label="Grow rows">
+            <Input
+              type="number"
+              min={0}
+              step={32}
+              value={form.kvGrow}
+              onChange={(e) => onField("kvGrow", e.target.value)}
+            />
+          </Field>
+          <Field label="Grow every (tokens)">
+            <Input
+              type="number"
+              min={1}
+              step={16}
+              value={form.kvGrowInterval}
+              onChange={(e) => onField("kvGrowInterval", e.target.value)}
+            />
+          </Field>
+        </div>
+        <p className="text-[10px] text-slate-500 mt-2">
+          With spill on, the resident budget can grow up to the max budget, refilling each new slot with
+          the highest-score archived rows. Growth needs h2o eviction and a max budget above the initial one.
+        </p>
+      </details>
 
       <div className="mt-5 flex gap-3">
         <Button variant="primary" disabled={busy || !modelDir} onClick={onRun}>

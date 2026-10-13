@@ -971,7 +971,11 @@ pub fn train_with_events<B: AutodiffBackend>(
             1.1,
             42 + epoch as u64,
             crate::model::KvCacheDtype::F32,
-            model_config.eviction_geometry().ok().flatten(),
+            model_config
+                .eviction_geometry()
+                .ok()
+                .flatten()
+                .map(crate::generate::EvictionOptions::from),
             device,
         ).ok();
 

@@ -49,6 +49,18 @@ pub(super) struct GenerateRequest {
     /// Recent tokens never evicted; 0/absent keeps the checkpoint config.
     #[serde(default)]
     kv_recent: Option<usize>,
+    /// Archive evicted rows in host RAM instead of discarding them.
+    #[serde(default)]
+    kv_spill: Option<bool>,
+    /// Physical cache rows (replay ceiling); 0/absent = the initial budget.
+    #[serde(default)]
+    kv_max_budget: Option<usize>,
+    /// Rows added to the resident budget per growth step.
+    #[serde(default)]
+    kv_grow: Option<usize>,
+    /// Processed tokens between growth steps.
+    #[serde(default)]
+    kv_grow_interval: Option<usize>,
 }
 
 fn default_max_new_tokens() -> usize {
@@ -95,6 +107,10 @@ struct Sampling {
     kv_eviction: String,
     kv_budget: usize,
     kv_recent: usize,
+    kv_spill: bool,
+    kv_max_budget: usize,
+    kv_grow: usize,
+    kv_grow_interval: usize,
 }
 
 impl Sampling {
@@ -133,6 +149,10 @@ impl Sampling {
             kv_eviction: req.kv_eviction.unwrap_or_default(),
             kv_budget: req.kv_budget.unwrap_or(0),
             kv_recent: req.kv_recent.unwrap_or(0),
+            kv_spill: req.kv_spill.unwrap_or(false),
+            kv_max_budget: req.kv_max_budget.unwrap_or(0),
+            kv_grow: req.kv_grow.unwrap_or(0),
+            kv_grow_interval: req.kv_grow_interval.unwrap_or(64),
         })
     }
 }
@@ -212,9 +232,29 @@ fn run_generate(
     config.set_rope_scaling(s.rope_kind, s.rope_factor);
     // Same for eviction: empty policy / zero knobs keep the checkpoint config.
     config.set_kv_eviction(&s.kv_eviction, s.kv_budget, s.kv_recent);
-    let eviction = config
+    let eviction = match config
         .eviction_geometry()
-        .map_err(|e| format!("invalid KV eviction config: {e}"))?;
+        .map_err(|e| format!("invalid KV eviction config: {e}"))?
+    {
+        Some(geometry) => {
+            let opts = crate::generate::EvictionOptions {
+                geometry,
+                spill: s.kv_spill,
+                max_budget: s.kv_max_budget,
+                grow_rows: s.kv_grow,
+                grow_interval: s.kv_grow_interval,
+            };
+            opts.validate()
+                .map_err(|e| format!("invalid KV spill config: {e}"))?;
+            Some(opts)
+        }
+        None => {
+            if s.kv_spill || s.kv_max_budget > 0 || s.kv_grow > 0 {
+                return Err("kvSpill / kvMaxBudget / kvGrow require kvEviction=h2o".into());
+            }
+            None
+        }
+    };
 
     let tokenizer = crate::data::resolve_tokenizer(Some(model_dir.as_path()))
         .map_err(|e| format!("tokenizer not found: {e}"))?;
@@ -243,7 +283,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
     weights_path: std::path::PathBuf,
     tokenizer: crate::data::LlmTokenizer,
     s: Sampling,
-    eviction: Option<crate::config::EvictionGeometry>,
+    eviction: Option<crate::generate::EvictionOptions>,
     stream: bool,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String, String> {

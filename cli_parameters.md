@@ -117,6 +117,10 @@ Performs autoregressive text inference using the model loaded from `--model-dir`
 | `--kv-eviction` | `String` | `""` | Eviction override: `h2o`, `none` or empty to keep the checkpoint config. |
 | `--kv-budget` | `usize` | `0` | Resident KV cache rows (`0` = checkpoint config). The generation loop still runs to the RoPE-extended context. |
 | `--kv-recent` | `usize` | `0` | Recent tokens never evicted (`0` = checkpoint config). |
+| `--kv-spill` | `bool` (flag) | `false` | Archive rows evicted by H2O in host RAM (f32, with position and score) instead of discarding them. Requires `--kv-eviction h2o`. |
+| `--kv-max-budget` | `usize` | `0` | Physical cache rows (replay ceiling); `0` = the initial budget. Must be at least the initial budget. |
+| `--kv-grow` | `usize` | `0` | Rows added to the resident budget per growth step (requires `--kv-max-budget` above the initial budget). |
+| `--kv-grow-interval` | `usize` | `64` | Processed tokens between growth steps; each new slot is filled by replaying the highest-score spilled rows. |
 
 ---
 

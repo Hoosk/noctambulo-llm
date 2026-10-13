@@ -22,6 +22,10 @@ const DEFAULT_FORM: GenForm = {
   kvEviction: "",
   kvBudget: "",
   kvRecent: "",
+  kvSpill: false,
+  kvMaxBudget: "",
+  kvGrow: "",
+  kvGrowInterval: "64",
 };
 
 interface RunStatus {
@@ -69,7 +73,8 @@ export function GenerateView() {
   const selectedDir = models.some((m) => m.dir === modelDir)
     ? modelDir
     : (models.find((m) => m.default)?.dir ?? models[0]?.dir ?? "");
-  const onField = (key: keyof GenForm, value: string) => setForm((f) => ({ ...f, [key]: value }));
+  const onField = (key: keyof GenForm, value: string | boolean) =>
+    setForm((f) => ({ ...f, [key]: value }) as GenForm);
 
   const run = async () => {
     if (busy || !selectedDir) return;
@@ -116,6 +121,10 @@ export function GenerateView() {
           kvEviction: form.kvEviction || undefined,
           kvBudget: Number(form.kvBudget) || 0,
           kvRecent: Number(form.kvRecent) || 0,
+          kvSpill: form.kvSpill,
+          kvMaxBudget: Number(form.kvMaxBudget) || 0,
+          kvGrow: Number(form.kvGrow) || 0,
+          kvGrowInterval: Number(form.kvGrowInterval) || 64,
         }),
         signal: controller.signal,
       });

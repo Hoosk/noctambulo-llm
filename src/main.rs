@@ -410,6 +410,20 @@ struct GenerateArgs {
     /// Recent tokens never evicted; 0 keeps the checkpoint config
     #[arg(long, default_value_t = 0)]
     kv_recent: usize,
+    /// Archive rows evicted by heavy-hitter eviction in host RAM instead of
+    /// discarding them (requires --kv-eviction h2o)
+    #[arg(long)]
+    kv_spill: bool,
+    /// Physical cache rows (replay ceiling); 0 = the initial budget
+    #[arg(long, default_value_t = 0)]
+    kv_max_budget: usize,
+    /// Rows added to the resident budget per growth step (requires
+    /// --kv-max-budget greater than the initial budget)
+    #[arg(long, default_value_t = 0)]
+    kv_grow: usize,
+    /// Processed tokens between growth steps
+    #[arg(long, default_value_t = 64)]
+    kv_grow_interval: usize,
 }
 
 #[derive(Args)]
@@ -445,7 +459,7 @@ fn run_generate<B: Backend>(
     device: &B::Device,
     args: &GenerateArgs,
     cache_dtype: crate::model::KvCacheDtype,
-    eviction: Option<crate::config::EvictionGeometry>,
+    eviction: Option<crate::generate::EvictionOptions>,
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let model: Llm<B> = model_config.init_model(device);
@@ -849,7 +863,28 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // the checkpoint config. The geometry is validated here so an
             // impossible budget fails before the model is loaded.
             model_config.set_kv_eviction(&args.kv_eviction, args.kv_budget, args.kv_recent);
-            let eviction = model_config.eviction_geometry()?;
+            let eviction = match model_config.eviction_geometry()? {
+                Some(geometry) => {
+                    let opts = crate::generate::EvictionOptions {
+                        geometry,
+                        spill: args.kv_spill,
+                        max_budget: args.kv_max_budget,
+                        grow_rows: args.kv_grow,
+                        grow_interval: args.kv_grow_interval,
+                    };
+                    opts.validate()?;
+                    Some(opts)
+                }
+                None => {
+                    if args.kv_spill || args.kv_max_budget > 0 || args.kv_grow > 0 {
+                        return Err(
+                            "--kv-spill / --kv-max-budget / --kv-grow require --kv-eviction h2o"
+                                .into(),
+                        );
+                    }
+                    None
+                }
+            };
 
             let cache_dtype = crate::model::KvCacheDtype::parse(&args.kv_cache_dtype)?;
             match (dtype, cache_dtype) {

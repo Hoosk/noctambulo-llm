@@ -225,6 +225,63 @@ fn assert_f16_storage<B: Backend>(device: &B::Device) {
 /// place when the handle has a single owner. This removes the per-token
 /// `Tensor::cat` reallocation the engine used to do, which copied the whole
 /// cache on every decoded token. Quantized dtypes store packed i32 words plus
+/// One evicted cache row archived in host RAM, in f32 and flat
+/// (head, dim) layout for K/V (or the latent for MLA).
+#[derive(Clone, Debug)]
+struct SpilledRow {
+    /// Absolute position the row was cached at.
+    position: usize,
+    /// Accumulated attention score when the row was evicted.
+    score: f32,
+    k: Vec<f32>,
+    /// Empty for MLA caches (only the latent is stored).
+    v: Vec<f32>,
+}
+
+/// Host-RAM archive of rows evicted by heavy-hitter eviction. Rows are stored
+/// in f32 regardless of the cache storage dtype, so a replayed row re-enters
+/// the cache through the same quantization path as a fresh row. Bounded by the
+/// model context window (`max_seq` rows at most).
+#[derive(Clone, Debug, Default)]
+pub struct SpillStore {
+    rows: Vec<SpilledRow>,
+}
+
+impl SpillStore {
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Host bytes held by the archive (values + position + score + lengths).
+    pub fn bytes(&self) -> usize {
+        self.rows
+            .iter()
+            .map(|r| 2 * std::mem::size_of::<usize>() + 4 * (r.k.len() + r.v.len() + 1))
+            .sum()
+    }
+
+    fn push(&mut self, row: SpilledRow) {
+        self.rows.push(row);
+    }
+
+    /// Highest-score row first; ties break towards the newest position, which
+    /// is what a denser cache would have kept.
+    fn pop_best(&mut self) -> Option<SpilledRow> {
+        let idx = self
+            .rows
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.position.cmp(&b.position))
+            })
+            .map(|(i, _)| i)?;
+        Some(self.rows.swap_remove(idx))
+    }
+}
+
 /// per-block f32 scales.
 #[derive(Clone, Debug)]
 pub struct KvCache<B: Backend> {
@@ -235,9 +292,9 @@ pub struct KvCache<B: Backend> {
     pub ks: Option<Tensor<B, 2>>,
     pub vq: Option<Tensor<B, 2, Int>>,
     pub vs: Option<Tensor<B, 2>>,
-    /// Number of valid rows (`<= capacity`).
+    /// Number of valid rows (`<= budget`).
     pub len: usize,
-    /// Number of ring slots (window + sinks, or the full context window).
+    /// Physical rows allocated (the replay ceiling when the budget grows).
     pub capacity: usize,
     /// Absolute position stored in each ring slot (`usize::MAX` = empty).
     pub positions: Vec<usize>,
@@ -249,6 +306,14 @@ pub struct KvCache<B: Backend> {
     pub scores: Option<Tensor<B, 1>>,
     /// Most recent tokens protected from eviction (0 when disabled).
     pub recent: usize,
+    /// Current resident limit (`<= capacity`); grows with spill replay.
+    pub budget: usize,
+    /// Host-RAM archive of evicted rows (`None` = eviction discards them).
+    pub spill: Option<SpillStore>,
+    /// Rows archived by eviction (cumulative, for reporting).
+    pub spilled_total: usize,
+    /// Rows restored by replay (cumulative, for reporting).
+    pub replayed_total: usize,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -297,6 +362,10 @@ impl<B: Backend> KvCache<B> {
                 dtype,
                 scores: None,
                 recent: 0,
+                budget: capacity,
+                spill: None,
+                spilled_total: 0,
+                replayed_total: 0,
             };
         }
         let shape = [batch, n_kv_head, capacity, head_dim];
@@ -322,6 +391,10 @@ impl<B: Backend> KvCache<B> {
             dtype,
             scores: None,
             recent: 0,
+            budget: capacity,
+            spill: None,
+            spilled_total: 0,
+            replayed_total: 0,
         }
     }
 
@@ -382,6 +455,10 @@ impl<B: Backend> KvCache<B> {
                 dtype,
                 scores: None,
                 recent: 0,
+                budget: capacity,
+                spill: None,
+                spilled_total: 0,
+                replayed_total: 0,
             };
         }
         let k: Tensor<B, 4> = Tensor::zeros([batch, heads, capacity, dim], device);
@@ -403,12 +480,17 @@ impl<B: Backend> KvCache<B> {
             dtype,
             scores: None,
             recent: 0,
+            budget: capacity,
+            spill: None,
+            spilled_total: 0,
+            replayed_total: 0,
         }
     }
 
-    /// Turns on heavy-hitter eviction: allocates the f32 attention-mass
-    /// accumulator and protects the last `recent` tokens from eviction.
-    pub fn enable_eviction(&mut self, recent: usize) {
+    /// Full version of the eviction setup: bounds the resident rows to
+    /// `budget` (`<= capacity`) and, when `spill` is set, archives evicted rows
+    /// in host RAM so they can be replayed into slots freed by budget growth.
+    pub fn enable_eviction_with(&mut self, recent: usize, budget: usize, spill: bool) {
         let device = match (&self.k, &self.v, &self.kq) {
             (Some(k), _, _) => k.device(),
             (_, Some(v), _) => v.device(),
@@ -417,10 +499,132 @@ impl<B: Backend> KvCache<B> {
         };
         self.scores = Some(Tensor::zeros([self.capacity], &device));
         self.recent = recent;
+        self.budget = budget.clamp(1, self.capacity);
+        self.spill = spill.then(SpillStore::default);
+        self.spilled_total = 0;
+        self.replayed_total = 0;
     }
 
     pub fn eviction_enabled(&self) -> bool {
         self.scores.is_some()
+    }
+
+    /// Grows the resident budget by `rows` (clamped to `capacity`) and replays
+    /// the highest-score archived rows to fill the new slots. Returns the
+    /// number of replayed rows.
+    pub fn grow_and_replay(&mut self, rows: usize) -> usize {
+        self.budget = (self.budget + rows).min(self.capacity);
+        self.replay_spilled()
+    }
+
+    /// Replays the highest-score archived rows until the resident budget is
+    /// full or the archive runs out. Returns the number of replayed rows.
+    pub fn replay_spilled(&mut self) -> usize {
+        if self.spill.is_none() {
+            return 0;
+        }
+        let mut rows = Vec::new();
+        while self.len < self.budget {
+            match self.spill.as_mut().and_then(SpillStore::pop_best) {
+                Some(row) => rows.push(row),
+                None => break,
+            }
+        }
+        let replayed = rows.len();
+        for row in rows {
+            self.write_replayed_row(row);
+        }
+        self.replayed_total += replayed;
+        replayed
+    }
+
+    /// Writes an archived row into the first free slot (`len`, which is always
+    /// virgin after a budget growth) restoring its position and score. The row
+    /// re-enters through the storage quantization path, like a fresh row.
+    fn write_replayed_row(&mut self, row: SpilledRow) {
+        let slot = self.len;
+        assert!(slot < self.capacity, "replay needs a free cache slot");
+
+        if self.dtype.is_quantized() {
+            let words = self
+                .kq
+                .as_ref()
+                .expect("quantized cache kq buffer")
+                .dims()[1];
+            let row_len = words * self.dtype.pack();
+            let blocks = row_len / quant_block(row_len);
+            let device = self
+                .kq
+                .as_ref()
+                .expect("quantized cache kq buffer")
+                .device();
+            let k = Tensor::<B, 2>::from_data(TensorData::new(row.k, [1, row_len]), &device);
+            let (kq_row, ks_row) = quantize_rows(k, self.dtype);
+            let mut kq = self.kq.take().expect("kv cache kq buffer");
+            kq = kq.slice_assign([slot..slot + 1, 0..words], kq_row);
+            self.kq = Some(kq);
+            let mut ks = self.ks.take().expect("kv cache ks buffer");
+            ks = ks.slice_assign([slot..slot + 1, 0..blocks], ks_row);
+            self.ks = Some(ks);
+
+            if !row.v.is_empty() {
+                let v = Tensor::<B, 2>::from_data(TensorData::new(row.v, [1, row_len]), &device);
+                let (vq_row, vs_row) = quantize_rows(v, self.dtype);
+                let mut vq = self.vq.take().expect("kv cache vq buffer");
+                vq = vq.slice_assign([slot..slot + 1, 0..words], vq_row);
+                self.vq = Some(vq);
+                let mut vs = self.vs.take().expect("kv cache vs buffer");
+                vs = vs.slice_assign([slot..slot + 1, 0..blocks], vs_row);
+                self.vs = Some(vs);
+            }
+        } else {
+            let (heads, dim, device) = match (&self.k, &self.v) {
+                (Some(k), _) => {
+                    let dims = k.dims();
+                    (dims[1], dims[3], k.device())
+                }
+                (_, Some(v)) => {
+                    let dims = v.dims();
+                    (dims[1], dims[3], v.device())
+                }
+                _ => panic!("kv cache has no storage"),
+            };
+            let to_storage = |t: Tensor<B, 4>| {
+                if self.dtype == KvCacheDtype::F16 || backend_is_f16::<B>() {
+                    t.cast(FloatDType::F16)
+                } else {
+                    t
+                }
+            };
+            let k = Tensor::<B, 4>::from_data(
+                TensorData::new(row.k, [1, heads, 1, dim]),
+                &device,
+            );
+            let mut k_buf = self.k.take().expect("kv cache k buffer");
+            k_buf = k_buf.slice_assign([0..1, 0..heads, slot..slot + 1, 0..dim], to_storage(k));
+            self.k = Some(k_buf);
+
+            if !row.v.is_empty() {
+                let v = Tensor::<B, 4>::from_data(
+                    TensorData::new(row.v, [1, heads, 1, dim]),
+                    &device,
+                );
+                let mut v_buf = self.v.take().expect("kv cache v buffer");
+                v_buf = v_buf.slice_assign([0..1, 0..heads, slot..slot + 1, 0..dim], to_storage(v));
+                self.v = Some(v_buf);
+            }
+        }
+
+        self.positions[slot] = row.position;
+        let scores = self.scores.take().expect("eviction scores accumulator");
+        let device = scores.device();
+        let value = Tensor::<B, 1>::from_data(TensorData::new(vec![row.score], [1]), &device);
+        // `slice_assign` takes `[Range; N]`; the single-range array is the
+        // intended API here.
+        #[allow(clippy::single_range_in_vec_init)]
+        let scores = scores.slice_assign([slot..slot + 1], value);
+        self.scores = Some(scores);
+        self.len += 1;
     }
 }
 
@@ -952,13 +1156,13 @@ fn alloc_evict_slots<B: Backend>(
     sink_tokens: usize,
 ) -> Vec<usize> {
     assert!(
-        cache.capacity > sink_tokens + cache.recent,
+        cache.budget > sink_tokens + cache.recent,
         "KV budget ({}) must exceed sink tokens ({}) + recent tokens ({})",
-        cache.capacity,
+        cache.budget,
         sink_tokens,
         cache.recent
     );
-    let scores_host: Option<Vec<f32>> = if cache.len + new_seq_len > cache.capacity {
+    let scores_host: Option<Vec<f32>> = if cache.len + new_seq_len > cache.budget {
         Some(
             cache
                 .scores
@@ -975,12 +1179,19 @@ fn alloc_evict_slots<B: Backend>(
 
     let mut slots = Vec::with_capacity(new_seq_len);
     let mut victims: Vec<usize> = Vec::new();
+    // Slots assigned by this same call but not written yet (their row data
+    // only exists after `alloc` returns), so they cannot be archived.
+    let mut appended: Vec<usize> = Vec::new();
+    // (slot, old position, old score) of every recycled row, archived before
+    // the buffer is overwritten.
+    let mut archived: Vec<(usize, usize, f32)> = Vec::new();
     for offset in 0..new_seq_len {
         let pos = start_pos + offset;
-        if cache.len < cache.capacity {
+        if cache.len < cache.budget {
             let slot = cache.len;
             cache.len += 1;
             cache.positions[slot] = pos;
+            appended.push(slot);
             slots.push(slot);
             continue;
         }
@@ -994,7 +1205,6 @@ fn alloc_evict_slots<B: Backend>(
                     && p >= sink_tokens
                     && p < cutoff
                     && !victims.contains(&s)
-                    && !slots.contains(&s)
             })
             .min_by(|&a, &b| {
                 scores[a]
@@ -1003,9 +1213,20 @@ fn alloc_evict_slots<B: Backend>(
                     .then_with(|| cache.positions[a].cmp(&cache.positions[b]))
             })
             .expect("budget must exceed sinks + recent so a victim exists");
+        if appended.contains(&victim) {
+            // Reusing a slot assigned earlier in this call: its row was never
+            // written, so there is nothing to archive. The resident count is
+            // unchanged (one row replaces another).
+        } else {
+            archived.push((victim, cache.positions[victim], scores[victim]));
+        }
         cache.positions[victim] = pos;
         victims.push(victim);
         slots.push(victim);
+    }
+
+    if !archived.is_empty() && cache.spill.is_some() {
+        spill_rows(cache, &archived);
     }
 
     if !victims.is_empty() {
@@ -1025,6 +1246,99 @@ fn alloc_evict_slots<B: Backend>(
         cache.scores = Some(scores);
     }
     slots
+}
+
+/// Archives the rows at `(slot, old_position, old_score)` in the cache spill
+/// store as f32 flat vectors. Reads every victim with one device transfer by
+/// concatenating their slices first.
+fn spill_rows<B: Backend>(cache: &mut KvCache<B>, rows: &[(usize, usize, f32)]) {
+    let slots: Vec<usize> = rows.iter().map(|r| r.0).collect();
+    let (k_rows, v_rows) = read_rows_f32(cache, &slots);
+    let n = slots.len();
+    let row_len = k_rows.len() / n;
+    let spill = cache.spill.as_mut().expect("spill store enabled");
+    for (i, (_, position, score)) in rows.iter().enumerate() {
+        let k = k_rows[i * row_len..(i + 1) * row_len].to_vec();
+        let v = if v_rows.is_empty() {
+            Vec::new()
+        } else {
+            v_rows[i * row_len..(i + 1) * row_len].to_vec()
+        };
+        spill.push(SpilledRow {
+            position: *position,
+            score: *score,
+            k,
+            v,
+        });
+    }
+    cache.spilled_total += n;
+}
+
+/// Reads the cache rows at `slots` as f32 flat `(head, dim)` vectors (the
+/// latent for MLA caches). `v` is empty when the cache stores no V buffer.
+fn read_rows_f32<B: Backend>(cache: &KvCache<B>, slots: &[usize]) -> (Vec<f32>, Vec<f32>) {
+    if cache.dtype.is_quantized() {
+        let kq = cache.kq.as_ref().expect("quantized cache kq buffer");
+        let words = kq.dims()[1];
+        let k_parts: Vec<_> = slots
+            .iter()
+            .map(|&s| kq.clone().slice([s..s + 1, 0..words]))
+            .collect();
+        let k_packed = Tensor::cat(k_parts, 0);
+        let ks = cache.ks.as_ref().expect("quantized cache ks buffer");
+        let blocks = ks.dims()[1];
+        let ks_parts: Vec<_> = slots
+            .iter()
+            .map(|&s| ks.clone().slice([s..s + 1, 0..blocks]))
+            .collect();
+        let k_scales = Tensor::cat(ks_parts, 0);
+        let k = dequantize_rows(k_packed, k_scales, cache.dtype)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("f32 dequantized rows");
+
+        let mut v = Vec::new();
+        if let Some(vq) = &cache.vq {
+            let v_parts: Vec<_> = slots
+                .iter()
+                .map(|&s| vq.clone().slice([s..s + 1, 0..words]))
+                .collect();
+            let v_packed = Tensor::cat(v_parts, 0);
+            let vs = cache.vs.as_ref().expect("quantized cache vs buffer");
+            let vs_parts: Vec<_> = slots
+                .iter()
+                .map(|&s| vs.clone().slice([s..s + 1, 0..blocks]))
+                .collect();
+            let v_scales = Tensor::cat(vs_parts, 0);
+            v = dequantize_rows(v_packed, v_scales, cache.dtype)
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .expect("f32 dequantized rows");
+        }
+        return (k, v);
+    }
+
+    let read = |buf: &Tensor<B, 4>| -> Vec<f32> {
+        let parts: Vec<_> = slots
+            .iter()
+            .map(|&s| buf.clone().slice([0..1, 0..buf.dims()[1], s..s + 1, 0..buf.dims()[3]]))
+            .collect();
+        // [1, slots, heads, dim] so the flat layout of each row is head-major.
+        let joined = Tensor::cat(parts, 2).swap_dims(1, 2);
+        joined
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("f32 cache rows")
+    };
+    let k = read(cache.k.as_ref().expect("kv cache k buffer"));
+    let v = match &cache.v {
+        Some(v_buf) => read(v_buf),
+        None => Vec::new(),
+    };
+    (k, v)
 }
 
 /// Writes K/V rows for the absolute positions `start_pos..` into the ring
@@ -2284,7 +2598,7 @@ mod tests {
         let device = NdArrayDevice::Cpu;
         let mut cache =
             KvCache::<NdArray<f32, i32>>::preallocated(1, 1, 4, 8, KvCacheDtype::F32, &device);
-        cache.enable_eviction(2);
+        cache.enable_eviction_with(2, 8, false);
         // Fill the cache: rows 0..8 are appended in order.
         let slots = alloc_evict_slots(&mut cache, 0, 8, 2);
         assert_eq!(slots, (0..8).collect::<Vec<_>>());
@@ -2310,7 +2624,7 @@ mod tests {
         let device = NdArrayDevice::Cpu;
         let mut cache =
             KvCache::<NdArray<f32, i32>>::preallocated(1, 1, 4, 6, KvCacheDtype::F32, &device);
-        cache.enable_eviction(1);
+        cache.enable_eviction_with(1, 6, false);
         let _ = alloc_evict_slots(&mut cache, 0, 6, 1);
         // Position 3 is the least important; position 2 is hot.
         cache.scores = Some(Tensor::from_data(
@@ -2383,7 +2697,7 @@ mod tests {
             let capacity = geo.budget.min(model.max_seq_len());
             let mut caches = model.new_kv_caches(capacity, dtype, &device);
             for c in caches.iter_mut() {
-                c.enable_eviction(geo.recent);
+                c.enable_eviction_with(geo.recent, capacity, false);
             }
             for pos in 0..20 {
                 let tok = (pos % config.vocab_size) as i32;
@@ -2419,6 +2733,151 @@ mod tests {
         for dtype in [KvCacheDtype::F32, KvCacheDtype::Int8, KvCacheDtype::Q4] {
             run(dtype);
         }
+    }
+
+    #[test]
+    fn test_spill_replay_restores_dense_context() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 16, 0.0, 0.0);
+        config.kv_eviction = Some("h2o".into());
+        config.kv_budget = Some(4);
+        config.kv_recent = 0;
+        config.sink_tokens = 0;
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+
+        let tokens: Vec<i32> = (0..13).map(|i| (i * 7) % 50).collect();
+        let step = |tok: i32| {
+            Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                TensorData::new(vec![tok], [1, 1]),
+                &device,
+            )
+        };
+
+        // Reference: a dense cache with room for the whole sequence.
+        let mut dense = model.new_kv_caches(16, KvCacheDtype::F32, &device);
+        let mut dense_logits = Vec::new();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            dense_logits = model
+                .forward_with_cache(step(tok), pos, &mut dense)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+        }
+
+        // Bounded cache with spill: the first 12 tokens evict 8 rows to RAM.
+        let mut caches = model.new_kv_caches(16, KvCacheDtype::F32, &device);
+        for c in caches.iter_mut() {
+            c.enable_eviction_with(0, 4, true);
+        }
+        for (pos, &tok) in tokens[..12].iter().enumerate() {
+            model.forward_with_cache(step(tok), pos, &mut caches);
+        }
+        assert_eq!(caches[0].len, 4, "the budget bounds the resident rows");
+        assert_eq!(caches[0].spilled_total, 8, "every eviction is archived");
+
+        // Grow the budget to the full context and replay the archive.
+        let replayed = caches[0].grow_and_replay(12);
+        assert_eq!(replayed, 8);
+        assert_eq!(caches[0].len, 12);
+        let mut positions: Vec<usize> = caches[0]
+            .positions
+            .iter()
+            .copied()
+            .filter(|p| *p != usize::MAX)
+            .collect();
+        positions.sort_unstable();
+        assert_eq!(positions, (0..12).collect::<Vec<_>>());
+
+        // The next token must attend the restored dense context.
+        let cached = model
+            .forward_with_cache(step(tokens[12]), 12, &mut caches)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let diff = dense_logits
+            .iter()
+            .zip(cached.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff < 1e-4,
+            "replayed cache diverged from the dense context: max_diff={diff}"
+        );
+    }
+
+    #[test]
+    fn test_spill_replay_prefers_high_scores() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        for dtype in [KvCacheDtype::F32, KvCacheDtype::Int8, KvCacheDtype::Q4] {
+            let mut cache =
+                KvCache::<NdArray<f32, i32>>::preallocated(1, 2, 4, 6, dtype, &device);
+            cache.enable_eviction_with(0, 4, true);
+            let _ = alloc_evict_slots(&mut cache, 0, 4, 0);
+            // Position 1 is the coldest row, then position 3.
+            cache.scores = Some(Tensor::from_data(
+                TensorData::new(vec![5.0, 1.0, 9.0, 2.0, 0.0, 0.0], [6]),
+                &device,
+            ));
+            let slots = alloc_evict_slots(&mut cache, 4, 2, 0);
+            assert_eq!(slots, vec![1, 3]);
+
+            let spill = cache.spill.as_ref().expect("spill enabled");
+            let mut archived: Vec<(usize, f32)> =
+                spill.rows.iter().map(|r| (r.position, r.score)).collect();
+            archived.sort_by_key(|r| r.0);
+            assert_eq!(archived, vec![(1, 1.0), (3, 2.0)]);
+
+            // Growth replays both rows and restores the full six-row window.
+            let replayed = cache.grow_and_replay(2);
+            assert_eq!(replayed, 2);
+            assert_eq!(cache.len, 6);
+            let mut positions: Vec<usize> = cache
+                .positions
+                .iter()
+                .copied()
+                .filter(|p| *p != usize::MAX)
+                .collect();
+            positions.sort_unstable();
+            assert_eq!(positions, vec![0, 1, 2, 3, 4, 5]);
+        }
+    }
+
+    #[test]
+    fn test_evict_mixed_batch_reuses_unwritten_slots() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut config = ModelConfig::new(50, 32, 4, Some(2), 1, 16, 0.0, 0.0);
+        config.kv_eviction = Some("h2o".into());
+        config.kv_budget = Some(4);
+        config.kv_recent = 1;
+        config.sink_tokens = 0;
+        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        let mut caches = model.new_kv_caches(8, KvCacheDtype::F32, &device);
+        for c in caches.iter_mut() {
+            c.enable_eviction_with(1, 4, true);
+        }
+        // A single 6-token call appends 4 rows and evicts 2 in the same batch;
+        // slots assigned earlier in the call must be reused without archiving
+        // (their data does not exist yet) and `len` must stay at the budget.
+        let input = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+            TensorData::new(vec![1, 2, 3, 4, 5, 6], [1, 6]),
+            &device,
+        );
+        let logits = model.forward_with_cache(input, 0, &mut caches);
+        let values = logits.into_data().to_vec::<f32>().unwrap();
+        assert!(values.iter().all(|v| v.is_finite()));
+        assert_eq!(caches[0].len, 4);
+        assert_eq!(caches[0].spilled_total, 0, "unwritten slots are not archived");
+        let mut positions: Vec<usize> = caches[0]
+            .positions
+            .iter()
+            .copied()
+            .filter(|p| *p != usize::MAX)
+            .collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![2, 3, 4, 5], "only the newest rows survive");
     }
 
     #[test]

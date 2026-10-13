@@ -197,3 +197,27 @@ bounded to `N` resident rows instead of the full context:
   web Generate form.
 - Eviction works with every cache format (`f32`, `f16`, `int8`, `q4`), with MLA latents
   and with cross-layer KV sharing.
+
+## Host-RAM Spill and Replay
+
+`--kv-spill` makes H2O eviction lossless: every recycled row is archived in host RAM as
+f32 (flat `(head, dim)` K/V, or the latent for MLA) together with its absolute position
+and accumulated attention score. The archive is bounded by the context window and costs
+`row_len · 4 bytes` per row (plus a position and a score).
+
+- `--kv-max-budget N` allocates the physical cache to `N` rows while the **resident
+  budget** still starts at the checkpoint/CLI budget. `--kv-grow R --kv-grow-interval T`
+  adds `R` rows to the budget every `T` processed tokens (prefill and decode both count)
+  until the physical ceiling.
+- Every slot freed by growth is filled by replaying the **highest-score** archived rows
+  first (ties break towards the newest position, which is what a denser cache would have
+  kept). Replayed rows re-enter through the storage quantization path, so the feature
+  works with `f32`, `f16`, `int8` and `q4` caches and with MLA.
+- Growth is deterministic and independent of sampling: it lets a long generation start
+  with a small fast cache and end up holding much more of the context, without losing the
+  rows evicted before the growth. Without `--kv-grow` the spill archive is still kept for
+  reporting (`rows archived / replayed / still spilled`).
+- Validation: `--kv-spill`, `--kv-max-budget` and `--kv-grow` require
+  `--kv-eviction h2o`; `--kv-grow` requires `--kv-max-budget` above the initial budget.
+- The web Generate form exposes the same knobs (`kvSpill`, `kvMaxBudget`, `kvGrow`,
+  `kvGrowInterval`) under "Spill to host RAM (advanced)".

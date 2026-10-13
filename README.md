@@ -25,6 +25,7 @@
 - **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; RoPE angles are computed per position (no table cap), generation and evaluation can run past the trained `n_ctx`, and GGUF exports carry the `rope.scaling.*` metadata.
 - **Bounded KV cache**: `--sliding-window` plus `--sink-tokens` turn the per-layer cache into a ring buffer of `window + sinks` rows (long prompts are prefilled in chunks); without a window the cache is preallocated to the context and written in place.
 - **Heavy-hitter KV eviction (H2O)**: `--kv-eviction h2o --kv-budget N [--kv-recent R]` bounds the cache to `N` rows that keep attention sinks, the last `R` tokens and the rows with the highest accumulated attention mass. Inference accumulates the mass in f32 (any cache dtype) and recycles the lowest-score unprotected row; training aligns the attention mask with the same geometry using a per-forward pseudo-random keep-set (a conservative lower bound). Mutually exclusive with `--sliding-window`.
+- **Host-RAM spill and replay**: `--kv-spill` archives every evicted row (f32, with position and score) in host RAM, and `--kv-max-budget N --kv-grow R --kv-grow-interval T` grows the resident budget deterministically, refilling each new slot with the highest-score archived rows. Lossless bounded decoding for long RoPE-extended generations, on top of any cache dtype or MLA.
 - **Cross-layer KV sharing**: `--kv-share-group N` makes each group of N layers share one K/V projection and cache (DeepSeek CSA-style), shrinking KV memory by N. Checkpoints carry an `arch_version`; GGUF export of grouped models requires `--approx` and is documented as an approximation.
 - **MLA latent cache**: `--mla-latent-dim D` compresses K/V through a `D`-wide latent and caches only the latent (4× smaller for a typical D), expanding K/V on the fly at attention time. This variant has no decoupled RoPE, so GGUF export folds `kv_down · k_up` into exact standard K/V weights.
 - **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
@@ -220,6 +221,10 @@ cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p
 | `--kv-eviction <kind>` | Eviction override: `h2o`, `none` or empty to keep the checkpoint config | `""` |
 | `--kv-budget <n>` | Resident KV cache rows (`0` = checkpoint config) | `0` |
 | `--kv-recent <n>` | Recent tokens never evicted (`0` = checkpoint config) | `0` |
+| `--kv-spill` | Archive evicted rows in host RAM and replay them when the budget grows | off |
+| `--kv-max-budget <n>` | Physical cache rows / replay ceiling (`0` = initial budget) | `0` |
+| `--kv-grow <n>` | Rows added to the resident budget per growth step | `0` |
+| `--kv-grow-interval <n>` | Processed tokens between growth steps | `64` |
 | `--rope-scaling <kind>` | Context extension: `none`, `linear`, `ntk` or `yarn` | `none` |
 | `--rope-factor <float>` | Extension factor (e.g. `2.0` doubles the usable context) | `1.0` |
 
