@@ -27,7 +27,8 @@ Goal: move from a per-layer f32 cache that reallocated with `Tensor::cat` on eve
 - ✅ **Phase 5 — Quantized KV cache**: `generate --kv-cache-dtype f32|f16|int8|q4`. f16 halves memory on the non-fused backend (the fused backend's casts are no-ops; it is detected and rejected). int8/q4 store packed i32 words (4 int8 or 8 int4) plus per-block f32 scales and dequantize on read; Burn 0.21's `QFloat` cannot be written with `slice`/`slice_assign`, so the packed representation sidesteps it and stays portable across backends. `stats` reports bytes/token for every format. Custom `burn::cubecl` kernels remain a possible optimization for the pack/unpack elementwise work, but are not required for correctness or the memory saving.
 - ✅ **GGUF import & model recovery**: `import` (CLI) and `POST /api/models/import` invert the exporter exactly and rebuild the tokenizer from the GGUF vocab, so models that only survive as GGUF are usable again. Generation/eval/export resolve `custom_tokenizer.json` from the model directory, and `/api/models` reports architecture compatibility, training steps and best validation loss.
 - ✅ **Train wizard & system info**: the Train form is a four-step wizard (data → architecture preset → schedule → review) with inline validation and a live parameter count; f16 is no longer offered for training. The Devices view adds a host system card (CPU model, cores, frequency, load, OS/kernel, RAM, swap, disks) backed by `sysinfo` via `GET /api/system`.
-- ⏳ **Phase 6 (backlog)** — heavy-hitter eviction and host-RAM spill/replay.
+- 🚧 **Phase 6 — Heavy-hitter eviction (H2O)**: bounded cache that keeps `sinks + recent + heavy hitters` instead of a blind ring. Inference accumulates attention mass per cached row (f32 accumulator per K/V group, independent of the cache dtype) and evicts the lowest-score row, protecting sinks and the last `recent` tokens; the attention mask is unchanged (evicted rows are implicit via slot positions). Training aligns with the same geometry: a per-batch column keep-mask (sinks + recent + `H` pseudo-random old tokens) replaces the dense past, a conservative lower bound of score-based selection. Config gains `kv_eviction` / `kv_budget` / `kv_recent` (optional, no `arch_version` bump) and `sliding_window` + `kv_eviction` are mutually exclusive. Knobs land in the train and generate CLIs, the HTTP API and the web forms. Host-RAM spill/replay stays as backlog.
+- ⏳ **Backlog — host-RAM spill/replay**: archive evicted rows in host RAM and replay them (adaptive/manual budget growth or session reuse).
 
 Known prerequisites discovered in Phase 0: all existing checkpoints are invalid (the v1 model was a 1-step run; v2 was trained with an older tokenizer and served with the current one; every `.bin` dataset is v1 without a fingerprint). Re-run `prepare-dataset` with the current tokenizer and retrain from scratch before measuring quality.
 
@@ -63,6 +64,14 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 
 - ✅ **Translate all documentation to English**: README, `cli_parameters.md`, `doc/*.md`, ROADMAP and the auxiliary notes, with no Spanish copies.
 - ✅ **Code strings and help text**: the remaining Spanish comments/messages in `src/` were translated; `serve --token` now documents that omitting it disables auth and `train --dtype` states that `bf16` is rejected by the WGPU backend.
+
+## Future Backlog — Third-Party Model Support
+
+Today `import` only inverts this engine's own GGUF exports (`general.architecture = "llama"`, this SwiGLU hidden layout, f32/f16 only, BPE tokenizer, fixed RMSNorm eps, tied embeddings) and `train` rebuilds the architecture from CLI flags. Loading/fine-tuning models downloaded from elsewhere needs:
+
+1. A converter from Hugging Face safetensors to the native format (name mapping, transposed linear weights, GPT-NeoX RoPE permutation, tied embeddings, optional biases).
+2. A relaxed GGUF import: `llama`/`qwen2`-style architectures beyond this layout, `layer_norm_rms_epsilon` from metadata, SentencePiece tokenizers and dequantization of quantized GGUF tensors at import time.
+3. Fine-tuning imported models using the checkpoint `config.json` as the architecture source (not CLI flags) and the model directory tokenizer.
 
 ## Suggested Order
 
