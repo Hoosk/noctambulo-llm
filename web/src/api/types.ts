@@ -215,6 +215,9 @@ export interface TrainRequestBody {
   sinkTokens?: number;
   kvShareGroup?: number;
   mlaLatentDim?: number;
+  kvEviction?: string;
+  kvBudget?: number;
+  kvRecent?: number;
   seqWarmupSteps: number;
   weightDecay: number;
   labelSmoothing: number;

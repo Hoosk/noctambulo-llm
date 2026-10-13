@@ -91,3 +91,15 @@ When running `cargo run --release -- stats` with the base configuration, the sub
   KV Cache (f16)   : 2048 B/token (0.50 MB at n_ctx=256)
 ===============================================================================
 ```
+
+## Heavy-Hitter Eviction Budget
+
+When the checkpoint enables `kv_eviction` the report adds the resolved geometry
+(`sinks + recent + hitters`) and, per storage format, the resident budget in MB and bytes
+per row including the f32 score accumulator and the slot position:
+
+```text
+  KV Eviction      : h2o, budget 512 rows (4 sinks + 64 recent + 444 hitters)
+  KV Budget (f32 ) : 4.03 MB resident (8256 B/row incl. scores)
+  ...
+```

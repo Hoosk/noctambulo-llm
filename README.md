@@ -24,6 +24,7 @@
   - **Decoupled weight decay** (AdamW) applied to all parameters, optional **label smoothing** and **z-loss**.
 - **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; RoPE angles are computed per position (no table cap), generation and evaluation can run past the trained `n_ctx`, and GGUF exports carry the `rope.scaling.*` metadata.
 - **Bounded KV cache**: `--sliding-window` plus `--sink-tokens` turn the per-layer cache into a ring buffer of `window + sinks` rows (long prompts are prefilled in chunks); without a window the cache is preallocated to the context and written in place.
+- **Heavy-hitter KV eviction (H2O)**: `--kv-eviction h2o --kv-budget N [--kv-recent R]` bounds the cache to `N` rows that keep attention sinks, the last `R` tokens and the rows with the highest accumulated attention mass. Inference accumulates the mass in f32 (any cache dtype) and recycles the lowest-score unprotected row; training aligns the attention mask with the same geometry using a per-forward pseudo-random keep-set (a conservative lower bound). Mutually exclusive with `--sliding-window`.
 - **Cross-layer KV sharing**: `--kv-share-group N` makes each group of N layers share one K/V projection and cache (DeepSeek CSA-style), shrinking KV memory by N. Checkpoints carry an `arch_version`; GGUF export of grouped models requires `--approx` and is documented as an approximation.
 - **MLA latent cache**: `--mla-latent-dim D` compresses K/V through a `D`-wide latent and caches only the latent (4× smaller for a typical D), expanding K/V on the fly at attention time. This variant has no decoupled RoPE, so GGUF export folds `kv_down · k_up` into exact standard K/V weights.
 - **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
@@ -82,6 +83,9 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--sink-tokens <n>` | Initial tokens always kept attendable (attention sinks) | `0` |
 | `--kv-share-group <n>` | Layers per cross-layer K/V sharing group (`1` = off); one K/V projection and cache per group | `1` |
 | `--mla-latent-dim <n>` | MLA latent size (`0` = off); caches only the compressed latent, GGUF export folds the weights exactly | `0` |
+| `--kv-eviction <kind>` | Bounded-cache policy: `none` or `h2o` (heavy-hitter eviction, mutually exclusive with `--sliding-window`) | `none` |
+| `--kv-budget <n>` | Resident KV cache rows (required by `--kv-eviction h2o`; must exceed sinks + recent) | `0` |
+| `--kv-recent <n>` | Most recent tokens never evicted | `64` |
 | `--val-split <float>` | Fraction reserved for validation and perplexity ($PPL$) | `0.1` |
 | `--grad-accum <n>` | Micro-batches accumulated per AdamW step (true gradient mean, equivalent to a larger batch) | `1` |
 | `--save-dir <path>` | Directory for automatic per-epoch checkpoint saving | `None` |
@@ -164,6 +168,10 @@ Evaluates the cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and **bit
 cargo run --release -- eval --model-dir model_output --file datasets/corpus.txt
 ```
 
+For checkpoints trained with heavy-hitter eviction the evaluation follows the training
+keep-mask automatically; add `--dense` to measure the same weights with a dense past as an
+upper-bound reference.
+
 ---
 
 ### 4. Train a Custom Tokenizer (`train-tokenizer`)
@@ -209,10 +217,13 @@ cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p
 | `--seed <n>` | Pseudo-random generator seed for reproducibility | `None` |
 | `--dtype <kind>` | Compute precision: `f32` or `f16` (non-fused backend) | `f32` |
 | `--kv-cache-dtype <kind>` | KV cache precision: `f32`, `f16`, `int8` or `q4` (quantized formats pack integers with per-block scales) | `f32` |
+| `--kv-eviction <kind>` | Eviction override: `h2o`, `none` or empty to keep the checkpoint config | `""` |
+| `--kv-budget <n>` | Resident KV cache rows (`0` = checkpoint config) | `0` |
+| `--kv-recent <n>` | Recent tokens never evicted (`0` = checkpoint config) | `0` |
 | `--rope-scaling <kind>` | Context extension: `none`, `linear`, `ntk` or `yarn` | `none` |
 | `--rope-factor <float>` | Extension factor (e.g. `2.0` doubles the usable context) | `1.0` |
 
-The web API additionally exposes `POST /api/generate/stream` (SSE), which streams tokens as they are generated and supports cancellation. The web Generate form also exposes the compute precision (`f32`/`f16`).
+The web API additionally exposes `POST /api/generate/stream` (SSE), which streams tokens as they are generated and supports cancellation. The web Generate form also exposes the compute precision (`f32`/`f16`) and the heavy-hitter eviction overrides (`kvEviction`, `kvBudget`, `kvRecent`).
 
 ---
 

@@ -235,6 +235,10 @@ struct EvalArgs {
     /// RoPE scaling factor (e.g. 2.0 doubles the usable context)
     #[arg(long, default_value_t = 1.0)]
     rope_factor: f32,
+    /// Disable the checkpoint's heavy-hitter eviction mask for a dense
+    /// (upper-bound) evaluation
+    #[arg(long)]
+    dense: bool,
 }
 
 #[derive(Args)]
@@ -338,6 +342,17 @@ struct TrainArgs {
     /// Z-loss coefficient on logsumexp(logits)^2 (0.0 = disabled)
     #[arg(long, default_value_t = 0.0)]
     z_loss: f32,
+    /// Heavy-hitter KV eviction policy: none (default) or h2o. Training aligns
+    /// the attention mask with the bounded cache.
+    #[arg(long, default_value = "none")]
+    kv_eviction: String,
+    /// Resident KV cache rows including sinks and recent tokens (required by
+    /// --kv-eviction h2o, e.g. 512)
+    #[arg(long, default_value_t = 0)]
+    kv_budget: usize,
+    /// Most recent tokens never evicted
+    #[arg(long, default_value_t = 64)]
+    kv_recent: usize,
 }
 
 #[derive(Args)]
@@ -384,6 +399,17 @@ struct GenerateArgs {
     /// RoPE scaling factor (e.g. 2.0 doubles the usable context)
     #[arg(long, default_value_t = 1.0)]
     rope_factor: f32,
+    /// Heavy-hitter eviction override: h2o or none (empty keeps the
+    /// checkpoint config)
+    #[arg(long, default_value = "")]
+    kv_eviction: String,
+    /// Resident KV cache rows (> sink tokens + recent); 0 keeps the checkpoint
+    /// config
+    #[arg(long, default_value_t = 0)]
+    kv_budget: usize,
+    /// Recent tokens never evicted; 0 keeps the checkpoint config
+    #[arg(long, default_value_t = 0)]
+    kv_recent: usize,
 }
 
 #[derive(Args)]
@@ -419,6 +445,7 @@ fn run_generate<B: Backend>(
     device: &B::Device,
     args: &GenerateArgs,
     cache_dtype: crate::model::KvCacheDtype,
+    eviction: Option<crate::config::EvictionGeometry>,
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let model: Llm<B> = model_config.init_model(device);
@@ -440,6 +467,7 @@ fn run_generate<B: Backend>(
         args.rep_penalty,
         seed,
         cache_dtype,
+        eviction,
         device,
     )?;
 
@@ -683,6 +711,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             model_config.kv_share_group = args.kv_share_group.max(1);
             model_config.mla_latent_dim =
                 (args.mla_latent_dim > 0).then_some(args.mla_latent_dim);
+            model_config.set_kv_eviction(&args.kv_eviction, args.kv_budget, args.kv_recent);
+            if let Some(geo) = model_config.eviction_geometry()? {
+                tui::print_info(&format!(
+                    "KV eviction: h2o (budget {}, {} sinks, {} recent, {} hitters)",
+                    geo.budget, geo.sinks, geo.recent, geo.hitters
+                ));
+            }
 
             let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
             let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
@@ -773,6 +808,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.max_tokens,
                 &device,
                 rope_override,
+                args.dense,
             )?;
         }
         Commands::Generate(args) => {
@@ -809,6 +845,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .unwrap_or(42)
             });
 
+            // Request-level eviction override: empty policy / zero knobs keep
+            // the checkpoint config. The geometry is validated here so an
+            // impossible budget fails before the model is loaded.
+            model_config.set_kv_eviction(&args.kv_eviction, args.kv_budget, args.kv_recent);
+            let eviction = model_config.eviction_geometry()?;
+
             let cache_dtype = crate::model::KvCacheDtype::parse(&args.kv_cache_dtype)?;
             match (dtype, cache_dtype) {
                 // An f16 cache needs a backend that really stores f16: the
@@ -822,6 +864,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &device,
                         &args,
                         cache_dtype,
+                        eviction,
                         seed,
                     )?;
                 }
@@ -833,6 +876,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &device,
                         &args,
                         cache_dtype,
+                        eviction,
                         seed,
                     )?;
                 }
@@ -844,6 +888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         &device,
                         &args,
                         cache_dtype,
+                        eviction,
                         seed,
                     )?;
                 }
@@ -974,6 +1019,30 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     mb(bytes),
                     model_config.n_ctx
                 );
+            }
+            if let Some(geo) = model_config.eviction_geometry()? {
+                let map_mb = |bytes: usize| {
+                    bytes as f64 * geo.budget as f64 / (1024.0 * 1024.0)
+                };
+                println!(
+                    "  KV Eviction      : h2o, budget {} rows ({} sinks + {} recent + {} hitters)",
+                    geo.budget, geo.sinks, geo.recent, geo.hitters
+                );
+                for (dtype, label) in [
+                    (crate::model::KvCacheDtype::F32, "f32 "),
+                    (crate::model::KvCacheDtype::F16, "f16 "),
+                    (crate::model::KvCacheDtype::Int8, "int8"),
+                    (crate::model::KvCacheDtype::Q4, "q4  "),
+                ] {
+                    // Scores are always f32 (4 bytes/row) plus one absolute
+                    // position per row.
+                    let bytes = kv_bytes(dtype) + 4 + std::mem::size_of::<usize>();
+                    println!(
+                        "  KV Budget ({label}): {:.2} MB resident ({} B/row incl. scores)",
+                        map_mb(bytes),
+                        bytes
+                    );
+                }
             }
             println!("===============================================================================");
         }

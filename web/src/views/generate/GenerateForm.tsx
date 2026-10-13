@@ -14,6 +14,9 @@ export interface GenForm {
   ropeFactor: string;
   dtype: string;
   kvCacheDtype: string;
+  kvEviction: string;
+  kvBudget: string;
+  kvRecent: string;
 }
 
 interface Props {
@@ -136,6 +139,40 @@ export function GenerateForm({
           </Select>
         </Field>
       </div>
+
+      <div className="grid grid-cols-3 gap-3 mt-3">
+        <Field label="KV eviction">
+          <Select value={form.kvEviction} onChange={(e) => onField("kvEviction", e.target.value)}>
+            <option value="">model default</option>
+            <option value="h2o">h2o · heavy hitters</option>
+            <option value="none">none · dense</option>
+          </Select>
+        </Field>
+        <Field label="Budget (rows)">
+          <Input
+            type="number"
+            min={0}
+            step={64}
+            placeholder="model default"
+            value={form.kvBudget}
+            onChange={(e) => onField("kvBudget", e.target.value)}
+          />
+        </Field>
+        <Field label="Recent tokens">
+          <Input
+            type="number"
+            min={0}
+            step={16}
+            placeholder="model default"
+            value={form.kvRecent}
+            onChange={(e) => onField("kvRecent", e.target.value)}
+          />
+        </Field>
+      </div>
+      <p className="text-[11px] text-slate-500 -mt-1 mb-1">
+        Heavy-hitter eviction bounds the cache to the budget, keeping sinks, recent tokens and the rows
+        with the highest accumulated attention. Empty/0 keeps the checkpoint config.
+      </p>
 
       <div className="mt-5 flex gap-3">
         <Button variant="primary" disabled={busy || !modelDir} onClick={onRun}>

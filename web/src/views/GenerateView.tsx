@@ -19,6 +19,9 @@ const DEFAULT_FORM: GenForm = {
   ropeFactor: "1",
   dtype: "f32",
   kvCacheDtype: "f32",
+  kvEviction: "",
+  kvBudget: "",
+  kvRecent: "",
 };
 
 interface RunStatus {
@@ -110,6 +113,9 @@ export function GenerateView() {
           ropeFactor: Number(form.ropeFactor) || 1,
           dtype: form.dtype,
           kvCacheDtype: form.kvCacheDtype,
+          kvEviction: form.kvEviction || undefined,
+          kvBudget: Number(form.kvBudget) || 0,
+          kvRecent: Number(form.kvRecent) || 0,
         }),
         signal: controller.signal,
       });

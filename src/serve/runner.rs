@@ -30,6 +30,9 @@ pub struct TrainParams {
     pub sink_tokens: usize,
     pub kv_share_group: usize,
     pub mla_latent_dim: usize,
+    pub kv_eviction: String,
+    pub kv_budget: usize,
+    pub kv_recent: usize,
     pub save_dir: Option<PathBuf>,
     pub resume: Option<PathBuf>,
     pub output_dir: String,
@@ -260,6 +263,16 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
         config.sink_tokens = params.sink_tokens;
         config.kv_share_group = params.kv_share_group.max(1);
         config.mla_latent_dim = (params.mla_latent_dim > 0).then_some(params.mla_latent_dim);
+        config.set_kv_eviction(&params.kv_eviction, params.kv_budget, params.kv_recent);
+        if let Some(geo) = config.eviction_geometry().ok().flatten() {
+            let _ = tx.send(TrainingEvent::LogEvent {
+                line: format!(
+                    "KV eviction: h2o (budget {}, {} sinks, {} recent, {} hitters)",
+                    geo.budget, geo.sinks, geo.recent, geo.hitters
+                ),
+                ts: start_unix(),
+            });
+        }
         let device = parse_device(&params.device);
         let _ = tx.send(TrainingEvent::LogEvent {
             line: format!("Compute precision: {}", params.dtype.as_str()),

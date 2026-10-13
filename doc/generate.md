@@ -178,3 +178,22 @@ buffer spanning the whole context:
 Memory per layer is therefore `2 · n_kv_head · head_dim · 4 bytes · (N + S)`, independent
 of how long the conversation grows. Checkpoints without a window keep the preallocated
 full-context cache (same behavior as before, without the per-token `cat`).
+
+## Heavy-Hitter Eviction (H2O)
+
+For checkpoints trained with `--kv-eviction h2o --kv-budget N --kv-recent R` the cache is
+bounded to `N` resident rows instead of the full context:
+
+- Every layer cache keeps a f32 **score accumulator** (`N` values, independent of the
+  cache dtype) fed by the attention mass each row receives, summed over heads, query rows
+  and the layers of a K/V group.
+- While the budget has room, rows are appended; once it is full the lowest-score row that
+  is neither a sink nor inside the last `R` tokens is recycled for the new token, and its
+  score restarts from zero.
+- The attention mask is unchanged: evicted rows are simply no longer in the cache, and
+  generation can continue up to the RoPE-extended context window.
+- `--kv-eviction h2o|none`, `--kv-budget N` and `--kv-recent R` override the checkpoint
+  config per request (empty/`0` keeps it); the same fields exist in the HTTP API and the
+  web Generate form.
+- Eviction works with every cache format (`f32`, `f16`, `int8`, `q4`), with MLA latents
+  and with cross-layer KV sharing.

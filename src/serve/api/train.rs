@@ -70,6 +70,15 @@ pub(super) struct TrainRequest {
     /// MLA latent dimension (0 = disabled).
     #[serde(default)]
     mla_latent_dim: usize,
+    /// Heavy-hitter KV eviction policy: none (default) or h2o.
+    #[serde(default = "default_kv_eviction")]
+    kv_eviction: String,
+    /// Resident KV cache rows (required by kv_eviction=h2o).
+    #[serde(default)]
+    kv_budget: usize,
+    /// Most recent tokens never evicted.
+    #[serde(default = "default_kv_recent")]
+    kv_recent: usize,
     #[serde(default)]
     save_dir: Option<String>,
     #[serde(default)]
@@ -134,6 +143,14 @@ fn default_weight_decay() -> f64 {
     0.1
 }
 
+fn default_kv_eviction() -> String {
+    "none".into()
+}
+
+fn default_kv_recent() -> usize {
+    64
+}
+
 fn default_output_dir() -> String {
     "model_output".into()
 }
@@ -194,6 +211,25 @@ pub(super) async fn train(
 
     let dtype = DType::parse(&req.dtype).map_err(ApiError::bad_request)?;
 
+    // Validate the eviction geometry before spawning the worker; an invalid
+    // budget must fail the request, not silently train densely.
+    {
+        let mut check = crate::config::ModelConfig::new(
+            1,
+            req.n_embd,
+            req.n_head,
+            req.n_kv_head,
+            req.n_layer,
+            req.n_ctx,
+            req.dropout,
+            req.attn_softcap,
+        );
+        check.sliding_window = (req.sliding_window > 0).then_some(req.sliding_window);
+        check.sink_tokens = req.sink_tokens;
+        check.set_kv_eviction(&req.kv_eviction, req.kv_budget, req.kv_recent);
+        check.eviction_geometry().map_err(ApiError::bad_request)?;
+    }
+
     let params = TrainParams {
         file: Some(file_path),
         dtype,
@@ -215,6 +251,9 @@ pub(super) async fn train(
         sink_tokens: req.sink_tokens,
         kv_share_group: req.kv_share_group,
         mla_latent_dim: req.mla_latent_dim,
+        kv_eviction: req.kv_eviction,
+        kv_budget: req.kv_budget,
+        kv_recent: req.kv_recent,
         save_dir: req.save_dir.map(path_buf_from),
         resume: req.resume.map(path_buf_from),
         output_dir: req.output_dir,

@@ -105,10 +105,34 @@ pub struct ModelConfig {
     /// latent of this size and only the latent is cached (DeepSeek MLA-style).
     #[serde(default)]
     pub mla_latent_dim: Option<usize>,
+    /// Heavy-hitter KV eviction policy (`"h2o"`). Absent/`none` keeps the
+    /// dense (or sliding-window) cache.
+    #[serde(default)]
+    pub kv_eviction: Option<String>,
+    /// Resident cache rows including sinks and recent tokens (required when
+    /// `kv_eviction` is set).
+    #[serde(default)]
+    pub kv_budget: Option<usize>,
+    /// Most recent tokens protected from eviction.
+    #[serde(default = "default_kv_recent")]
+    pub kv_recent: usize,
     /// Checkpoint architecture version. Bumped whenever the module layout
     /// changes; older versions cannot be loaded (records are positional).
     #[serde(default = "default_arch_version")]
     pub arch_version: u32,
+}
+
+/// Resolved heavy-hitter eviction geometry: `budget = sinks + recent + hitters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictionGeometry {
+    /// Resident rows in the bounded cache.
+    pub budget: usize,
+    /// Most recent tokens always kept.
+    pub recent: usize,
+    /// Attention sinks always kept (initial tokens).
+    pub sinks: usize,
+    /// Old rows kept by accumulated attention score.
+    pub hitters: usize,
 }
 
 /// Current module layout. 1 = pre-KV-cache-refactor, 2 = dynamic RoPE +
@@ -117,6 +141,10 @@ pub const ARCH_VERSION: u32 = 4;
 
 fn default_kv_share_group() -> usize {
     1
+}
+
+fn default_kv_recent() -> usize {
+    64
 }
 
 fn default_arch_version() -> u32 {
@@ -171,6 +199,9 @@ impl ModelConfig {
             sink_tokens: 0,
             kv_share_group: 1,
             mla_latent_dim: None,
+            kv_eviction: None,
+            kv_budget: None,
+            kv_recent: default_kv_recent(),
             arch_version: ARCH_VERSION,
         }
     }
@@ -183,6 +214,72 @@ impl ModelConfig {
     /// Latent dimension when MLA is enabled.
     pub fn mla_dim(&self) -> usize {
         self.mla_latent_dim.filter(|d| *d > 0).unwrap_or(0)
+    }
+
+    /// Resolved heavy-hitter eviction geometry. `None` means the cache is
+    /// dense (or ring-bounded by `sliding_window`). Errs on unknown policies,
+    /// on `sliding_window` + eviction together, and on budgets that leave no
+    /// room for at least one heavy hitter.
+    pub fn eviction_geometry(&self) -> Result<Option<EvictionGeometry>, String> {
+        match self
+            .kv_eviction
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None => return Ok(None),
+            Some("") | Some("none") | Some("off") => return Ok(None),
+            Some("h2o") => {}
+            Some(other) => {
+                return Err(format!(
+                    "Unknown KV eviction policy '{other}'. Available: none, h2o"
+                ))
+            }
+        }
+        if self.sliding_window.is_some() {
+            return Err(
+                "sliding_window and kv_eviction are mutually exclusive: use one bounded-cache policy"
+                    .into(),
+            );
+        }
+        let budget = self
+            .kv_budget
+            .filter(|b| *b > 0)
+            .ok_or_else(|| "kv_eviction=h2o requires kv_budget (> 0)".to_string())?;
+        let sinks = self.sink_tokens;
+        let recent = self.kv_recent;
+        if budget <= sinks + recent {
+            return Err(format!(
+                "kv_budget ({budget}) must exceed sink_tokens ({sinks}) + kv_recent ({recent}) \
+                 so at least one heavy hitter fits"
+            ));
+        }
+        Ok(Some(EvictionGeometry {
+            budget,
+            recent,
+            sinks,
+            hitters: budget - sinks - recent,
+        }))
+    }
+
+    /// Applies a CLI/API eviction override: `policy` replaces the configured
+    /// policy (empty keeps it) and `budget`/`recent` (0 keeps the configured
+    /// value).
+    pub fn set_kv_eviction(&mut self, policy: &str, budget: usize, recent: usize) {
+        let policy = policy.trim();
+        if !policy.is_empty() {
+            self.kv_eviction = match policy.to_ascii_lowercase().as_str() {
+                "none" | "off" => None,
+                other => Some(other.to_string()),
+            };
+        }
+        if budget > 0 {
+            self.kv_budget = Some(budget);
+        }
+        if recent > 0 {
+            self.kv_recent = recent;
+        }
     }
 
     /// Number of layer groups (each group owns one K/V projection and cache).
@@ -345,5 +442,71 @@ mod tests {
         assert_eq!(cfg.kv_share_group, 1);
         let err = cfg.check_arch_version("old.bin").unwrap_err();
         assert!(err.contains("architecture version"), "{err}");
+    }
+
+    #[test]
+    fn test_eviction_geometry_and_validation() {
+        let mut cfg = ModelConfig::new(100, 64, 4, Some(2), 2, 64, 0.0, 0.0);
+        assert_eq!(cfg.eviction_geometry().unwrap(), None);
+        assert_eq!(cfg.kv_recent, 64);
+
+        cfg.sink_tokens = 4;
+        cfg.kv_eviction = Some("h2o".into());
+        // The budget is required.
+        let err = cfg.eviction_geometry().unwrap_err();
+        assert!(err.contains("requires kv_budget"), "{err}");
+        cfg.kv_budget = Some(100);
+        let geo = cfg.eviction_geometry().unwrap().unwrap();
+        assert_eq!(
+            geo,
+            EvictionGeometry { budget: 100, recent: 64, sinks: 4, hitters: 32 }
+        );
+
+        // The budget must leave room for at least one heavy hitter.
+        cfg.kv_budget = Some(68);
+        let err = cfg.eviction_geometry().unwrap_err();
+        assert!(err.contains("must exceed"), "{err}");
+
+        // Sliding window conflicts with eviction.
+        cfg.kv_budget = Some(100);
+        cfg.sliding_window = Some(32);
+        let err = cfg.eviction_geometry().unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
+
+        // Unknown policy.
+        cfg.sliding_window = None;
+        cfg.kv_eviction = Some("magic".into());
+        let err = cfg.eviction_geometry().unwrap_err();
+        assert!(err.contains("Unknown KV eviction"), "{err}");
+
+        // "none"/"off" disable eviction even with a budget.
+        cfg.kv_eviction = Some("none".into());
+        assert_eq!(cfg.eviction_geometry().unwrap(), None);
+    }
+
+    #[test]
+    fn test_eviction_fields_default_when_absent() {
+        let json = r#"{"vocab_size":100,"n_embd":64,"n_head":4,"n_layer":2,"n_ctx":32}"#;
+        let cfg: ModelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.kv_eviction, None);
+        assert_eq!(cfg.kv_budget, None);
+        assert_eq!(cfg.kv_recent, 64);
+        assert_eq!(cfg.eviction_geometry().unwrap(), None);
+    }
+
+    #[test]
+    fn test_set_kv_eviction_override() {
+        let mut cfg = ModelConfig::new(100, 64, 4, Some(2), 2, 64, 0.0, 0.0);
+        cfg.set_kv_eviction("h2o", 128, 16);
+        assert_eq!(cfg.kv_eviction.as_deref(), Some("h2o"));
+        assert_eq!(cfg.kv_budget, Some(128));
+        assert_eq!(cfg.kv_recent, 16);
+        // Empty policy / zero knobs keep the configured values.
+        cfg.set_kv_eviction("", 0, 0);
+        assert_eq!(cfg.kv_budget, Some(128));
+        assert_eq!(cfg.kv_recent, 16);
+        // "none" turns it off.
+        cfg.set_kv_eviction("none", 0, 0);
+        assert_eq!(cfg.kv_eviction, None);
     }
 }

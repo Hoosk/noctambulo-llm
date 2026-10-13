@@ -29,6 +29,9 @@ interface FormState {
   sinkTokens: string;
   kvShareGroup: string;
   mlaLatentDim: string;
+  kvEviction: string;
+  kvBudget: string;
+  kvRecent: string;
   seqWarmup: string;
   weightDecay: string;
   labelSmoothing: string;
@@ -67,6 +70,9 @@ const DEFAULT_FORM: FormState = {
   sinkTokens: "0",
   kvShareGroup: "1",
   mlaLatentDim: "0",
+  kvEviction: "none",
+  kvBudget: "0",
+  kvRecent: "64",
   seqWarmup: "0",
   weightDecay: "0.1",
   labelSmoothing: "0",
@@ -132,6 +138,15 @@ function validateStep(step: number, f: FormState, datasets: DatasetInfo[]): stri
     if (window > nCtx) return "The sliding window cannot exceed n_ctx.";
     const mla = Number(f.mlaLatentDim) || 0;
     if (mla > 0 && mla > nEmbd / nHead) return "The MLA latent cannot exceed the attention head size.";
+    if (f.kvEviction === "h2o") {
+      if (window > 0) return "Sliding window and KV eviction are mutually exclusive.";
+      const budget = Number(f.kvBudget) || 0;
+      const sinks = Number(f.sinkTokens) || 0;
+      const recent = Number(f.kvRecent) || 0;
+      if (budget <= sinks + recent) {
+        return "The KV budget must exceed sink tokens + recent tokens.";
+      }
+    }
   }
   if (step === 2) {
     if (!(Number(f.lr) > 0)) return "Learning rate must be greater than 0.";
@@ -179,6 +194,9 @@ function buildTrainBody(
       sinkTokens: Number(form.sinkTokens) || 0,
       kvShareGroup: Number(form.kvShareGroup) || 1,
       mlaLatentDim: Number(form.mlaLatentDim) || 0,
+      kvEviction: form.kvEviction,
+      kvBudget: Number(form.kvBudget) || 0,
+      kvRecent: Number(form.kvRecent) || 64,
       seqWarmupSteps: num(form.seqWarmup),
       weightDecay: num(form.weightDecay),
       labelSmoothing: num(form.labelSmoothing),
@@ -537,10 +555,21 @@ function StepArchitecture({
           <NumberField label="MLA latent dim" step={16} min={0} value={form.mlaLatentDim} onChange={(v) => set("mlaLatentDim", v)} />
           <NumberField label="Attn softcap" step={1} min={0} value={form.attnSoftcap} onChange={(v) => set("attnSoftcap", v)} />
         </div>
+        <div className="grid grid-cols-3 gap-3 mt-3">
+          <Field label="KV eviction">
+            <Select value={form.kvEviction} onChange={(e) => set("kvEviction", e.target.value)}>
+              <option value="none">none</option>
+              <option value="h2o">h2o · heavy hitters</option>
+            </Select>
+          </Field>
+          <NumberField label="KV budget (rows)" step={64} min={0} value={form.kvBudget} onChange={(v) => set("kvBudget", v)} />
+          <NumberField label="KV recent tokens" step={16} min={0} value={form.kvRecent} onChange={(v) => set("kvRecent", v)} />
+        </div>
         <p className="text-[10px] text-slate-500 mt-2">
           Sliding window + sinks bound the KV cache. KV share group reuses K/V projections across layers.
           MLA compresses K/V into a latent (mutually exclusive with GQA in practice: set KV heads = heads
-          when using MLA).
+          when using MLA). H2O eviction trains the attention mask for a bounded heavy-hitter cache
+          (mutually exclusive with the sliding window; it needs a budget above sink + recent tokens).
         </p>
       </details>
     </>
@@ -598,6 +627,14 @@ function StepReview({
     ["Device", form.device],
     ["Preset", form.preset],
     ["Architecture", `d ${form.nEmbd} · heads ${form.nHead} · kv ${form.nKvHead} · layers ${form.nLayer} · ctx ${form.nCtx}`],
+    [
+      "KV cache",
+      form.kvEviction === "h2o"
+        ? `h2o eviction · budget ${form.kvBudget} · recent ${form.kvRecent}`
+        : Number(form.slidingWindow) > 0
+          ? `sliding window ${form.slidingWindow} · sinks ${form.sinkTokens}`
+          : "dense",
+    ],
     ["Params (f32)", `${(params / 1e6).toFixed(2)}M · ${fmtBytes(params * 4)}`],
     ["Schedule", `${form.epochs} epoch(s) · batch ${form.batch} · lr ${form.lr} · accum ${form.gradAccum}`],
     ["Token budget", Number(form.maxTokens) > 0 ? Number(form.maxTokens).toLocaleString() : "full dataset"],

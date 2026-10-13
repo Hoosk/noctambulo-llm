@@ -39,6 +39,16 @@ pub(super) struct GenerateRequest {
     /// KV cache precision: f32 (default), f16, int8 or q4.
     #[serde(default)]
     kv_cache_dtype: Option<String>,
+    /// Heavy-hitter eviction policy: "h2o" or "none"; absent keeps the
+    /// checkpoint config.
+    #[serde(default)]
+    kv_eviction: Option<String>,
+    /// Resident KV cache rows; 0/absent keeps the checkpoint config.
+    #[serde(default)]
+    kv_budget: Option<usize>,
+    /// Recent tokens never evicted; 0/absent keeps the checkpoint config.
+    #[serde(default)]
+    kv_recent: Option<usize>,
 }
 
 fn default_max_new_tokens() -> usize {
@@ -82,6 +92,9 @@ struct Sampling {
     rope_factor: f32,
     dtype: crate::config::DType,
     cache_dtype: crate::model::KvCacheDtype,
+    kv_eviction: String,
+    kv_budget: usize,
+    kv_recent: usize,
 }
 
 impl Sampling {
@@ -117,6 +130,9 @@ impl Sampling {
             rope_factor,
             dtype,
             cache_dtype,
+            kv_eviction: req.kv_eviction.unwrap_or_default(),
+            kv_budget: req.kv_budget.unwrap_or(0),
+            kv_recent: req.kv_recent.unwrap_or(0),
         })
     }
 }
@@ -194,6 +210,11 @@ fn run_generate(
     // Request-level RoPE override for context extension; `none` + factor 1
     // keeps whatever the checkpoint config declares.
     config.set_rope_scaling(s.rope_kind, s.rope_factor);
+    // Same for eviction: empty policy / zero knobs keep the checkpoint config.
+    config.set_kv_eviction(&s.kv_eviction, s.kv_budget, s.kv_recent);
+    let eviction = config
+        .eviction_geometry()
+        .map_err(|e| format!("invalid KV eviction config: {e}"))?;
 
     let tokenizer = crate::data::resolve_tokenizer(Some(model_dir.as_path()))
         .map_err(|e| format!("tokenizer not found: {e}"))?;
@@ -203,15 +224,15 @@ fn run_generate(
         // backend's f16 casts are no-ops).
         (crate::config::DType::F32, crate::model::KvCacheDtype::F16) => {
             run_generate_backend::<crate::backend::WgpuHalf<f32>>(
-                config, weights_path, tokenizer, s, stream, tx,
+                config, weights_path, tokenizer, s, eviction, stream, tx,
             )
         }
         (crate::config::DType::F32, _) => run_generate_backend::<burn::backend::Wgpu>(
-            config, weights_path, tokenizer, s, stream, tx,
+            config, weights_path, tokenizer, s, eviction, stream, tx,
         ),
         (crate::config::DType::F16, _) => {
             run_generate_backend::<crate::backend::WgpuHalf<burn::tensor::f16>>(
-                config, weights_path, tokenizer, s, stream, tx,
+                config, weights_path, tokenizer, s, eviction, stream, tx,
             )
         }
     }
@@ -222,6 +243,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
     weights_path: std::path::PathBuf,
     tokenizer: crate::data::LlmTokenizer,
     s: Sampling,
+    eviction: Option<crate::config::EvictionGeometry>,
     stream: bool,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String, String> {
@@ -255,6 +277,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
             s.repetition_penalty,
             seed,
             s.cache_dtype,
+            eviction,
             &device,
             |chunk| tx.blocking_send(chunk.to_string()).is_ok(),
         )
@@ -274,6 +297,7 @@ fn run_generate_backend<B: burn::tensor::backend::Backend>(
         s.repetition_penalty,
         seed,
         s.cache_dtype,
+        eviction,
         &device,
     )
     .map_err(|e| format!("generate error: {e}"))

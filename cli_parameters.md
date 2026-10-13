@@ -30,6 +30,9 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--sink-tokens` | `usize` | `0` | Initial tokens always kept attendable (attention sinks, StreamingLLM). |
 | `--kv-share-group` | `usize` | `1` | Layers per cross-layer K/V sharing group (`1` = no sharing). One K/V projection and cache serve each group, shrinking KV memory by the group size at the cost of a different computation graph. |
 | `--mla-latent-dim` | `usize` | `0` | Multi-head Latent Attention: compress K/V into a latent of this size and cache only the latent (`0` = disabled). Memory per token is `latent_dim` floats instead of `2·n_kv_head·head_dim`. GGUF export folds the weights exactly (`W_down · W_up`). |
+| `--kv-eviction` | `String` | `"none"` | Bounded-cache policy: `none` (dense/ring) or `h2o`. With `h2o`, training replaces the dense past with a keep-mask (sinks + recent + `budget − sinks − recent` pseudo-random heavy hitters), matching the score-based eviction used at inference. Mutually exclusive with `--sliding-window`. |
+| `--kv-budget` | `usize` | `0` | Resident KV cache rows including sinks and recent tokens (required by `--kv-eviction h2o`). Must exceed `sink_tokens + kv_recent` so at least one heavy hitter fits. |
+| `--kv-recent` | `usize` | `64` | Most recent tokens never evicted. |
 | `--val-split` | `f32` | `0.1` | Percentage of the dataset reserved for validation and perplexity computation ($\text{PPL} = e^{\text{loss}}$). |
 | `--grad-accum` | `usize` | `1` | Gradient accumulation steps before running the AdamW step. |
 | `--save-dir` | `Option<String>`| `None` | Directory to save automatic model checkpoints at the end of each epoch. |
@@ -75,6 +78,7 @@ Evaluates the cross-entropy loss, perplexity ($PPL$) and bits per byte (BPB) of 
 | `--max-tokens` | `usize` | `0` | Tokenizes at most this many dataset tokens before evaluating (`0` = all). Useful to evaluate a slice of a huge corpus instead of tokenizing it fully. Pairs with `--eval-batches`. |
 | `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
 | `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
+| `--dense` | `bool` (flag) | `false` | Disables the checkpoint's heavy-hitter eviction keep-mask for a dense (upper-bound) evaluation of an eviction-trained model. |
 
 ---
 
@@ -110,6 +114,9 @@ Performs autoregressive text inference using the model loaded from `--model-dir`
 | `--kv-cache-dtype` | `String` | `"f32"` | KV cache precision: `f32`, `f16` (halves memory; automatically runs on the non-fused backend because the fused backend's f16 casts are silent no-ops), `int8` (4 values per i32 word + per-block scales) or `q4` (8 nibbles per i32 word + per-block scales). |
 | `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
 | `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
+| `--kv-eviction` | `String` | `""` | Eviction override: `h2o`, `none` or empty to keep the checkpoint config. |
+| `--kv-budget` | `usize` | `0` | Resident KV cache rows (`0` = checkpoint config). The generation loop still runs to the RoPE-extended context. |
+| `--kv-recent` | `usize` | `0` | Recent tokens never evicted (`0` = checkpoint config). |
 
 ---
 
@@ -149,7 +156,7 @@ Downloads a dataset file from Hugging Face Hub; Parquet files are automatically 
 ---
 
 ## 📈 9. `stats` Subcommand Parameters
-Prints the model parameter count, VRAM footprint, FLOPs statistics and KV cache estimates for every storage format (`f32`, `f16`, `int8`, `q4`, in bytes/token and total MB at `n_ctx`). It takes no parameters.
+Prints the model parameter count, VRAM footprint, FLOPs statistics and KV cache estimates for every storage format (`f32`, `f16`, `int8`, `q4`, in bytes/token and total MB at `n_ctx`). When the checkpoint enables heavy-hitter eviction it also reports the geometry (`sinks + recent + hitters`), the resident budget in MB per storage format and the f32 score overhead. It takes no parameters.
 
 ---
 

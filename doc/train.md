@@ -210,3 +210,23 @@ All three are also available in the web Train form and the JSON API.
 Parquet corpora no longer need a manual extraction step: `prepare-dataset` tokenizes the
 text column directly to `.bin`, and `--dedupe` removes exact duplicate lines/documents
 before tokenizing.
+
+## Heavy-Hitter Eviction (H2O)
+
+`--kv-eviction h2o --kv-budget N [--kv-recent R]` trains the model for a **bounded
+heavy-hitter cache**: `N` resident rows split into attention sinks, the last `R` tokens
+(`64` by default) and `N − sinks − R` old rows kept by importance.
+
+- The training mask replaces the dense past with a keep-mask: for query rows before the
+  budget the past is dense, past the budget only sinks, recent tokens and a
+  per-forward pseudo-random set of `N − sinks − R` old columns are attendable. Random
+  selection is a conservative lower bound of the score-based selection used at inference.
+- The set is resampled on every forward pass (SplitMix64 seeded per call), so the model
+  cannot overfit one cache layout.
+- `sliding_window` and `kv_eviction` are mutually exclusive; a budget that does not
+  exceed `sink_tokens + kv_recent` is rejected with a clear error.
+- At inference the same geometry drives H2O eviction: attention mass is accumulated per
+  cached row in f32 (independent of the cache dtype) and the lowest-score unprotected row
+  is recycled when the budget is full.
+- `eval` follows the checkpoint mask automatically; pass `--dense` for a dense
+  upper-bound reference of the same weights.

@@ -2,7 +2,8 @@ use crate::config::{ModelConfig, RopeScalingKind};
 use burn::module::{Module, ModuleMapper, Param};
 use burn::nn::{Dropout, DropoutConfig, Embedding, Linear, LinearConfig};
 use burn::tensor::backend::Backend;
-use burn::tensor::{DType, ElementConversion, FloatDType, Int, Tensor, TensorData};
+use burn::tensor::{Bool, DType, ElementConversion, FloatDType, Int, Tensor, TensorData};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// True when the backend computes in f16. Burn 0.21 creates f32 tensors from
 /// `from_data`/`zeros` even on an f16 backend, so callers must normalize them.
@@ -242,6 +243,12 @@ pub struct KvCache<B: Backend> {
     pub positions: Vec<usize>,
     /// Storage format for the cached rows.
     pub dtype: KvCacheDtype,
+    /// Accumulated attention mass per slot, always f32. `Some` enables
+    /// heavy-hitter eviction; the accumulator is independent of the storage
+    /// dtype (f16/int8/q4 caches still score in f32).
+    pub scores: Option<Tensor<B, 1>>,
+    /// Most recent tokens protected from eviction (0 when disabled).
+    pub recent: usize,
 }
 
 impl<B: Backend> KvCache<B> {
@@ -288,6 +295,8 @@ impl<B: Backend> KvCache<B> {
                 capacity,
                 positions: vec![usize::MAX; capacity],
                 dtype,
+                scores: None,
+                recent: 0,
             };
         }
         let shape = [batch, n_kv_head, capacity, head_dim];
@@ -311,6 +320,8 @@ impl<B: Backend> KvCache<B> {
             capacity,
             positions: vec![usize::MAX; capacity],
             dtype,
+            scores: None,
+            recent: 0,
         }
     }
 
@@ -369,6 +380,8 @@ impl<B: Backend> KvCache<B> {
                 capacity,
                 positions: vec![usize::MAX; capacity],
                 dtype,
+                scores: None,
+                recent: 0,
             };
         }
         let k: Tensor<B, 4> = Tensor::zeros([batch, heads, capacity, dim], device);
@@ -388,7 +401,26 @@ impl<B: Backend> KvCache<B> {
             capacity,
             positions: vec![usize::MAX; capacity],
             dtype,
+            scores: None,
+            recent: 0,
         }
+    }
+
+    /// Turns on heavy-hitter eviction: allocates the f32 attention-mass
+    /// accumulator and protects the last `recent` tokens from eviction.
+    pub fn enable_eviction(&mut self, recent: usize) {
+        let device = match (&self.k, &self.v, &self.kq) {
+            (Some(k), _, _) => k.device(),
+            (_, Some(v), _) => v.device(),
+            (_, _, Some(q)) => q.device(),
+            _ => panic!("KV cache has no storage to derive the device from"),
+        };
+        self.scores = Some(Tensor::zeros([self.capacity], &device));
+        self.recent = recent;
+    }
+
+    pub fn eviction_enabled(&self) -> bool {
+        self.scores.is_some()
     }
 }
 
@@ -624,27 +656,44 @@ pub struct CausalSelfAttention<B: Backend> {
     pub n_head: usize,
     pub n_kv_head: usize,
     pub n_embd: usize,
+    /// Trained context window (eviction keep-mask density).
+    pub n_ctx: usize,
     pub attn_softcap: f32,
     /// Sliding attention window in tokens (`None` = full causal attention).
     pub sliding_window: Option<usize>,
     /// Number of initial tokens kept attendable forever (attention sinks).
     pub sink_tokens: usize,
+    /// Heavy-hitter eviction budget in rows (`None` = dense/ring mask).
+    pub evict_budget: Option<usize>,
+    /// Recent tokens protected from eviction (training mask).
+    pub evict_recent: usize,
 }
 
 impl<B: Backend> CausalSelfAttention<B> {
     /// Allowed-attention mask over absolute row and column positions: causal,
-    /// plus the sliding window and attention sinks when configured. Columns
-    /// with the `i32::MAX` sentinel (empty ring slots) are always masked out.
+    /// plus the bounded-cache geometries when configured (sliding window +
+    /// sinks, or the eviction keep-mask used during training). Columns with
+    /// the `i32::MAX` sentinel (empty ring slots) are always masked out.
     fn allowed_mask(
         &self,
         row_pos: Tensor<B, 1, Int>,
         col_pos: Tensor<B, 1, Int>,
-    ) -> Tensor<B, 2, burn::tensor::Bool> {
+        keep_old: Option<&Tensor<B, 2, Bool>>,
+    ) -> Tensor<B, 2, Bool> {
         let [rows] = row_pos.dims();
         let [cols] = col_pos.dims();
         let r = row_pos.reshape([rows, 1]);
         let c = col_pos.reshape([1, cols]);
         let causal = c.clone().lower_equal(r.clone());
+        if let (Some(budget), Some(keep)) = (self.evict_budget, keep_old) {
+            // Eviction-aligned training mask: dense until the cache budget is
+            // reached, then sinks + recent + the sampled heavy hitters.
+            let dense = r.clone().lower_elem(budget as i32);
+            let recent = c.clone().greater(r.sub_scalar(self.evict_recent as i32));
+            let sinks = c.lower_elem(self.sink_tokens as i32);
+            let sparse = sinks.bool_or(recent).bool_or(keep.clone());
+            return causal.bool_and(dense.bool_or(sparse));
+        }
         match self.sliding_window {
             Some(window) => {
                 // Last `window` positions: distance < window  <=>  col > row - window.
@@ -677,7 +726,10 @@ impl<B: Backend> CausalSelfAttention<B> {
     }
 
     /// Attention output for a precomputed query and the K/V rows whose
-    /// absolute positions are `col_pos`.
+    /// absolute positions are `col_pos`. When `collect_mass` is set, also
+    /// returns the attention mass received by every K/V column (summed over
+    /// the batch, heads and query rows), which drives heavy-hitter eviction.
+    #[allow(clippy::too_many_arguments)]
     pub fn attend(
         &self,
         q_embed: Tensor<B, 4>,
@@ -685,7 +737,9 @@ impl<B: Backend> CausalSelfAttention<B> {
         v_full: Tensor<B, 4>,
         row_pos: Tensor<B, 1, Int>,
         col_pos: Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        keep_old: Option<Tensor<B, 2, Bool>>,
+        collect_mass: bool,
+    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         let [batch_size, _, seq_len, _] = q_embed.dims();
         let head_size = self.n_embd / self.n_head;
         let n_rep = self.n_head / self.n_kv_head;
@@ -702,15 +756,30 @@ impl<B: Backend> CausalSelfAttention<B> {
             scores = (scores / cap).tanh() * cap;
         }
 
-        let disallowed = self.allowed_mask(row_pos, col_pos).bool_not();
+        let disallowed = self
+            .allowed_mask(row_pos, col_pos, keep_old.as_ref())
+            .bool_not();
         scores = scores.mask_fill(disallowed.unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(0), -1e4);
 
         let attn_probs = burn::tensor::activation::softmax(scores, 3);
+        let mass = if collect_mass {
+            let [_, _, _, cols] = attn_probs.dims();
+            Some(
+                attn_probs
+                    .clone()
+                    .sum_dim(0)
+                    .sum_dim(1)
+                    .sum_dim(2)
+                    .reshape([cols]),
+            )
+        } else {
+            None
+        };
         let attn_probs = self.attn_dropout.forward(attn_probs);
         let out = attn_probs.matmul(v_repeat);
 
         let out = out.swap_dims(1, 2).reshape([batch_size, seq_len, self.n_embd]);
-        self.resid_dropout.forward(self.out_proj.forward(out))
+        (self.resid_dropout.forward(self.out_proj.forward(out)), mass)
     }
 }
 
@@ -833,6 +902,131 @@ fn cache_segments<B: Backend>(
     segments
 }
 
+/// Training-time eviction simulation step counter: every forward pass samples
+/// a different heavy-hitter keep set, so the model cannot overfit one cache
+/// layout.
+static KEEP_STEP: AtomicU64 = AtomicU64::new(0);
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
+}
+
+/// Column keep-mask that simulates the steady-state bounded cache: sinks and
+/// recent columns are handled positionally by the mask, while old columns
+/// survive with probability `hitters / (n_ctx - sinks - recent)`.
+fn sample_keep_mask<B: Backend>(
+    seq_len: usize,
+    n_ctx: usize,
+    budget: usize,
+    recent: usize,
+    sinks: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Bool> {
+    let old_region = n_ctx.saturating_sub(sinks + recent).max(1);
+    let hitters = budget.saturating_sub(sinks + recent);
+    let p = (hitters as f64 / old_region as f64).min(1.0);
+    let step = KEEP_STEP.fetch_add(1, Ordering::Relaxed);
+    let mut bits = vec![false; seq_len];
+    for (c, bit) in bits.iter_mut().enumerate() {
+        let h = splitmix64(step ^ (c as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let u = (h >> 11) as f64 / (1u64 << 53) as f64;
+        *bit = u < p;
+    }
+    Tensor::<B, 1, Bool>::from_data(TensorData::new(bits, [seq_len]), device)
+        .reshape([1, seq_len])
+}
+
+/// Slot assigned to every new row when heavy-hitter eviction is enabled.
+/// While the cache has free rows they are appended in order; once full the
+/// victim is the live row with the lowest accumulated attention score that is
+/// neither a sink, nor inside the recent window, nor written by this same
+/// call. `positions` and `len` are updated here; victim scores reset to zero.
+fn alloc_evict_slots<B: Backend>(
+    cache: &mut KvCache<B>,
+    start_pos: usize,
+    new_seq_len: usize,
+    sink_tokens: usize,
+) -> Vec<usize> {
+    assert!(
+        cache.capacity > sink_tokens + cache.recent,
+        "KV budget ({}) must exceed sink tokens ({}) + recent tokens ({})",
+        cache.capacity,
+        sink_tokens,
+        cache.recent
+    );
+    let scores_host: Option<Vec<f32>> = if cache.len + new_seq_len > cache.capacity {
+        Some(
+            cache
+                .scores
+                .as_ref()
+                .expect("eviction allocator needs the score accumulator")
+                .clone()
+                .into_data()
+                .to_vec::<f32>()
+                .expect("f32 score readback"),
+        )
+    } else {
+        None
+    };
+
+    let mut slots = Vec::with_capacity(new_seq_len);
+    let mut victims: Vec<usize> = Vec::new();
+    for offset in 0..new_seq_len {
+        let pos = start_pos + offset;
+        if cache.len < cache.capacity {
+            let slot = cache.len;
+            cache.len += 1;
+            cache.positions[slot] = pos;
+            slots.push(slot);
+            continue;
+        }
+        let scores = scores_host.as_ref().expect("scores read back when full");
+        // Rows at or after `cutoff` are the recent window and stay put.
+        let cutoff = pos.saturating_sub(cache.recent);
+        let victim = (0..cache.capacity)
+            .filter(|&s| {
+                let p = cache.positions[s];
+                p != usize::MAX
+                    && p >= sink_tokens
+                    && p < cutoff
+                    && !victims.contains(&s)
+                    && !slots.contains(&s)
+            })
+            .min_by(|&a, &b| {
+                scores[a]
+                    .partial_cmp(&scores[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| cache.positions[a].cmp(&cache.positions[b]))
+            })
+            .expect("budget must exceed sinks + recent so a victim exists");
+        cache.positions[victim] = pos;
+        victims.push(victim);
+        slots.push(victim);
+    }
+
+    if !victims.is_empty() {
+        // Fresh rows start from a clean score; multiply by a 0/1 mask (Burn's
+        // scatter only implements `Add` and its Int dtype plumbing differs per
+        // backend, so the mask is the portable option).
+        let mut scores = cache.scores.take().expect("scores enabled");
+        let device = scores.device();
+        let mask: Vec<f32> = (0..cache.capacity)
+            .map(|s| if victims.contains(&s) { 0.0 } else { 1.0 })
+            .collect();
+        let mask = Tensor::<B, 1>::from_data(
+            TensorData::new(mask, [cache.capacity]),
+            &device,
+        );
+        scores = scores * mask;
+        cache.scores = Some(scores);
+    }
+    slots
+}
+
 /// Writes K/V rows for the absolute positions `start_pos..` into the ring
 /// cache with contiguous `slice_assign` segments (in place when the buffer has
 /// a single owner). Shared by every group leader.
@@ -850,6 +1044,10 @@ fn cache_write<B: Backend>(
         cache.capacity,
         sink_tokens
     );
+    if cache.eviction_enabled() {
+        cache_write_evict(cache, k_embed, v, start_pos, sink_tokens);
+        return;
+    }
     for pos in start_pos..(start_pos + new_seq_len) {
         let slot = cache.slot_for(pos, sink_tokens);
         cache.positions[slot] = pos;
@@ -924,6 +1122,85 @@ fn cache_write<B: Backend>(
     cache.v = Some(v_buf);
 }
 
+/// Heavy-hitter variant of [`cache_write`]: rows go to the slots chosen by
+/// [`alloc_evict_slots`] (append while there is room, otherwise the victim
+/// slot), written one row at a time because victims are not contiguous.
+fn cache_write_evict<B: Backend>(
+    cache: &mut KvCache<B>,
+    k_embed: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    start_pos: usize,
+    sink_tokens: usize,
+) {
+    let [batch_size, n_kv_head, new_seq_len, head_size] = k_embed.dims();
+    let slots = alloc_evict_slots(cache, start_pos, new_seq_len, sink_tokens);
+
+    if cache.dtype.is_quantized() {
+        let row_len = n_kv_head * head_size;
+        let pack = cache.dtype.pack();
+        let block = quant_block(row_len);
+        let words = row_len / pack;
+        let blocks = row_len / block;
+        let to_rows =
+            |x: Tensor<B, 4>| x.swap_dims(1, 2).reshape([batch_size * new_seq_len, row_len]);
+        let (kp, ksc) = quantize_rows(to_rows(k_embed), cache.dtype);
+        let (vp, vsc) = quantize_rows(to_rows(v), cache.dtype);
+        let mut kq = cache.kq.take().expect("kv cache kq buffer");
+        let mut ks = cache.ks.take().expect("kv cache ks buffer");
+        let mut vq = cache.vq.take().expect("kv cache vq buffer");
+        let mut vs = cache.vs.take().expect("kv cache vs buffer");
+        for (row, &slot) in slots.iter().enumerate() {
+            kq = kq.slice_assign(
+                [slot..slot + 1, 0..words],
+                kp.clone().slice([row..row + 1, 0..words]),
+            );
+            ks = ks.slice_assign(
+                [slot..slot + 1, 0..blocks],
+                ksc.clone().slice([row..row + 1, 0..blocks]),
+            );
+            vq = vq.slice_assign(
+                [slot..slot + 1, 0..words],
+                vp.clone().slice([row..row + 1, 0..words]),
+            );
+            vs = vs.slice_assign(
+                [slot..slot + 1, 0..blocks],
+                vsc.clone().slice([row..row + 1, 0..blocks]),
+            );
+        }
+        cache.kq = Some(kq);
+        cache.ks = Some(ks);
+        cache.vq = Some(vq);
+        cache.vs = Some(vs);
+        return;
+    }
+
+    let k_embed = if cache.dtype == KvCacheDtype::F16 {
+        k_embed.cast(FloatDType::F16)
+    } else {
+        k_embed
+    };
+    let v = if cache.dtype == KvCacheDtype::F16 {
+        v.cast(FloatDType::F16)
+    } else {
+        v
+    };
+    let mut k_buf = cache.k.take().expect("kv cache k buffer");
+    let mut v_buf = cache.v.take().expect("kv cache v buffer");
+    for (row, &slot) in slots.iter().enumerate() {
+        let write_slice = [0..batch_size, 0..n_kv_head, slot..slot + 1, 0..head_size];
+        let k_part = k_embed
+            .clone()
+            .slice([0..batch_size, 0..n_kv_head, row..row + 1, 0..head_size]);
+        let v_part = v
+            .clone()
+            .slice([0..batch_size, 0..n_kv_head, row..row + 1, 0..head_size]);
+        k_buf = k_buf.slice_assign(write_slice.clone(), k_part);
+        v_buf = v_buf.slice_assign(write_slice, v_part);
+    }
+    cache.k = Some(k_buf);
+    cache.v = Some(v_buf);
+}
+
 /// Absolute position of every ring slot as `i32` (`i32::MAX` for empty slots,
 /// masked out by the attention).
 fn cache_positions_i32<B: Backend>(cache: &KvCache<B>) -> Vec<i32> {
@@ -948,6 +1225,10 @@ fn cache_write_latent<B: Backend>(
         cache.capacity,
         sink_tokens
     );
+    if cache.eviction_enabled() {
+        cache_write_latent_evict(cache, latent, start_pos, sink_tokens);
+        return;
+    }
     for pos in start_pos..(start_pos + new_seq_len) {
         let slot = cache.slot_for(pos, sink_tokens);
         cache.positions[slot] = pos;
@@ -999,6 +1280,60 @@ fn cache_write_latent<B: Backend>(
     cache.k = Some(k_buf);
 }
 
+/// Heavy-hitter variant of [`cache_write_latent`], one row at a time into the
+/// slots chosen by [`alloc_evict_slots`].
+fn cache_write_latent_evict<B: Backend>(
+    cache: &mut KvCache<B>,
+    latent: Tensor<B, 4>,
+    start_pos: usize,
+    sink_tokens: usize,
+) {
+    let [batch_size, heads, new_seq_len, dim] = latent.dims();
+    let slots = alloc_evict_slots(cache, start_pos, new_seq_len, sink_tokens);
+
+    if cache.dtype.is_quantized() {
+        let row_len = heads * dim;
+        let pack = cache.dtype.pack();
+        let block = quant_block(row_len);
+        let words = row_len / pack;
+        let blocks = row_len / block;
+        let rows = latent
+            .swap_dims(1, 2)
+            .reshape([batch_size * new_seq_len, row_len]);
+        let (packed, scales) = quantize_rows(rows, cache.dtype);
+        let mut kq = cache.kq.take().expect("mla cache kq buffer");
+        let mut ks = cache.ks.take().expect("mla cache ks buffer");
+        for (row, &slot) in slots.iter().enumerate() {
+            kq = kq.slice_assign(
+                [slot..slot + 1, 0..words],
+                packed.clone().slice([row..row + 1, 0..words]),
+            );
+            ks = ks.slice_assign(
+                [slot..slot + 1, 0..blocks],
+                scales.clone().slice([row..row + 1, 0..blocks]),
+            );
+        }
+        cache.kq = Some(kq);
+        cache.ks = Some(ks);
+        return;
+    }
+
+    let latent = if cache.dtype == KvCacheDtype::F16 {
+        latent.cast(FloatDType::F16)
+    } else {
+        latent
+    };
+    let mut k_buf = cache.k.take().expect("kv cache latent buffer");
+    for (row, &slot) in slots.iter().enumerate() {
+        let write_slice = [0..batch_size, 0..heads, slot..slot + 1, 0..dim];
+        let part = latent
+            .clone()
+            .slice([0..batch_size, 0..heads, row..row + 1, 0..dim]);
+        k_buf = k_buf.slice_assign(write_slice, part);
+    }
+    cache.k = Some(k_buf);
+}
+
 /// Absolute position of every ring slot as an `Int` tensor (`i32::MAX` for
 /// empty slots, masked out by the attention).
 fn cache_col_positions<B: Backend>(cache: &KvCache<B>, device: &B::Device) -> Tensor<B, 1, Int> {
@@ -1018,6 +1353,10 @@ pub struct CausalSelfAttentionConfig {
     pub rope_factor: f32,
     pub sliding_window: Option<usize>,
     pub sink_tokens: usize,
+    /// Heavy-hitter eviction budget in rows (`None` = dense/ring mask).
+    pub evict_budget: Option<usize>,
+    /// Recent tokens protected from eviction (training mask).
+    pub evict_recent: usize,
 }
 
 impl CausalSelfAttentionConfig {
@@ -1035,9 +1374,12 @@ impl CausalSelfAttentionConfig {
             n_head: self.n_head,
             n_kv_head: self.n_kv_head,
             n_embd: self.n_embd,
+            n_ctx: self.n_ctx,
             attn_softcap: self.attn_softcap,
             sliding_window: self.sliding_window,
             sink_tokens: self.sink_tokens,
+            evict_budget: self.evict_budget,
+            evict_recent: self.evict_recent,
         }
     }
 }
@@ -1146,7 +1488,10 @@ pub struct Block<B: Backend> {
 
 impl<B: Backend> Block<B> {
     /// Runs the block with K/V rows already projected by the group leader and
-    /// their absolute column positions.
+    /// their absolute column positions. `keep_old` is the training-time
+    /// eviction keep-mask and `collect_mass` requests the per-column attention
+    /// mass used by heavy-hitter eviction during cached decoding.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
@@ -1155,12 +1500,19 @@ impl<B: Backend> Block<B> {
         start_pos: usize,
         row_pos: Tensor<B, 1, Int>,
         col_pos: Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        keep_old: Option<Tensor<B, 2, Bool>>,
+        collect_mass: bool,
+    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
         let ln = self.input_layernorm.forward(x.clone());
         let q = self.attn.query(ln, start_pos);
-        let attn_out = self.attn.attend(q, k_full, v_full, row_pos, col_pos);
+        let (attn_out, mass) =
+            self.attn
+                .attend(q, k_full, v_full, row_pos, col_pos, keep_old, collect_mass);
         let x = x + attn_out;
-        x.clone() + self.mlp.forward(self.post_attention_layernorm.forward(x))
+        (
+            x.clone() + self.mlp.forward(self.post_attention_layernorm.forward(x)),
+            mass,
+        )
     }
 }
 
@@ -1176,6 +1528,8 @@ pub struct BlockConfig {
     pub rope_factor: f32,
     pub sliding_window: Option<usize>,
     pub sink_tokens: usize,
+    pub evict_budget: Option<usize>,
+    pub evict_recent: usize,
 }
 
 impl BlockConfig {
@@ -1192,6 +1546,8 @@ impl BlockConfig {
                 rope_factor: self.rope_factor,
                 sliding_window: self.sliding_window,
                 sink_tokens: self.sink_tokens,
+                evict_budget: self.evict_budget,
+                evict_recent: self.evict_recent,
             }
             .init(device),
             mlp: SwiGluMlpConfig {
@@ -1221,6 +1577,11 @@ pub struct Llm<B: Backend> {
     pub max_seq: usize,
     /// Layers per K/V group (`1` = no cross-layer reuse).
     pub kv_share_group: usize,
+    /// Heavy-hitter eviction budget in rows (`None` = dense/ring cache). The
+    /// training forward uses it to build the eviction keep-mask.
+    pub evict_budget: Option<usize>,
+    /// Recent tokens protected from eviction (training mask).
+    pub evict_recent: usize,
 }
 
 impl<B: Backend> Llm<B> {
@@ -1233,6 +1594,11 @@ impl<B: Backend> Llm<B> {
     /// Whether the model compresses K/V into an MLA latent.
     pub fn use_mla(&self) -> bool {
         !self.mla.is_empty()
+    }
+
+    /// Number of attention sinks configured on the blocks.
+    pub fn sink_tokens(&self) -> usize {
+        self.blocks.first().map(|b| b.attn.sink_tokens).unwrap_or(0)
     }
 
     /// Number of rows each layer cache needs. With a sliding window the cache
@@ -1313,6 +1679,17 @@ impl<B: Backend> Llm<B> {
         let col_pos = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device);
         let group = self.kv_share_group.max(1);
         let positions: Vec<i32> = (0..seq_len as i32).collect();
+        // Eviction-aligned training: sample this batch's heavy-hitter columns.
+        let keep_old = self.evict_budget.map(|budget| {
+            sample_keep_mask::<B>(
+                seq_len,
+                self.n_ctx,
+                budget,
+                self.evict_recent,
+                self.sink_tokens(),
+                &device,
+            )
+        });
 
         let mut x = tok_emb;
         let mut group_kv: Option<(Tensor<B, 4>, Tensor<B, 4>)> = None;
@@ -1327,7 +1704,17 @@ impl<B: Backend> Llm<B> {
                 });
             }
             let (k, v) = group_kv.as_ref().expect("group leader computed K/V");
-            x = block.forward(x, k.clone(), v.clone(), 0, row_pos.clone(), col_pos.clone());
+            let (x_new, _) = block.forward(
+                x,
+                k.clone(),
+                v.clone(),
+                0,
+                row_pos.clone(),
+                col_pos.clone(),
+                keep_old.clone(),
+                false,
+            );
+            x = x_new;
         }
 
         let x = self.norm.forward(x);
@@ -1450,7 +1837,22 @@ impl<B: Backend> Llm<B> {
                 }
             };
             let col_pos = cache_col_positions(cache, &device);
-            x = block.forward(x, k_full, v_full, start_pos, row_pos.clone(), col_pos);
+            let want_mass = cache.eviction_enabled();
+            let (x_new, mass) = block.forward(
+                x,
+                k_full,
+                v_full,
+                start_pos,
+                row_pos.clone(),
+                col_pos,
+                None,
+                want_mass,
+            );
+            x = x_new;
+            if let Some(mass) = mass {
+                let scores = caches[g].scores.take().expect("eviction scores enabled");
+                caches[g].scores = Some(scores + mass.cast(FloatDType::F32));
+            }
         }
 
         let x = self.norm.forward(x);
@@ -1466,6 +1868,9 @@ impl ModelConfig {
         let rope_kind = self.rope_kind();
         let rope_factor = self.rope_factor;
         let max_seq = extended_ctx_len(self.n_ctx, rope_kind, rope_factor);
+        // Invalid eviction configs are rejected by the CLI/API entry points;
+        // here they only downgrade to the dense mask.
+        let eviction = self.eviction_geometry().ok().flatten();
         let blocks = (0..self.n_layer)
             .map(|_| {
                 BlockConfig {
@@ -1479,6 +1884,8 @@ impl ModelConfig {
                     rope_factor,
                     sliding_window: self.sliding_window,
                     sink_tokens: self.sink_tokens,
+                    evict_budget: eviction.map(|e| e.budget),
+                    evict_recent: eviction.map(|e| e.recent).unwrap_or(0),
                 }
                 .init(device)
             })
@@ -1539,6 +1946,8 @@ impl ModelConfig {
             n_ctx: self.n_ctx,
             max_seq,
             kv_share_group: self.kv_share_group.max(1),
+            evict_budget: eviction.map(|e| e.budget),
+            evict_recent: eviction.map(|e| e.recent).unwrap_or(0),
         }
         .align_compute_dtype()
     }
@@ -1615,6 +2024,8 @@ mod tests {
             rope_factor: 1.0,
             sliding_window: None,
             sink_tokens: 0,
+            evict_budget: None,
+            evict_recent: 0,
         };
         let attn = base.init::<NdArray<f32, i32>>(&device);
         assert_eq!(attn.rope_freqs.len(), 4); // head_dim / 2
@@ -1865,6 +2276,149 @@ mod tests {
     fn test_cached_decode_matches_full_with_mla() {
         let (capacity, _) = assert_cached_matches_full_with_window(None, 0, 1, Some(16));
         assert_eq!(capacity, 8);
+    }
+
+    #[test]
+    fn test_evict_slots_protect_sinks_and_recent() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut cache =
+            KvCache::<NdArray<f32, i32>>::preallocated(1, 1, 4, 8, KvCacheDtype::F32, &device);
+        cache.enable_eviction(2);
+        // Fill the cache: rows 0..8 are appended in order.
+        let slots = alloc_evict_slots(&mut cache, 0, 8, 2);
+        assert_eq!(slots, (0..8).collect::<Vec<_>>());
+        assert_eq!(cache.len, 8);
+        // pos 8: cutoff 6 -> victim is the lowest-position row among 2..6.
+        let slots = alloc_evict_slots(&mut cache, 8, 1, 2);
+        assert_eq!(slots, vec![2]);
+        assert_eq!(cache.positions[2], 8);
+        // pos 9: cutoff 7 -> victim among 3..7 (position 8 is recent).
+        let slots = alloc_evict_slots(&mut cache, 9, 1, 2);
+        assert_eq!(slots, vec![3]);
+        // Sinks and recent rows survive; the live set is exactly the budget.
+        assert_eq!(cache.positions[0], 0);
+        assert_eq!(cache.positions[1], 1);
+        assert!(cache.positions.contains(&8));
+        assert!(cache.positions.contains(&9));
+        assert!(cache.positions.iter().all(|p| *p != usize::MAX));
+    }
+
+    #[test]
+    fn test_evict_picks_lowest_score_and_resets_it() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let mut cache =
+            KvCache::<NdArray<f32, i32>>::preallocated(1, 1, 4, 6, KvCacheDtype::F32, &device);
+        cache.enable_eviction(1);
+        let _ = alloc_evict_slots(&mut cache, 0, 6, 1);
+        // Position 3 is the least important; position 2 is hot.
+        cache.scores = Some(Tensor::from_data(
+            TensorData::new(vec![9.0, 9.0, 50.0, 0.5, 9.0, 9.0], [6]),
+            &device,
+        ));
+        // pos 6: cutoff 5 -> candidates 1..5, lowest score is position 3.
+        let slots = alloc_evict_slots(&mut cache, 6, 1, 1);
+        assert_eq!(slots, vec![3]);
+        let scores = cache
+            .scores
+            .clone()
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scores[3], 0.0, "victim score must reset");
+        assert_eq!(scores[2], 50.0, "hot rows keep their score");
+    }
+
+    #[test]
+    fn test_sample_keep_mask_density_and_stochasticity() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+        let device = NdArrayDevice::Cpu;
+        let n_ctx = 4096;
+        let sinks = 4;
+        let recent = 64;
+        let budget = 516; // hitters = 448, p = 448 / 4028 ~ 0.111
+        let mask = sample_keep_mask::<NdArray<f32, i32>>(
+            n_ctx, n_ctx, budget, recent, sinks, &device,
+        );
+        assert_eq!(mask.dims(), [1, n_ctx]);
+        let kept = mask
+            .clone()
+            .into_data()
+            .to_vec::<bool>()
+            .unwrap()
+            .iter()
+            .filter(|b| **b)
+            .count();
+        let expected = 448.0f64;
+        // Binomial sd ~ 20; allow 4 sd of slack.
+        assert!(
+            (kept as f64 - expected).abs() < 80.0,
+            "keep-mask density off: kept {kept}, expected ~{expected}"
+        );
+        let other = sample_keep_mask::<NdArray<f32, i32>>(
+            n_ctx, n_ctx, budget, recent, sinks, &device,
+        );
+        assert_ne!(
+            mask.into_data().to_vec::<bool>().unwrap(),
+            other.into_data().to_vec::<bool>().unwrap(),
+            "each forward must resample the keep set"
+        );
+    }
+
+    #[test]
+    fn test_evict_cached_decode_stays_bounded_and_finite() {
+        use burn_ndarray::{NdArray, NdArrayDevice};
+
+        fn run(dtype: KvCacheDtype) {
+            let device = NdArrayDevice::Cpu;
+            let mut config = ModelConfig::new(50, 32, 4, Some(2), 2, 32, 0.0, 0.0);
+            config.sink_tokens = 2;
+            config.kv_eviction = Some("h2o".into());
+            config.kv_budget = Some(8);
+            config.kv_recent = 2;
+            let geo = config.eviction_geometry().unwrap().unwrap();
+            let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+            let capacity = geo.budget.min(model.max_seq_len());
+            let mut caches = model.new_kv_caches(capacity, dtype, &device);
+            for c in caches.iter_mut() {
+                c.enable_eviction(geo.recent);
+            }
+            for pos in 0..20 {
+                let tok = (pos % config.vocab_size) as i32;
+                let input = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+                    TensorData::new(vec![tok], [1, 1]),
+                    &device,
+                );
+                let logits = model.forward_with_cache(input, pos, &mut caches);
+                let vals = logits.into_data().to_vec::<f32>().unwrap();
+                assert!(
+                    vals.iter().all(|v| v.is_finite()),
+                    "{} eviction produced non-finite logits at pos {pos}",
+                    dtype.as_str()
+                );
+            }
+            for c in &caches {
+                assert_eq!(c.len, capacity, "cache must stay at the budget");
+                let mut alive: Vec<usize> = c
+                    .positions
+                    .iter()
+                    .copied()
+                    .filter(|p| *p != usize::MAX)
+                    .collect();
+                let before = alive.len();
+                alive.sort_unstable();
+                alive.dedup();
+                assert_eq!(alive.len(), before, "slot positions must be unique");
+            }
+        }
+
+        // burn-ndarray has no f16 storage, so the f16 cache path is covered by
+        // the WGPU tests; f32/int8/q4 exercise every eviction writer branch.
+        for dtype in [KvCacheDtype::F32, KvCacheDtype::Int8, KvCacheDtype::Q4] {
+            run(dtype);
+        }
     }
 
     #[test]

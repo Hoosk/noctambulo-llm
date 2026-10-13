@@ -1,3 +1,4 @@
+use crate::config::EvictionGeometry;
 use crate::data::LlmTokenizer;
 use crate::model::{KvCache, KvCacheDtype, Llm};
 use burn::tensor::backend::Backend;
@@ -164,11 +165,12 @@ pub fn generate<B: Backend>(
     repetition_penalty: f32,
     seed: u64,
     cache_dtype: KvCacheDtype,
+    eviction: Option<EvictionGeometry>,
     device: &B::Device,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     generate_streaming(
         model, tokenizer, prompt, max_new_tokens, temperature, top_k, top_p, min_p,
-        repetition_penalty, seed, cache_dtype, device, |_| true,
+        repetition_penalty, seed, cache_dtype, eviction, device, |_| true,
     )
 }
 
@@ -188,6 +190,7 @@ pub fn generate_streaming<B: Backend>(
     repetition_penalty: f32,
     seed: u64,
     cache_dtype: KvCacheDtype,
+    eviction: Option<EvictionGeometry>,
     device: &B::Device,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -198,10 +201,14 @@ pub fn generate_streaming<B: Backend>(
     }
 
     // `max_seq_len` is the trained context window extended by the active RoPE
-    // scaling factor (equal to `n_ctx` when scaling is off); `kv_capacity` is
-    // the per-layer cache size, bounded by the sliding window when configured.
+    // scaling factor (equal to `n_ctx` when scaling is off); the cache
+    // capacity is the eviction budget when heavy-hitter eviction is enabled,
+    // otherwise the per-layer size bounded by the sliding window.
     let max_seq = model.max_seq_len();
-    let capacity = model.kv_capacity();
+    let capacity = match eviction {
+        Some(geo) => geo.budget.min(max_seq),
+        None => model.kv_capacity(),
+    };
     if tokens.len() > max_seq {
         eprintln!(
             "Warning: prompt length ({}) exceeds model context window ({}). Keeping the most recent {} tokens.",
@@ -218,6 +225,15 @@ pub fn generate_streaming<B: Backend>(
     let mut decode_stream = tokenizer.decode_stream(true);
 
     let mut caches: Vec<KvCache<B>> = model.new_kv_caches(capacity, cache_dtype, device);
+    if let Some(geo) = eviction {
+        for cache in caches.iter_mut() {
+            cache.enable_eviction(geo.recent);
+        }
+        println!(
+            "\n[KV cache: heavy-hitter eviction, budget {} rows ({} sinks, {} recent, {} hitters)]",
+            capacity, geo.sinks, geo.recent, capacity.saturating_sub(geo.sinks + geo.recent)
+        );
+    }
 
     // 1. Prefill Phase: process the prompt in chunks of at most `capacity`
     // tokens so a ring cache never sees duplicate slots in a single call.

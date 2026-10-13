@@ -971,6 +971,7 @@ pub fn train_with_events<B: AutodiffBackend>(
             1.1,
             42 + epoch as u64,
             crate::model::KvCacheDtype::F32,
+            model_config.eviction_geometry().ok().flatten(),
             device,
         ).ok();
 
@@ -1098,6 +1099,7 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     max_tokens: usize,
     device: &B::Device,
     rope_override: Option<(crate::config::RopeScalingKind, f32)>,
+    dense: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config_path = model_dir.join("config.json");
     if !config_path.exists() {
@@ -1113,6 +1115,15 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     if let Some((kind, factor)) = rope_override {
         config.set_rope_scaling(kind, factor);
         println!("RoPE scaling override: {} (factor {})", kind.as_str(), config.rope_factor);
+    }
+    if dense {
+        config.kv_eviction = None;
+        println!("Dense evaluation: the checkpoint's heavy-hitter eviction mask is disabled.");
+    } else if let Some(geo) = config.eviction_geometry()? {
+        println!(
+            "Eviction-aware evaluation: budget {} rows ({} sinks, {} recent, {} hitters).",
+            geo.budget, geo.sinks, geo.recent, geo.hitters
+        );
     }
 
     println!("Loading model config from {:?}...", config_path);
@@ -1254,6 +1265,7 @@ mod tests {
             1.1,
             7,
             crate::model::KvCacheDtype::F32,
+            None,
             &device,
         )
         .unwrap();
@@ -1271,6 +1283,7 @@ mod tests {
             1.1,
             7,
             crate::model::KvCacheDtype::F32,
+            None,
             &device,
             |chunk| {
                 streamed.push_str(chunk);
@@ -1820,6 +1833,49 @@ mod tests {
             last < first - 1.0,
             "training did not reduce the loss ({first:.4} -> {last:.4}); \
              default weight decay is breaking the optimizer again"
+        );
+    }
+
+    #[test]
+    fn test_training_learns_with_eviction_mask() {
+        let device = NdArrayDevice::Cpu;
+        let dir = test_dir("evict_overfit");
+        let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
+        let mut config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        config.sink_tokens = 1;
+        config.kv_eviction = Some("h2o".into());
+        config.kv_budget = Some(4);
+        config.kv_recent = 1;
+        config
+            .eviction_geometry()
+            .unwrap()
+            .expect("valid eviction geometry");
+        let init = save_initial_weights::<NdArray<f32, i32>>(&dir, &config, &device);
+        let out = dir.join("out");
+
+        let losses = run_train_losses::<TestBackend>(
+            &config, &tokenizer, &corpus, 8, 4, 0, &init, &out, &device,
+        );
+        assert!(!losses.is_empty(), "no progress events emitted");
+        let first = losses
+            .iter()
+            .map(|(_, l)| *l)
+            .find(|l| *l > 0.0)
+            .unwrap_or(losses.first().unwrap().1);
+        let last = losses
+            .iter()
+            .rev()
+            .map(|(_, l)| *l)
+            .find(|l| *l > 0.0)
+            .unwrap_or(losses.last().unwrap().1);
+        eprintln!(
+            "[EVICT OVERFIT] avg_loss {first:.4} -> {last:.4} over {} steps (chance ~ {:.2})",
+            losses.len(),
+            (tokenizer.vocab_size() as f32).ln()
+        );
+        assert!(
+            last < first - 1.0,
+            "eviction-masked training did not reduce the loss ({first:.4} -> {last:.4})"
         );
     }
 
