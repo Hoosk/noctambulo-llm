@@ -88,6 +88,7 @@ function ModelRow({
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono text-sm text-white">{model.name}</span>
           {model.default ? <Badge tone="violet">default</Badge> : null}
+          {model.import_source ? <Badge tone="sky">{model.import_source}</Badge> : null}
           {model.compatible ? null : <Badge tone="rose">incompatible</Badge>}
           {model.steps != null && model.steps <= 2 ? <Badge tone="amber">demo</Badge> : null}
           {isActive ? (
@@ -102,12 +103,15 @@ function ModelRow({
           <span>layers {model.n_layer}</span>
           <span>ctx {model.n_ctx}</span>
           <span>vocab {model.vocab}</span>
+          <span>ffn {model.ffn_hidden}</span>
           <span>{model.params_m.toFixed(2)}M</span>
           <span>{fmtBytes(model.size_mb * 1024 * 1024)}</span>
         </div>
         <div className="mt-1 text-[10px] text-slate-600 font-mono truncate">{model.dir}</div>
         <div className="mt-0.5 text-[10px] text-slate-500 tnum">
           arch v{model.arch_version}
+          {` · rope θ ${model.rope_base >= 1e5 ? model.rope_base.toExponential(0) : model.rope_base}`}
+          {` · eps ${model.rms_norm_eps.toExponential(0)}`}
           {model.steps != null ? ` · ${model.steps} steps` : ""}
           {model.best_val_loss != null ? ` · best val ${model.best_val_loss.toFixed(3)}` : ""}
         </div>
@@ -221,6 +225,111 @@ function ImportPanel({ onDone }: { onDone: () => void }) {
   );
 }
 
+function ImportHfPanel({ onStarted }: { onStarted: (opId: string) => void }) {
+  const toast = useToast();
+  const [mode, setMode] = useState<"repo" | "dir">("repo");
+  const [repo, setRepo] = useState("Qwen/Qwen2.5-0.5B-Instruct");
+  const [dir, setDir] = useState("");
+  const [outputDir, setOutputDir] = useState("");
+  const [force, setForce] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const run = async () => {
+    const value = mode === "repo" ? repo.trim() : dir.trim();
+    if (!value || busy) return;
+    setBusy(true);
+    try {
+      const res = await api.importModelHf({
+        repo: mode === "repo" ? value : undefined,
+        dir: mode === "dir" ? value : undefined,
+        outputDir: outputDir.trim() || undefined,
+        force,
+      });
+      toast.info(`Converting ${res.name}…`);
+      onStarted(res.opId);
+    } catch (e) {
+      toast.error(`Import failed: ${e instanceof Error ? e.message : "unknown"}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mb-5 glass-card rounded-2xl p-4">
+      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-3">
+        Import from Hugging Face
+      </h3>
+      <div className="flex gap-2 mb-3">
+        <Button
+          variant={mode === "repo" ? "primary" : "ghost"}
+          className="px-3 py-1.5 text-xs"
+          onClick={() => setMode("repo")}
+        >
+          Hub repo
+        </Button>
+        <Button
+          variant={mode === "dir" ? "primary" : "ghost"}
+          className="px-3 py-1.5 text-xs"
+          onClick={() => setMode("dir")}
+        >
+          Local directory
+        </Button>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {mode === "repo" ? (
+          <Field label="Hugging Face repo id">
+            <Input
+              type="text"
+              placeholder="Qwen/Qwen2.5-0.5B-Instruct"
+              value={repo}
+              onChange={(e) => setRepo(e.target.value)}
+            />
+          </Field>
+        ) : (
+          <Field label="Directory with config.json + tokenizer.json + safetensors">
+            <Input
+              type="text"
+              placeholder="downloads/my-model"
+              value={dir}
+              onChange={(e) => setDir(e.target.value)}
+            />
+          </Field>
+        )}
+        <Field label="Output model name (optional)">
+          <Input
+            type="text"
+            placeholder="derived from the repo or directory"
+            value={outputDir}
+            onChange={(e) => setOutputDir(e.target.value)}
+          />
+        </Field>
+      </div>
+      <label className="mt-3 flex items-center gap-2.5 text-xs text-slate-400 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={force}
+          onChange={(e) => setForce(e.target.checked)}
+          className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+        />
+        Overwrite if the model directory already exists
+      </label>
+      <p className="text-[11px] text-slate-500 mt-2">
+        Supports Llama / Qwen2 / Mistral decoder models with SwiGLU, GQA, RMSNorm and a byte-level
+        BPE tokenizer (tied embeddings, f32/f16/bf16 safetensors). Weights are converted to f32.
+      </p>
+      <div className="mt-3">
+        <Button
+          variant="primary"
+          disabled={busy || (mode === "repo" ? !repo.trim() : !dir.trim())}
+          onClick={() => void run()}
+        >
+          {busy ? "Starting…" : "Convert"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function ModelsView() {
   const { activeModel, setActiveModel, cancelOp } = useAppState();
   const toast = useToast();
@@ -230,7 +339,10 @@ export function ModelsView() {
   const [exportState, setExportState] = useState<{ dir: string; opId: string } | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [showHfImport, setShowHfImport] = useState(false);
+  const [hfOpId, setHfOpId] = useState<string | null>(null);
   const exportOp = useOp(exportState?.opId ?? null);
+  const hfOp = useOp(hfOpId);
 
   useOpOutcome(exportState?.opId ?? null, (op) => {
     if (op.status === "done") {
@@ -254,6 +366,18 @@ export function ModelsView() {
       setLoaded(true);
     }
   }, [toast]);
+
+  useOpOutcome(hfOpId, (op) => {
+    if (op.status === "done") {
+      toast.success(op.message ?? "Model converted");
+      void load();
+    } else if (op.status === "cancelled") {
+      toast.info("Conversion cancelled");
+    } else {
+      toast.error(`Conversion failed: ${op.error ?? "unknown"}`);
+    }
+    setHfOpId(null);
+  });
 
   useEffect(() => {
     let cancelled = false;
@@ -326,12 +450,21 @@ export function ModelsView() {
         subtitle="Pick an active model for Generate/Export, download its files, rename or delete it."
       />
 
-      <div className="mb-4">
+      <div className="mb-4 flex flex-wrap gap-2">
         <Button variant="ghost" onClick={() => setShowImport((v) => !v)}>
           {showImport ? "Hide import" : "Import GGUF"}
         </Button>
+        <Button variant="ghost" onClick={() => setShowHfImport((v) => !v)}>
+          {showHfImport ? "Hide HF import" : "Import from Hugging Face"}
+        </Button>
       </div>
       {showImport ? <ImportPanel onDone={() => void load()} /> : null}
+      {showHfImport ? <ImportHfPanel onStarted={setHfOpId} /> : null}
+      {hfOp ? (
+        <div className="mb-4">
+          <OpProgress op={hfOp} onCancel={() => cancelOp(hfOp.id)} />
+        </div>
+      ) : null}
 
       {active ? (
         <div className="mb-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 flex items-center gap-3 shadow-lg shadow-emerald-500/10">

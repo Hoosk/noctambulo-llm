@@ -171,6 +171,10 @@ export interface ModelInfo {
   n_layer: number;
   n_ctx: number;
   vocab: number;
+  ffn_hidden: number;
+  rope_base: number;
+  rms_norm_eps: number;
+  import_source: string | null;
   params_m: number;
   size_mb: number;
   default: boolean;

@@ -116,6 +116,23 @@ pub struct ModelConfig {
     /// Most recent tokens protected from eviction.
     #[serde(default = "default_kv_recent")]
     pub kv_recent: usize,
+    /// FFN hidden size. `None` uses the engine default
+    /// `ceil((8/3)·n_embd / 256)·256`; imported third-party models store their
+    /// real `intermediate_size`.
+    #[serde(default)]
+    pub ffn_hidden: Option<usize>,
+    /// RMSNorm epsilon (`rms_norm_eps` in HF configs). Older checkpoints omit
+    /// it, which defaults to the engine's original `1e-6`.
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f32,
+    /// RoPE base frequency (`rope_theta` in HF configs; `10000` for the
+    /// original models, `1e6` for Qwen2.5, `5e5` for Llama-3).
+    #[serde(default = "default_rope_base")]
+    pub rope_base: f32,
+    /// Origin of an imported checkpoint (`gguf` / `hf`); native training
+    /// leaves it `None`.
+    #[serde(default)]
+    pub import_source: Option<String>,
     /// Checkpoint architecture version. Bumped whenever the module layout
     /// changes; older versions cannot be loaded (records are positional).
     #[serde(default = "default_arch_version")]
@@ -136,8 +153,14 @@ pub struct EvictionGeometry {
 }
 
 /// Current module layout. 1 = pre-KV-cache-refactor, 2 = dynamic RoPE +
-/// sliding window, 3 = grouped cross-layer KV projections, 4 = MLA latent.
-pub const ARCH_VERSION: u32 = 4;
+/// sliding window, 3 = grouped cross-layer KV projections, 4 = MLA latent,
+/// 5 = configurable FFN hidden size / RMSNorm eps / RoPE base (third-party
+/// imports). Versions 4 and 5 share the layout when the new fields keep their
+/// defaults, so both load.
+pub const ARCH_VERSION: u32 = 5;
+
+/// Oldest architecture version this build can load.
+pub const MIN_ARCH_VERSION: u32 = 4;
 
 fn default_kv_share_group() -> usize {
     1
@@ -145,6 +168,14 @@ fn default_kv_share_group() -> usize {
 
 fn default_kv_recent() -> usize {
     64
+}
+
+fn default_rms_norm_eps() -> f32 {
+    1e-6
+}
+
+fn default_rope_base() -> f32 {
+    10000.0
 }
 
 fn default_arch_version() -> u32 {
@@ -202,6 +233,10 @@ impl ModelConfig {
             kv_eviction: None,
             kv_budget: None,
             kv_recent: default_kv_recent(),
+            ffn_hidden: None,
+            rms_norm_eps: default_rms_norm_eps(),
+            rope_base: default_rope_base(),
+            import_source: None,
             arch_version: ARCH_VERSION,
         }
     }
@@ -290,14 +325,26 @@ impl ModelConfig {
 
     /// Rejects checkpoints saved with an incompatible module layout.
     pub fn check_arch_version(&self, path: &str) -> Result<(), String> {
-        if self.arch_version != ARCH_VERSION {
+        if !self.is_compatible() {
             return Err(format!(
-                "checkpoint at {path} uses architecture version {} but this build expects {} \
-                 (module layout changed); retrain from scratch",
-                self.arch_version, ARCH_VERSION
+                "checkpoint at {path} uses architecture version {} but this build supports \
+                 {}..={} (module layout changed); retrain from scratch or re-import",
+                self.arch_version, MIN_ARCH_VERSION, ARCH_VERSION
             ));
         }
         Ok(())
+    }
+
+    /// Whether this build can load the checkpoint layout.
+    pub fn is_compatible(&self) -> bool {
+        self.arch_version >= MIN_ARCH_VERSION && self.arch_version <= ARCH_VERSION
+    }
+
+    /// FFN hidden size: the configured value or the engine's aligned default.
+    pub fn ffn_hidden(&self) -> usize {
+        self.ffn_hidden
+            .filter(|h| *h > 0)
+            .unwrap_or_else(|| ((8 * self.n_embd) / 3).div_ceil(256) * 256)
     }
 
     /// Parsed RoPE strategy; unknown strings fall back to `none`.
@@ -330,7 +377,7 @@ impl ModelConfig {
     pub fn param_count(&self) -> usize {
         let n_embd = self.n_embd;
         let kv_dim = self.get_n_kv_head() * (n_embd / self.n_head);
-        let hidden = ((8 * n_embd) / 3).div_ceil(256) * 256;
+        let hidden = self.ffn_hidden();
 
         let embed = self.vocab_size * n_embd;
         let q = n_embd * n_embd + n_embd;
@@ -485,8 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn test_eviction_fields_default_when_absent() {
-        let json = r#"{"vocab_size":100,"n_embd":64,"n_head":4,"n_layer":2,"n_ctx":32}"#;
+    fn test_eviction_fields_default_when_absent() {        let json = r#"{"vocab_size":100,"n_embd":64,"n_head":4,"n_layer":2,"n_ctx":32}"#;
         let cfg: ModelConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.kv_eviction, None);
         assert_eq!(cfg.kv_budget, None);
@@ -508,5 +554,37 @@ mod tests {
         // "none" turns it off.
         cfg.set_kv_eviction("none", 0, 0);
         assert_eq!(cfg.kv_eviction, None);
+    }
+
+    #[test]
+    fn test_third_party_config_fields() {
+        let json = r#"{"vocab_size":100,"n_embd":64,"n_head":4,"n_layer":2,"n_ctx":32}"#;
+        let cfg: ModelConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ffn_hidden(), ((8 * 64) / 3usize).div_ceil(256) * 256);
+        assert_eq!(cfg.rms_norm_eps, 1e-6);
+        assert_eq!(cfg.rope_base, 10000.0);
+        assert_eq!(cfg.import_source, None);
+
+        let mut custom = cfg.clone();
+        custom.arch_version = ARCH_VERSION;
+        custom.ffn_hidden = Some(192);
+        custom.rms_norm_eps = 1e-5;
+        custom.rope_base = 1e6;
+        custom.import_source = Some("hf".into());
+        assert_eq!(custom.ffn_hidden(), 192);
+        let round: ModelConfig =
+            serde_json::from_slice(&serde_json::to_vec(&custom).unwrap()).unwrap();
+        assert_eq!(round.ffn_hidden, Some(192));
+        assert_eq!(round.rms_norm_eps, 1e-5);
+        assert_eq!(round.rope_base, 1e6);
+        assert_eq!(round.import_source.as_deref(), Some("hf"));
+        assert_eq!(round.arch_version, ARCH_VERSION);
+
+        // v4 checkpoints keep loading (the new fields default to the old
+        // behavior).
+        let mut v4 = cfg.clone();
+        v4.arch_version = 4;
+        assert!(v4.is_compatible());
+        assert!(v4.check_arch_version("v4").is_ok());
     }
 }

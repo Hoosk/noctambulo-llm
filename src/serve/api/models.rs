@@ -22,6 +22,10 @@ pub(super) struct ModelInfo {
     n_layer: usize,
     n_ctx: usize,
     vocab: usize,
+    ffn_hidden: usize,
+    rope_base: f32,
+    rms_norm_eps: f32,
+    import_source: Option<String>,
     params_m: f64,
     size_mb: f64,
     default: bool,
@@ -61,11 +65,15 @@ fn model_meta(dir: &Path) -> Option<ModelInfo> {
         n_layer: cfg.n_layer,
         n_ctx: cfg.n_ctx,
         vocab: cfg.vocab_size,
+        ffn_hidden: cfg.ffn_hidden(),
+        rope_base: cfg.rope_base,
+        rms_norm_eps: cfg.rms_norm_eps,
+        import_source: cfg.import_source.clone(),
         params_m: params as f64 / 1_000_000.0,
         size_mb,
         default: dir.file_name().unwrap_or_default() == "model_output",
         arch_version: cfg.arch_version,
-        compatible: cfg.arch_version == crate::config::ARCH_VERSION,
+        compatible: cfg.is_compatible(),
         steps,
         best_val_loss,
     })
@@ -342,8 +350,13 @@ pub(super) async fn model_import(
     let force = req.force;
     let out_clone = out.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
-        crate::import::import_gguf::<crate::backend::MainBackend>(&gguf, &out_clone, force, &device)
+        crate::import::import_gguf::<crate::backend::CpuBackend>(
+            &gguf,
+            &out_clone,
+            force,
+            &crate::backend::cpu_device(),
+            None,
+        )
     })
     .await
     .map_err(|e| ApiError::internal(format!("import task failed: {e}")))?;
@@ -413,4 +426,120 @@ pub(super) async fn model_delete(
     std::fs::remove_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "status": "ok", "deleted": name })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ModelImportHfRequest {
+    /// Hugging Face repo id (exactly one of `repo` / `dir`).
+    #[serde(default)]
+    repo: Option<String>,
+    /// Local directory with config.json + tokenizer.json + safetensors.
+    #[serde(default)]
+    dir: Option<String>,
+    /// Output model directory under the models root (default: source name).
+    #[serde(default)]
+    output_dir: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+/// Convert a Hugging Face model into the native format as a background
+/// operation (download + tensor conversion can take minutes).
+#[allow(clippy::unused_async)]
+pub(super) async fn model_import_hf(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ModelImportHfRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_token(&state.server, &headers, None)?;
+    ensure_idle(&state)?;
+
+    let source = match (req.repo, req.dir) {
+        (Some(repo), None) => {
+            let repo = repo.trim().to_string();
+            if repo.is_empty() || !repo.contains('/') {
+                return Err(ApiError::bad_request("invalid Hugging Face repo id"));
+            }
+            crate::hf_import::HfSource::Repo(repo)
+        }
+        (None, Some(dir)) => {
+            if !is_safe_rel_path(&dir) {
+                return Err(ApiError::bad_request("invalid dir"));
+            }
+            crate::hf_import::HfSource::Dir(std::path::PathBuf::from(dir))
+        }
+        _ => return Err(ApiError::bad_request("pass exactly one of repo or dir")),
+    };
+    let default_name = match &source {
+        crate::hf_import::HfSource::Repo(repo) => {
+            repo.rsplit('/').next().unwrap_or(repo).to_string()
+        }
+        crate::hf_import::HfSource::Dir(dir) => dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "imported_model".to_string()),
+    };
+    let name = req
+        .output_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_name);
+    if !is_safe_child_name(&name) || name.starts_with('.') {
+        return Err(ApiError::bad_request("invalid output directory name"));
+    }
+    let out = state.server.models_dir.join(&name);
+    if out.exists() && !req.force {
+        return Err(ApiError::conflict(format!(
+            "'{name}' already exists (enable overwrite to replace it)"
+        )));
+    }
+
+    let force = req.force;
+    let op = state
+        .ops
+        .start("import-hf", &format!("{} → {name}", source.label()));
+    let op_id = op.id().to_string();
+    let name_for_op = name.clone();
+    tokio::task::spawn_blocking(move || {
+        if op.is_cancelled() {
+            op.cancelled();
+            return;
+        }
+        let result = {
+            let mut progress =
+                |phase: &str, done: u64, total: u64, unit: &str| op.progress(phase, done, total, unit);
+            crate::hf_import::import_hf::<crate::backend::CpuBackend>(
+                &source,
+                &out,
+                force,
+                &crate::backend::cpu_device(),
+                &mut progress,
+            )
+        };
+        match result {
+            Ok(cfg) => op.finish(
+                &format!("{name_for_op} converted"),
+                Some(serde_json::json!({
+                    "dir": out.to_string_lossy(),
+                    "name": name_for_op,
+                    "layers": cfg.n_layer,
+                    "n_embd": cfg.n_embd,
+                })),
+            ),
+            Err(e) => {
+                if op.is_cancelled() {
+                    op.cancelled();
+                } else {
+                    op.fail(&e);
+                }
+            }
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "status": "started",
+        "opId": op_id,
+        "name": name,
+    })))
 }

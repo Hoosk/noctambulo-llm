@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../api/client";
-import type { CheckpointInfo, DatasetInfo, DeviceInfo, TrainRequestBody } from "../../api/types";
+import type { CheckpointInfo, DatasetInfo, DeviceInfo, ModelInfo, TrainRequestBody } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Field, Input, Select } from "../../components/ui";
 import { fmtBytes } from "../../lib/format";
@@ -226,6 +226,7 @@ export function TrainForm() {
   const [form, setForm] = useState<FormState>(DEFAULT_FORM);
   const [datasets, setDatasets] = useState<DatasetInfo[]>([]);
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [models, setModels] = useState<ModelInfo[]>([]);
   const [resumeOn, setResumeOn] = useState(false);
   const [checkpoints, setCheckpoints] = useState<CheckpointInfo[] | null>(null);
   const [resumePath, setResumePath] = useState("");
@@ -245,7 +246,7 @@ export function TrainForm() {
 
   useEffect(() => {
     let cancelled = false;
-    Promise.allSettled([api.getDatasets(), api.getDevices()]).then(([ds, dv]) => {
+    Promise.allSettled([api.getDatasets(), api.getDevices(), api.getModels()]).then(([ds, dv, md]) => {
       if (cancelled) return;
       // Biggest corpora first: the default selection should not be a tiny
       // test fixture.
@@ -253,6 +254,7 @@ export function TrainForm() {
         setDatasets([...ds.value].sort((a, b) => b.size_bytes - a.size_bytes));
       }
       if (dv.status === "fulfilled") setDevices(dv.value);
+      if (md.status === "fulfilled") setModels(md.value);
     });
     return () => {
       cancelled = true;
@@ -373,12 +375,17 @@ export function TrainForm() {
           set={set}
           datasets={datasets}
           devices={devices}
+          models={models}
           onSaveDirChange={onSaveDirChange}
           resumeOn={resumeOn}
           checkpoints={checkpoints}
           resumePath={resumePath}
           onToggleResume={toggleResume}
           onSelectResume={setResumePath}
+          onWarmStart={(dir) => {
+            setResumeOn(true);
+            setResumePath(dir);
+          }}
         />
       ) : null}
       {step === 1 ? <StepArchitecture form={form} set={set} onPreset={applyPreset} /> : null}
@@ -414,12 +421,14 @@ interface StepDataProps {
   set: (key: keyof FormState, value: string) => void;
   datasets: DatasetInfo[];
   devices: DeviceInfo[];
+  models: ModelInfo[];
   onSaveDirChange: (value: string) => void;
   resumeOn: boolean;
   checkpoints: CheckpointInfo[] | null;
   resumePath: string;
   onToggleResume: (enabled: boolean) => void;
   onSelectResume: (path: string) => void;
+  onWarmStart: (dir: string) => void;
 }
 
 function StepData({
@@ -427,12 +436,14 @@ function StepData({
   set,
   datasets,
   devices,
+  models,
   onSaveDirChange,
   resumeOn,
   checkpoints,
   resumePath,
   onToggleResume,
   onSelectResume,
+  onWarmStart,
 }: StepDataProps) {
   const selectedDataset = form.file || datasets[0]?.name || "";
   const resumeDisabled = !resumeOn || checkpoints === null || checkpoints.length === 0;
@@ -501,6 +512,30 @@ function StepData({
             ))}
           </Select>
         </div>
+      </div>
+
+      <div className="mt-4">
+        <Field label="Warm start from a model (fine-tune)">
+          <Select
+            value={models.some((m) => m.dir === resumePath) ? resumePath : ""}
+            onChange={(e) => {
+              if (e.target.value) onWarmStart(e.target.value);
+            }}
+          >
+            <option value="">— keep the checkpoint selection —</option>
+            {models.map((m) => (
+              <option key={m.dir} value={m.dir} disabled={!m.compatible}>
+                {m.name} · {m.params_m.toFixed(1)}M
+                {m.import_source ? ` · ${m.import_source}` : ""}
+                {m.compatible ? "" : " · incompatible"}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <p className="text-[11px] text-slate-500 mt-1">
+          Fine-tunes an existing model (including imported HF/GGUF models): its config.json defines
+          the architecture and its tokenizer the vocabulary.
+        </p>
       </div>
     </>
   );

@@ -14,6 +14,7 @@ This set of documents provides a detailed guide on the system architecture, the 
 | 🔤 **[Generation and Inference (generate.md)](generate.md)** | Usage guide for the `generate` subcommand. Explanation of sampling strategies (Temperature, Top-K, Top-P, Min-P, Repetition Penalty) and how the KV Cache works (Prefill & Decode). |
 | 🧩 **[Custom Tokenizer (train-tokenizer.md)](train-tokenizer.md)** | Training guide for the byte-level BPE tokenizer through the `train-tokenizer` subcommand, NFKC Unicode normalization and handling of special tokens. |
 | 📦 **[GGUF v3 Export (export.md)](export.md)** | Manual for converting the model to the standard `GGUF v3` format through the `export` subcommand, 32-byte tensor alignment and integration with Ollama, LM Studio and llama.cpp. |
+| 📥 **[Third-Party Models (import.md)](import.md)** | Converting Hugging Face safetensors or compatible GGUF files into the native format, and fine-tuning them with `train --resume <model_dir>`. |
 | 📊 **[Model Statistics (stats.md)](stats.md)** | Manual of the `stats` subcommand to calculate the total number of parameters, FP32 memory footprint, FLOPs per token estimate and GQA memory savings. |
 | 🧠 **[Technical Architecture (architecture.md)](architecture.md)** | In-depth technical specification of the Qwen Transformer architecture: RoPE ($\theta=10.000$), SwiGLU aligned to 256, GQA, RMSNorm ($\epsilon=10^{-6}$), Tied Embeddings and Attention Softcapping. |
 

@@ -113,6 +113,11 @@ export const api = {
       method: "POST",
       json: body,
     }),
+  importModelHf: (body: { repo?: string; dir?: string; outputDir?: string; force?: boolean }) =>
+    request<{ status: string; opId: string; name: string }>("/api/models/import-hf", {
+      method: "POST",
+      json: body,
+    }),
   renameModel: (dir: string, newName: string) =>
     request<{ status: string; dir: string; name?: string }>("/api/models/rename", {
       method: "POST",

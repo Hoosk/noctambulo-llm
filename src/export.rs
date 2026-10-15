@@ -254,8 +254,7 @@ pub fn export_to_gguf<B: Backend>(
     });
 
     // 2. Transformer Blocks
-    let raw_hidden = (8 * config.n_embd) / 3;
-    let hidden_dim = raw_hidden.div_ceil(256) * 256;
+    let hidden_dim = config.ffn_hidden();
     progress("extracting tensors", 0, config.n_layer as u64, "layers");
 
     for (i, block) in model.blocks.iter().enumerate() {
@@ -339,7 +338,7 @@ pub fn export_to_gguf<B: Backend>(
             (k, k_bias, v, v_bias)
         };
 
-        let k_trans = transpose_2d(&k, kv_dim, config.n_embd);
+        let k_trans = transpose_2d(&k, config.n_embd, kv_dim);
         let k_permuted = permute_rope_weight(&k_trans, n_kv_head, head_dim, config.n_embd);
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_k.weight", prefix),
@@ -359,7 +358,7 @@ pub fn export_to_gguf<B: Backend>(
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_v.weight", prefix),
             dims: vec![config.n_embd as u64, kv_dim as u64],
-            data: transpose_2d(&v, kv_dim, config.n_embd),
+            data: transpose_2d(&v, config.n_embd, kv_dim),
         });
 
         if let Some(v_b) = v_bias {
@@ -393,7 +392,7 @@ pub fn export_to_gguf<B: Backend>(
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_gate.weight", prefix),
             dims: vec![config.n_embd as u64, hidden_dim as u64],
-            data: transpose_2d(&gate, hidden_dim, config.n_embd),
+            data: transpose_2d(&gate, config.n_embd, hidden_dim),
         });
 
         let up = block.mlp.up_proj.weight.val().into_data().to_vec::<f32>()
@@ -401,7 +400,7 @@ pub fn export_to_gguf<B: Backend>(
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_up.weight", prefix),
             dims: vec![config.n_embd as u64, hidden_dim as u64],
-            data: transpose_2d(&up, hidden_dim, config.n_embd),
+            data: transpose_2d(&up, config.n_embd, hidden_dim),
         });
 
         let down = block.mlp.down_proj.weight.val().into_data().to_vec::<f32>()
@@ -409,7 +408,7 @@ pub fn export_to_gguf<B: Backend>(
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_down.weight", prefix),
             dims: vec![hidden_dim as u64, config.n_embd as u64],
-            data: transpose_2d(&down, config.n_embd, hidden_dim),
+            data: transpose_2d(&down, hidden_dim, config.n_embd),
         });
 
         progress("extracting tensors", (i + 1) as u64, config.n_layer as u64, "layers");
@@ -457,7 +456,8 @@ pub fn export_to_gguf<B: Backend>(
         ("llama.feed_forward_length", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(hidden_dim as u32).to_le_bytes())?; Ok(4) })),
         ("llama.attention.head_count", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.n_head as u32).to_le_bytes())?; Ok(4) })),
         ("llama.attention.head_count_kv", GGUF_TYPE_UINT32, Box::new(move |w| { w.write_all(&(config.get_n_kv_head() as u32).to_le_bytes())?; Ok(4) })),
-        ("llama.attention.layer_norm_rms_epsilon", GGUF_TYPE_FLOAT32, Box::new(|w| { w.write_all(&1e-6f32.to_le_bytes())?; Ok(4) })),
+        ("llama.attention.layer_norm_rms_epsilon", GGUF_TYPE_FLOAT32, Box::new(move |w| { w.write_all(&config.rms_norm_eps.to_le_bytes())?; Ok(4) })),
+        ("llama.rope.freq_base", GGUF_TYPE_FLOAT32, Box::new(move |w| { w.write_all(&config.rope_base.to_le_bytes())?; Ok(4) })),
         ("tokenizer.ggml.model", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "gpt2")? as u64) })),
         ("tokenizer.ggml.pre", GGUF_TYPE_STRING, Box::new(|w| { Ok(write_gguf_string(w, "gpt-2")? as u64) })),
         ("tokenizer.ggml.add_prefix_space", GGUF_TYPE_BOOL, Box::new(|w| { w.write_all(&[1u8])?; Ok(1) })),

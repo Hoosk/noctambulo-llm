@@ -2,8 +2,9 @@ mod backend;
 mod config;
 mod data;
 mod export;
-mod import;
 mod generate;
+mod hf_import;
+mod import;
 mod model;
 mod serve;
 mod train;
@@ -111,6 +112,8 @@ enum Commands {
     Export(ExportArgs),
     /// Import a GGUF export back into the native model format
     Import(ImportArgs),
+    /// Convert a Hugging Face model (safetensors) into the native format
+    ImportHf(ImportHfArgs),
     /// Print model parameter count, VRAM footprint, and FLOPs statistics
     Stats,
     /// Serve a web UI to control training/generate/export from the browser
@@ -343,15 +346,16 @@ struct TrainArgs {
     #[arg(long, default_value_t = 0.0)]
     z_loss: f32,
     /// Heavy-hitter KV eviction policy: none (default) or h2o. Training aligns
-    /// the attention mask with the bounded cache.
-    #[arg(long, default_value = "none")]
-    kv_eviction: String,
+    /// the attention mask with the bounded cache. Omit to keep the resumed
+    /// model's configuration.
+    #[arg(long)]
+    kv_eviction: Option<String>,
     /// Resident KV cache rows including sinks and recent tokens (required by
     /// --kv-eviction h2o, e.g. 512)
     #[arg(long, default_value_t = 0)]
     kv_budget: usize,
-    /// Most recent tokens never evicted
-    #[arg(long, default_value_t = 64)]
+    /// Most recent tokens never evicted (0 = engine default / resumed config)
+    #[arg(long, default_value_t = 0)]
     kv_recent: usize,
 }
 
@@ -442,6 +446,26 @@ struct ImportArgs {
     /// Path to the GGUF file (e.g. exported/kuro-neko-v2.gguf)
     gguf: String,
     /// Output model directory (default: the GGUF file stem)
+    #[arg(long)]
+    output_dir: Option<String>,
+    /// Overwrite the output directory if it already contains a model
+    #[arg(long)]
+    force: bool,
+    /// Exact tokenizer.json to use instead of the one rebuilt from the GGUF
+    /// vocabulary (recommended for third-party GGUFs)
+    #[arg(long)]
+    tokenizer: Option<String>,
+}
+
+#[derive(Args)]
+struct ImportHfArgs {
+    /// Hugging Face repo id (e.g. Qwen/Qwen2.5-0.5B-Instruct)
+    #[arg(long)]
+    repo: Option<String>,
+    /// Local directory containing config.json, tokenizer.json and safetensors
+    #[arg(long)]
+    dir: Option<String>,
+    /// Output model directory (default: the repo or directory name)
     #[arg(long)]
     output_dir: Option<String>,
     /// Overwrite the output directory if it already contains a model
@@ -686,7 +710,29 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Some(combine_and_mix_datasets(&sources, Path::new("datasets/combined_corpus.txt"))?)
             };
 
-            let tokenizer = if Path::new(custom_tokenizer_file).exists() {
+            // Warm start from a native model directory (e.g. an imported HF or
+            // GGUF model): its config.json defines the architecture and its
+            // tokenizer the vocabulary.
+            let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
+            let resume_model = resume_path_buf.as_ref().and_then(|p| {
+                let dir = if p.is_dir() {
+                    p.clone()
+                } else {
+                    p.parent()?.to_path_buf()
+                };
+                let cfg = dir.join("config.json");
+                cfg.is_file().then_some((dir, cfg))
+            });
+
+            let tokenizer = if let Some((dir, _)) = &resume_model {
+                let tok = dir.join("custom_tokenizer.json");
+                if tok.is_file() {
+                    tui::print_info(&format!("Warm start: tokenizer from '{}'", tok.display()));
+                    LlmTokenizer::from_file(&tok)?
+                } else {
+                    LlmTokenizer::from_file(custom_tokenizer_file)?
+                }
+            } else if Path::new(custom_tokenizer_file).exists() {
                 tui::print_info(&format!("Loading trained custom tokenizer from '{}'...", custom_tokenizer_file));
                 LlmTokenizer::from_file(custom_tokenizer_file)?
             } else {
@@ -700,32 +746,61 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
 
-            let preset = args.preset.as_deref().map(arch_preset).transpose()?;
-            let (n_embd, n_head, n_kv_head, n_layer, n_ctx) = resolve_arch(
-                preset.as_ref(),
-                args.n_embd,
-                args.n_head,
-                args.n_kv_head,
-                args.n_layer,
-                args.n_ctx,
+            let mut model_config = if let Some((_, cfg_path)) = &resume_model {
+                let cfg: ModelConfig =
+                    serde_json::from_str(&std::fs::read_to_string(cfg_path)?)?;
+                cfg.check_arch_version(&cfg_path.display().to_string())?;
+                if cfg.vocab_size != vocab_size {
+                    return Err(format!(
+                        "the resumed model expects {} tokens but its tokenizer has {vocab_size}; \
+                         use the tokenizer that belongs to the model",
+                        cfg.vocab_size
+                    )
+                    .into());
+                }
+                tui::print_info(&format!(
+                    "Warm start: architecture from '{}' ({} layers, n_embd {}, hidden {}, ctx {})",
+                    cfg_path.display(),
+                    cfg.n_layer,
+                    cfg.n_embd,
+                    cfg.ffn_hidden(),
+                    cfg.n_ctx
+                ));
+                cfg
+            } else {
+                let preset = args.preset.as_deref().map(arch_preset).transpose()?;
+                let (n_embd, n_head, n_kv_head, n_layer, n_ctx) = resolve_arch(
+                    preset.as_ref(),
+                    args.n_embd,
+                    args.n_head,
+                    args.n_kv_head,
+                    args.n_layer,
+                    args.n_ctx,
+                );
+                let mut cfg = ModelConfig::new(
+                    vocab_size,
+                    n_embd,
+                    n_head,
+                    n_kv_head,
+                    n_layer,
+                    n_ctx,
+                    args.dropout,
+                    args.attn_softcap,
+                );
+                cfg.sliding_window =
+                    (args.sliding_window > 0).then_some(args.sliding_window);
+                cfg.sink_tokens = args.sink_tokens;
+                cfg.kv_share_group = args.kv_share_group.max(1);
+                cfg.mla_latent_dim = (args.mla_latent_dim > 0).then_some(args.mla_latent_dim);
+                cfg
+            };
+            // Explicit eviction flags override the resumed configuration; the
+            // defaults (no policy, zero knobs) keep it untouched.
+            model_config.set_kv_eviction(
+                args.kv_eviction.as_deref().unwrap_or(""),
+                args.kv_budget,
+                args.kv_recent,
             );
-            let mut model_config = ModelConfig::new(
-                vocab_size,
-                n_embd,
-                n_head,
-                n_kv_head,
-                n_layer,
-                n_ctx,
-                args.dropout,
-                args.attn_softcap,
-            );
-            model_config.sliding_window =
-                (args.sliding_window > 0).then_some(args.sliding_window);
-            model_config.sink_tokens = args.sink_tokens;
-            model_config.kv_share_group = args.kv_share_group.max(1);
-            model_config.mla_latent_dim =
-                (args.mla_latent_dim > 0).then_some(args.mla_latent_dim);
-            model_config.set_kv_eviction(&args.kv_eviction, args.kv_budget, args.kv_recent);
             if let Some(geo) = model_config.eviction_geometry()? {
                 tui::print_info(&format!(
                     "KV eviction: h2o (budget {}, {} sinks, {} recent, {} hitters)",
@@ -734,7 +809,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
-            let resume_path_buf = args.resume.as_ref().map(PathBuf::from);
             let cancel = sigint_cancel_flag();
 
             // The trainer is generic over the backend; dispatch on --dtype.
@@ -968,7 +1042,45 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "imported_model".to_string())
             });
-            import::import_gguf::<MainBackend>(gguf_path, Path::new(&output_dir), args.force, &device)?;
+            import::import_gguf::<backend::CpuBackend>(
+                gguf_path,
+                Path::new(&output_dir),
+                args.force,
+                &backend::cpu_device(),
+                args.tokenizer.as_deref().map(Path::new),
+            )?;
+        }
+        Commands::ImportHf(args) => {
+            let source = match (args.repo, args.dir) {
+                (Some(repo), None) => hf_import::HfSource::Repo(repo),
+                (None, Some(dir)) => hf_import::HfSource::Dir(PathBuf::from(dir)),
+                _ => {
+                    return Err(
+                        "pass exactly one of --repo <id> or --dir <path> for import-hf".into(),
+                    )
+                }
+            };
+            let output_dir = args.output_dir.unwrap_or_else(|| match &source {
+                hf_import::HfSource::Repo(repo) => {
+                    repo.rsplit('/').next().unwrap_or(repo).to_string()
+                }
+                hf_import::HfSource::Dir(dir) => dir
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "imported_model".to_string()),
+            });
+            let mut progress = |phase: &str, done: u64, total: u64, unit: &str| {
+                if done == 0 || done == total {
+                    println!("  {phase}: {done}/{total} {unit}");
+                }
+            };
+            hf_import::import_hf::<backend::CpuBackend>(
+                &source,
+                Path::new(&output_dir),
+                args.force,
+                &backend::cpu_device(),
+                &mut progress,
+            )?;
         }
         Commands::Stats => {
             let config_path = Path::new(output_dir).join("config.json");
@@ -985,8 +1097,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let n_layer = model_config.n_layer;
             let vocab_size = model_config.vocab_size;
 
-            let raw_hidden = (8 * n_embd) / 3;
-            let hidden_dim = raw_hidden.div_ceil(256) * 256;
+            let hidden_dim = model_config.ffn_hidden();
 
             let total_params = model_config.param_count();
 

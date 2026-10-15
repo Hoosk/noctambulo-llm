@@ -28,6 +28,7 @@
 - **Host-RAM spill and replay**: `--kv-spill` archives every evicted row (f32, with position and score) in host RAM, and `--kv-max-budget N --kv-grow R --kv-grow-interval T` grows the resident budget deterministically, refilling each new slot with the highest-score archived rows. Lossless bounded decoding for long RoPE-extended generations, on top of any cache dtype or MLA.
 - **Cross-layer KV sharing**: `--kv-share-group N` makes each group of N layers share one K/V projection and cache (DeepSeek CSA-style), shrinking KV memory by N. Checkpoints carry an `arch_version`; GGUF export of grouped models requires `--approx` and is documented as an approximation.
 - **MLA latent cache**: `--mla-latent-dim D` compresses K/V through a `D`-wide latent and caches only the latent (4× smaller for a typical D), expanding K/V on the fly at attention time. This variant has no decoupled RoPE, so GGUF export folds `kv_down · k_up` into exact standard K/V weights.
+- **Third-party models**: `import-hf` converts Hugging Face safetensors (Llama / Qwen2 / Mistral, f32/f16/bf16, sharded, custom FFN size, RoPE base/eps from the config) and `import` reads compatible `llama`/`qwen2` GGUFs; both are tagged with their origin and can be generated, evaluated, exported and fine-tuned with `train --resume <model_dir>`.
 - **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
 - **Full-state checkpoints and resume**: weights, AdamW moments, LR schedule and shuffler RNG; safe stop with Ctrl+C saves an interrupted checkpoint.
 - **Evaluation with BPB**: cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and bits-per-byte (comparable across tokenizers), over all batches by default.
@@ -90,7 +91,7 @@ cargo run --release -- train --dataset roneneldan/TinyStories
 | `--val-split <float>` | Fraction reserved for validation and perplexity ($PPL$) | `0.1` |
 | `--grad-accum <n>` | Micro-batches accumulated per AdamW step (true gradient mean, equivalent to a larger batch) | `1` |
 | `--save-dir <path>` | Directory for automatic per-epoch checkpoint saving | `None` |
-| `--resume <path>` | Checkpoint to resume from (restores weights, AdamW, schedule and RNG; `--epochs` = additional epochs) | `None` |
+| `--resume <path>` | Checkpoint file or **model directory** to resume from. A directory with `config.json` warm-starts (fine-tunes) that model using its architecture and tokenizer; checkpoint files restore weights, AdamW, schedule and RNG (`--epochs` = additional epochs) | `None` |
 | `--seq-warmup-steps <n>` | Initial steps for **Progressive Sequence Scaling** (from $N/4$ to $N$) | `0` |
 | `--early-stop-patience <n>` | Stops training after `n` epochs without improving `val_loss` (`0` = disabled) | `0` |
 | `--weight-decay <float>` | Decoupled weight decay (AdamW) applied to all parameters (`0` disables it) | `0.1` |
@@ -273,12 +274,29 @@ cargo run --release -- import exported/kuro-neko-v3.gguf --output-dir imported_v
 | :--- | :--- | :--- |
 | `--output-dir <name>` | Directory under the models root that receives the model | GGUF file stem |
 | `--force` | Overwrite the output directory if it already contains a model | off |
+| `--tokenizer <path>` | Exact `tokenizer.json` instead of the one rebuilt from the GGUF vocab | off |
 
-The export transforms (weight transposes and the GPT-NeoX RoPE row permutation) are inverted exactly; quantized GGUFs are rejected. The web Models view offers the same operation via **Import GGUF**.
+This engine's own exports round-trip exactly. Third-party GGUFs are supported when they use the `llama` or `qwen2` architecture with f32/f16 tensors and a byte-level BPE vocabulary: the metadata (`feed_forward_length`, `layer_norm_rms_epsilon`, `rope.freq_base`, GQA, biases) is honored, and Q/K are de-permuted only for the `llama` layout. Quantized GGUFs are rejected with a clear error.
 
 ---
 
-### 8. Download a Dataset (`download`)
+### 9. Import a Hugging Face Model (`import-hf`)
+
+Converts a Hugging Face model (`config.json` + `tokenizer.json` + `model.safetensors`) into the native format. Llama / Qwen2 / Mistral decoder models with SwiGLU, RMSNorm, GQA, RoPE and tied embeddings are supported (f32/f16/bf16 safetensors, single-file or sharded):
+
+```bash
+# Download and convert straight from the Hub
+cargo run --release -- import-hf --repo Qwen/Qwen2.5-0.5B-Instruct --output-dir qwen2.5-0.5b
+
+# Or from a directory you already downloaded
+cargo run --release -- import-hf --dir downloads/my-model --output-dir my-model
+```
+
+The converted model carries its own `custom_tokenizer.json`, is tagged with `import_source`, and can be generated (`generate`), evaluated (`eval`), exported (`export`) and **fine-tuned** with `train --resume <model_dir>` (the directory's `config.json` and tokenizer define the architecture, so no architecture flags are needed). QK-norm architectures (Qwen3), SentencePiece tokenizers, untied `lm_head` weights and quantized safetensors are rejected. See [doc/import.md](doc/import.md). The web Models view offers **Import from Hugging Face** as a cancellable background job with live progress.
+
+---
+
+### 10. Download a Dataset (`download`)
 
 Downloads a single dataset file from Hugging Face Hub; Parquet files are automatically text-extracted:
 

@@ -635,11 +635,11 @@ pub struct RmsNorm<B: Backend> {
 }
 
 impl<B: Backend> RmsNorm<B> {
-    pub fn new(dim: usize, device: &B::Device) -> Self {
+    pub fn new(dim: usize, eps: f32, device: &B::Device) -> Self {
         let weight = Tensor::ones([dim], device);
         Self {
             weight: burn::module::Param::from_tensor(weight),
-            eps: 1e-6, // Qwen2.5 / Qwen3 standard RMSNorm epsilon
+            eps,
         }
     }
 
@@ -688,10 +688,19 @@ pub struct RopeSpec {
 /// - `Yarn`: piecewise interpolation between the linear-scaled and original
 ///   frequencies (ramp between the 1- and 32-rotation dimensions) plus the
 ///   standard `mscale` attention factor.
-pub fn rope_spec(n_ctx: usize, head_dim: usize, kind: RopeScalingKind, factor: f32) -> RopeSpec {
+///
+/// `base` is the model's RoPE theta (10000 by default; imported models carry
+/// their own value, e.g. 1e6 for Qwen2.5 or 5e5 for Llama-3).
+pub fn rope_spec(
+    n_ctx: usize,
+    head_dim: usize,
+    kind: RopeScalingKind,
+    factor: f32,
+    base: f32,
+) -> RopeSpec {
     let half = head_dim / 2;
     let factor = if factor.is_finite() && factor > 1.0 { factor } else { 1.0 };
-    let base = ROPE_BASE_THETA;
+    let base = if base.is_finite() && base > 0.0 { base } else { ROPE_BASE_THETA };
 
     let inv_freqs = |base: f32| -> Vec<f32> {
         (0..half)
@@ -1665,6 +1674,8 @@ pub struct CausalSelfAttentionConfig {
     pub attn_softcap: f32,
     pub rope_kind: RopeScalingKind,
     pub rope_factor: f32,
+    /// RoPE theta (10000 by default; imported models may differ).
+    pub rope_base: f32,
     pub sliding_window: Option<usize>,
     pub sink_tokens: usize,
     /// Heavy-hitter eviction budget in rows (`None` = dense/ring mask).
@@ -1676,7 +1687,13 @@ pub struct CausalSelfAttentionConfig {
 impl CausalSelfAttentionConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> CausalSelfAttention<B> {
         let head_dim = self.n_embd / self.n_head;
-        let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
+        let rope = rope_spec(
+            self.n_ctx,
+            head_dim,
+            self.rope_kind,
+            self.rope_factor,
+            self.rope_base,
+        );
 
         CausalSelfAttention {
             q_proj: LinearConfig::new(self.n_embd, self.n_embd).with_bias(true).init(device),
@@ -1706,6 +1723,7 @@ pub struct KvProjConfig {
     pub n_ctx: usize,
     pub rope_kind: RopeScalingKind,
     pub rope_factor: f32,
+    pub rope_base: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -1716,6 +1734,7 @@ pub struct MlaProjConfig {
     pub n_ctx: usize,
     pub rope_kind: RopeScalingKind,
     pub rope_factor: f32,
+    pub rope_base: f32,
     pub d_latent: usize,
 }
 
@@ -1723,7 +1742,13 @@ impl MlaProjConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> MlaProj<B> {
         let head_dim = self.n_embd / self.n_head;
         let kv_dim = self.n_kv_head * head_dim;
-        let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
+        let rope = rope_spec(
+            self.n_ctx,
+            head_dim,
+            self.rope_kind,
+            self.rope_factor,
+            self.rope_base,
+        );
         MlaProj {
             kv_down: LinearConfig::new(self.n_embd, self.d_latent).with_bias(false).init(device),
             k_up: LinearConfig::new(self.d_latent, kv_dim).with_bias(false).init(device),
@@ -1742,7 +1767,13 @@ impl KvProjConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> KvProj<B> {
         let head_dim = self.n_embd / self.n_head;
         let kv_dim = self.n_kv_head * head_dim;
-        let rope = rope_spec(self.n_ctx, head_dim, self.rope_kind, self.rope_factor);
+        let rope = rope_spec(
+            self.n_ctx,
+            head_dim,
+            self.rope_kind,
+            self.rope_factor,
+            self.rope_base,
+        );
         KvProj {
             k_proj: LinearConfig::new(self.n_embd, kv_dim).with_bias(true).init(device),
             v_proj: LinearConfig::new(self.n_embd, kv_dim).with_bias(true).init(device),
@@ -1775,13 +1806,18 @@ impl<B: Backend> SwiGluMlp<B> {
 #[derive(Clone, Debug)]
 pub struct SwiGluMlpConfig {
     pub n_embd: usize,
+    /// FFN hidden size (0 = engine default aligned to 256).
+    pub hidden: usize,
     pub dropout: f64,
 }
 
 impl SwiGluMlpConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> SwiGluMlp<B> {
-        let raw_hidden_dim = (8 * self.n_embd) / 3;
-        let hidden_dim = raw_hidden_dim.div_ceil(256) * 256;
+        let hidden_dim = if self.hidden > 0 {
+            self.hidden
+        } else {
+            ((8 * self.n_embd) / 3).div_ceil(256) * 256
+        };
 
         SwiGluMlp {
             gate_proj: LinearConfig::new(self.n_embd, hidden_dim).with_bias(false).init(device),
@@ -1840,10 +1876,15 @@ pub struct BlockConfig {
     pub attn_softcap: f32,
     pub rope_kind: RopeScalingKind,
     pub rope_factor: f32,
+    pub rope_base: f32,
     pub sliding_window: Option<usize>,
     pub sink_tokens: usize,
     pub evict_budget: Option<usize>,
     pub evict_recent: usize,
+    /// FFN hidden size (0 = engine default aligned to 256).
+    pub hidden: usize,
+    /// RMSNorm epsilon.
+    pub rms_norm_eps: f32,
 }
 
 impl BlockConfig {
@@ -1858,6 +1899,7 @@ impl BlockConfig {
                 attn_softcap: self.attn_softcap,
                 rope_kind: self.rope_kind,
                 rope_factor: self.rope_factor,
+                rope_base: self.rope_base,
                 sliding_window: self.sliding_window,
                 sink_tokens: self.sink_tokens,
                 evict_budget: self.evict_budget,
@@ -1866,11 +1908,12 @@ impl BlockConfig {
             .init(device),
             mlp: SwiGluMlpConfig {
                 n_embd: self.n_embd,
+                hidden: self.hidden,
                 dropout: self.dropout,
             }
             .init(device),
-            input_layernorm: RmsNorm::new(self.n_embd, device),
-            post_attention_layernorm: RmsNorm::new(self.n_embd, device),
+            input_layernorm: RmsNorm::new(self.n_embd, self.rms_norm_eps, device),
+            post_attention_layernorm: RmsNorm::new(self.n_embd, self.rms_norm_eps, device),
         }
     }
 }
@@ -2181,6 +2224,8 @@ impl ModelConfig {
         let kv_head = self.get_n_kv_head();
         let rope_kind = self.rope_kind();
         let rope_factor = self.rope_factor;
+        let rope_base = self.rope_base;
+        let hidden = self.ffn_hidden();
         let max_seq = extended_ctx_len(self.n_ctx, rope_kind, rope_factor);
         // Invalid eviction configs are rejected by the CLI/API entry points;
         // here they only downgrade to the dense mask.
@@ -2196,10 +2241,13 @@ impl ModelConfig {
                     attn_softcap: self.attn_softcap,
                     rope_kind,
                     rope_factor,
+                    rope_base,
                     sliding_window: self.sliding_window,
                     sink_tokens: self.sink_tokens,
                     evict_budget: eviction.map(|e| e.budget),
                     evict_recent: eviction.map(|e| e.recent).unwrap_or(0),
+                    hidden,
+                    rms_norm_eps: self.rms_norm_eps,
                 }
                 .init(device)
             })
@@ -2216,6 +2264,7 @@ impl ModelConfig {
                         n_ctx: self.n_ctx,
                         rope_kind,
                         rope_factor,
+                        rope_base,
                     }
                     .init(device)
                 })
@@ -2231,6 +2280,7 @@ impl ModelConfig {
                         n_ctx: self.n_ctx,
                         rope_kind,
                         rope_factor,
+                        rope_base,
                         d_latent: self.mla_dim(),
                     }
                     .init(device)
@@ -2256,7 +2306,7 @@ impl ModelConfig {
             kv,
             mla,
             blocks,
-            norm: RmsNorm::new(self.n_embd, device),
+            norm: RmsNorm::new(self.n_embd, self.rms_norm_eps, device),
             n_ctx: self.n_ctx,
             max_seq,
             kv_share_group: self.kv_share_group.max(1),
@@ -2275,22 +2325,22 @@ mod tests {
 
     #[test]
     fn test_rope_spec_linear_scales_frequencies() {
-        let base = rope_spec(256, 64, RopeScalingKind::None, 1.0);
-        let linear = rope_spec(256, 64, RopeScalingKind::Linear, 4.0);
+        let base = rope_spec(256, 64, RopeScalingKind::None, 1.0, 10000.0);
+        let linear = rope_spec(256, 64, RopeScalingKind::Linear, 4.0, 10000.0);
         assert_eq!(base.freqs.len(), linear.freqs.len());
         for (b, l) in base.freqs.iter().zip(linear.freqs.iter()) {
             assert!((b / 4.0 - l).abs() < 1e-7, "linear scaling mismatch: {b} vs {l}");
         }
         assert_eq!(linear.mscale, 1.0);
         // A factor <= 1 is a no-op.
-        let noop = rope_spec(256, 64, RopeScalingKind::Linear, 1.0);
+        let noop = rope_spec(256, 64, RopeScalingKind::Linear, 1.0, 10000.0);
         assert_eq!(noop.freqs[1], base.freqs[1]);
     }
 
     #[test]
     fn test_rope_spec_ntk_lowers_frequencies() {
-        let base = rope_spec(256, 64, RopeScalingKind::None, 1.0);
-        let ntk = rope_spec(256, 64, RopeScalingKind::Ntk, 4.0);
+        let base = rope_spec(256, 64, RopeScalingKind::None, 1.0, 10000.0);
+        let ntk = rope_spec(256, 64, RopeScalingKind::Ntk, 4.0, 10000.0);
         // The first frequency is 1.0 regardless of base; later ones shrink.
         assert!((base.freqs[0] - 1.0).abs() < 1e-6);
         assert!((ntk.freqs[0] - 1.0).abs() < 1e-6);
@@ -2302,8 +2352,8 @@ mod tests {
     fn test_rope_spec_yarn_ramp_and_mscale() {
         let factor = 4.0;
         let half = 32; // head_dim = 64
-        let original = rope_spec(256, 64, RopeScalingKind::None, 1.0);
-        let yarn = rope_spec(256, 64, RopeScalingKind::Yarn, factor);
+        let original = rope_spec(256, 64, RopeScalingKind::None, 1.0, 10000.0);
+        let yarn = rope_spec(256, 64, RopeScalingKind::Yarn, factor, 10000.0);
 
         // High frequencies (low dimensions) keep the original table; low
         // frequencies (high dimensions) are interpolated by `1/factor`.
@@ -2336,6 +2386,7 @@ mod tests {
             attn_softcap: 0.0,
             rope_kind: RopeScalingKind::None,
             rope_factor: 1.0,
+            rope_base: 10000.0,
             sliding_window: None,
             sink_tokens: 0,
             evict_budget: None,

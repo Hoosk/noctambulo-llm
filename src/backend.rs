@@ -37,6 +37,15 @@ pub fn default_device() -> MainDevice {
     MainDevice::default()
 }
 
+/// CPU-only backend used by the model converters: building a record needs no
+/// GPU and this keeps large conversions off the VRAM.
+pub type CpuBackend = burn_ndarray::NdArray<f32, i32>;
+
+/// CPU device for [`CpuBackend`].
+pub fn cpu_device() -> burn_ndarray::NdArrayDevice {
+    burn_ndarray::NdArrayDevice::Cpu
+}
+
 /// Human-readable backend name for logs.
 pub fn backend_label() -> &'static str {
     if cfg!(feature = "cuda") {

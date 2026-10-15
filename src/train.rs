@@ -597,7 +597,9 @@ pub fn train_with_events<B: AutodiffBackend>(
         let rec_file = if res_path.is_file() {
             res_path.with_extension("")
         } else {
-            res_path.to_path_buf()
+            // A model directory (imported/native) stores its record as
+            // `model_weights.bin`; the recorder appends the `.bin` extension.
+            res_path.join("model_weights")
         };
         emit_log(tx, format!("Resuming model weights from {:?}...", rec_file));
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();

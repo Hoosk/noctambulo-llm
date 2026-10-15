@@ -368,7 +368,7 @@ fn expect_dims(t: &GgufTensor, expected: &[usize], name: &str) -> Result<(), Str
     Ok(())
 }
 
-fn param1<B: Backend>(data: Vec<f32>, device: &B::Device) -> Param<Tensor<B, 1>> {
+pub(crate) fn param1<B: Backend>(data: Vec<f32>, device: &B::Device) -> Param<Tensor<B, 1>> {
     let len = data.len();
     let tensor = Tensor::<B, 1>::from_data(TensorData::new(data, [len]), device);
     let tensor = if backend_is_f16::<B>() {
@@ -379,7 +379,7 @@ fn param1<B: Backend>(data: Vec<f32>, device: &B::Device) -> Param<Tensor<B, 1>>
     Param::from_tensor(tensor)
 }
 
-fn param2<B: Backend>(data: Vec<f32>, dims: [usize; 2], device: &B::Device) -> Param<Tensor<B, 2>> {
+pub(crate) fn param2<B: Backend>(data: Vec<f32>, dims: [usize; 2], device: &B::Device) -> Param<Tensor<B, 2>> {
     let tensor = Tensor::<B, 2>::from_data(TensorData::new(data, dims), device);
     let tensor = if backend_is_f16::<B>() {
         tensor.cast(burn::tensor::FloatDType::F16)
@@ -476,6 +476,7 @@ pub fn import_gguf<B: Backend>(
     output_dir: &Path,
     force: bool,
     device: &B::Device,
+    tokenizer_override: Option<&Path>,
 ) -> Result<ModelConfig, String> {
     let weights_path = output_dir.join("model_weights.bin");
     if weights_path.exists() && !force {
@@ -487,20 +488,34 @@ pub fn import_gguf<B: Backend>(
 
     let gguf = parse_gguf(gguf_path)?;
     let arch = meta_string(&gguf.metadata, "general.architecture").unwrap_or_default();
-    if arch != "llama" {
+    // Third-party llama.cpp GGUFs use the architecture name as the metadata
+    // prefix. `llama` and `qwen2` share the layout this engine implements;
+    // anything else (qwen3 adds QK-norms, gemma uses GeGLU, ...) is rejected.
+    if arch != "llama" && arch != "qwen2" {
         return Err(format!(
-            "unsupported GGUF architecture '{arch}' (only the llama-style exports written by \
-             `export` can be imported)"
+            "unsupported GGUF architecture '{arch}' (supported: llama, qwen2; models with \
+             QK-norms, GeGLU or non-BPE tokenizers must be converted from safetensors instead)"
         ));
     }
-    let n_ctx = required(&gguf.metadata, "llama.context_length")?;
-    let n_embd = required(&gguf.metadata, "llama.embedding_length")?;
-    let n_layer = required(&gguf.metadata, "llama.block_count")?;
-    let n_head = required(&gguf.metadata, "llama.attention.head_count")?;
-    let n_kv_head = meta_u64(&gguf.metadata, "llama.attention.head_count_kv")
+    let key = |name: &str| format!("{arch}.{name}");
+    if meta_string(&gguf.metadata, "tokenizer.ggml.model").as_deref() != Some("gpt2") {
+        return Err(
+            "unsupported GGUF tokenizer (only byte-level BPE / 'gpt2' vocabularies can be \
+             imported; SentencePiece models need a safetensors conversion)"
+                .into(),
+        );
+    }
+    let n_ctx = required(&gguf.metadata, &key("context_length"))?;
+    let n_embd = required(&gguf.metadata, &key("embedding_length"))?;
+    let n_layer = required(&gguf.metadata, &key("block_count"))?;
+    let n_head = required(&gguf.metadata, &key("attention.head_count"))?;
+    let n_kv_head = meta_u64(&gguf.metadata, &key("attention.head_count_kv"))
         .map(|v| v as usize)
         .unwrap_or(n_head);
-    let hidden = required(&gguf.metadata, "llama.feed_forward_length")?;
+    let hidden = required(&gguf.metadata, &key("feed_forward_length"))?;
+    let rms_norm_eps = meta_f32(&gguf.metadata, &key("attention.layer_norm_rms_epsilon"))
+        .unwrap_or(1e-6);
+    let rope_base = meta_f32(&gguf.metadata, &key("rope.freq_base")).unwrap_or(10000.0);
     let tokens = meta_strings(&gguf.metadata, "tokenizer.ggml.tokens")
         .ok_or_else(|| "GGUF metadata is missing 'tokenizer.ggml.tokens'".to_string())?;
     let merges = meta_strings(&gguf.metadata, "tokenizer.ggml.merges").unwrap_or_default();
@@ -509,6 +524,9 @@ pub fn import_gguf<B: Backend>(
 
     if n_embd == 0 || n_head == 0 || n_layer == 0 || n_ctx == 0 || vocab_size == 0 {
         return Err("GGUF metadata contains zero-sized dimensions".to_string());
+    }
+    if hidden == 0 {
+        return Err("GGUF feed_forward_length is zero".to_string());
     }
     if !n_embd.is_multiple_of(n_head) {
         return Err(format!(
@@ -520,24 +538,28 @@ pub fn import_gguf<B: Backend>(
             "n_head ({n_head}) is not divisible by n_kv_head ({n_kv_head})"
         ));
     }
-    let expected_hidden = ((8 * n_embd) / 3).div_ceil(256) * 256;
-    if hidden != expected_hidden {
-        return Err(format!(
-            "GGUF feed_forward_length {hidden} does not match this engine's SwiGLU layout \
-             ({expected_hidden} for n_embd {n_embd})"
-        ));
-    }
-
     let head_dim = n_embd / n_head;
+    if let Some(key_length) = meta_u64(&gguf.metadata, &key("attention.key_length")) {
+        if key_length as usize != head_dim {
+            return Err(format!(
+                "GGUF attention.key_length {key_length} differs from n_embd/n_head ({head_dim}); \
+                 explicit head dimensions are not supported"
+            ));
+        }
+    }
     let kv_dim = n_kv_head * head_dim;
 
     let mut config = ModelConfig::new(vocab_size, n_embd, n_head, Some(n_kv_head), n_layer, n_ctx, 0.1, 0.0);
-    if let Some(kind) = meta_string(&gguf.metadata, "llama.rope.scaling.type") {
+    config.ffn_hidden = Some(hidden);
+    config.rms_norm_eps = rms_norm_eps;
+    config.rope_base = rope_base;
+    config.import_source = Some("gguf".into());
+    if let Some(kind) = meta_string(&gguf.metadata, &key("rope.scaling.type")) {
         let rope_kind = RopeScalingKind::parse(&kind)?;
-        let factor = meta_f32(&gguf.metadata, "llama.rope.scaling.factor").unwrap_or(1.0);
+        let factor = meta_f32(&gguf.metadata, &key("rope.scaling.factor")).unwrap_or(1.0);
         config.set_rope_scaling(rope_kind, factor);
     }
-    if let Some(window) = meta_u64(&gguf.metadata, "llama.attention.sliding_window") {
+    if let Some(window) = meta_u64(&gguf.metadata, &key("attention.sliding_window")) {
         config.sliding_window = Some(window as usize);
     }
 
@@ -580,6 +602,9 @@ pub fn import_gguf<B: Backend>(
     expect_dims(norm, &[n_embd], "output_norm.weight")?;
     model.norm.weight = param1(norm.data.clone(), device);
 
+    // llama.cpp stores llama-arch Q/K with the GPT-NeoX row permutation
+    // (NORM rope); qwen2 uses NEOX rope and stores the original layout.
+    let permuted = arch == "llama";
     for i in 0..n_layer {
         let prefix = format!("blk.{i}");
 
@@ -593,25 +618,27 @@ pub fn import_gguf<B: Backend>(
         let q = tensor(&gguf, &format!("{prefix}.attn_q.weight"))?;
         expect_len(q, n_embd * n_embd, &format!("{prefix}.attn_q.weight"))?;
         expect_dims(q, &[n_embd, n_embd], &format!("{prefix}.attn_q.weight"))?;
-        let q = transpose_2d(
-            &unpermute_rope_weight(&q.data, n_head, head_dim, n_embd),
-            n_embd,
-            n_embd,
-        );
+        let q_data = if permuted {
+            unpermute_rope_weight(&q.data, n_head, head_dim, n_embd)
+        } else {
+            q.data.clone()
+        };
+        let q = transpose_2d(&q_data, n_embd, n_embd);
 
         let k = tensor(&gguf, &format!("{prefix}.attn_k.weight"))?;
         expect_len(k, n_embd * kv_dim, &format!("{prefix}.attn_k.weight"))?;
         expect_dims(k, &[n_embd, kv_dim], &format!("{prefix}.attn_k.weight"))?;
-        let k = transpose_2d(
-            &unpermute_rope_weight(&k.data, n_kv_head, head_dim, n_embd),
-            n_embd,
-            kv_dim,
-        );
+        let k_data = if permuted {
+            unpermute_rope_weight(&k.data, n_kv_head, head_dim, n_embd)
+        } else {
+            k.data.clone()
+        };
+        let k = transpose_2d(&k_data, kv_dim, n_embd);
 
         let v = tensor(&gguf, &format!("{prefix}.attn_v.weight"))?;
         expect_len(v, n_embd * kv_dim, &format!("{prefix}.attn_v.weight"))?;
         expect_dims(v, &[n_embd, kv_dim], &format!("{prefix}.attn_v.weight"))?;
-        let v = transpose_2d(&v.data, n_embd, kv_dim);
+        let v = transpose_2d(&v.data, kv_dim, n_embd);
 
         let o = tensor(&gguf, &format!("{prefix}.attn_output.weight"))?;
         expect_len(o, n_embd * n_embd, &format!("{prefix}.attn_output.weight"))?;
@@ -621,23 +648,31 @@ pub fn import_gguf<B: Backend>(
         let gate = tensor(&gguf, &format!("{prefix}.ffn_gate.weight"))?;
         expect_len(gate, n_embd * hidden, &format!("{prefix}.ffn_gate.weight"))?;
         expect_dims(gate, &[n_embd, hidden], &format!("{prefix}.ffn_gate.weight"))?;
-        let gate = transpose_2d(&gate.data, n_embd, hidden);
+        let gate = transpose_2d(&gate.data, hidden, n_embd);
 
         let up = tensor(&gguf, &format!("{prefix}.ffn_up.weight"))?;
         expect_len(up, n_embd * hidden, &format!("{prefix}.ffn_up.weight"))?;
         expect_dims(up, &[n_embd, hidden], &format!("{prefix}.ffn_up.weight"))?;
-        let up = transpose_2d(&up.data, n_embd, hidden);
+        let up = transpose_2d(&up.data, hidden, n_embd);
 
         let down = tensor(&gguf, &format!("{prefix}.ffn_down.weight"))?;
         expect_len(down, hidden * n_embd, &format!("{prefix}.ffn_down.weight"))?;
         expect_dims(down, &[hidden, n_embd], &format!("{prefix}.ffn_down.weight"))?;
-        let down = transpose_2d(&down.data, hidden, n_embd);
+        let down = transpose_2d(&down.data, n_embd, hidden);
 
         let q_bias = gguf.tensors.get(&format!("{prefix}.attn_q.bias")).map(|b| {
-            unpermute_rope_bias(&b.data, n_head, head_dim)
+            if permuted {
+                unpermute_rope_bias(&b.data, n_head, head_dim)
+            } else {
+                b.data.clone()
+            }
         });
         let k_bias = gguf.tensors.get(&format!("{prefix}.attn_k.bias")).map(|b| {
-            unpermute_rope_bias(&b.data, n_kv_head, head_dim)
+            if permuted {
+                unpermute_rope_bias(&b.data, n_kv_head, head_dim)
+            } else {
+                b.data.clone()
+            }
         });
         let v_bias = gguf
             .tensors
@@ -675,12 +710,25 @@ pub fn import_gguf<B: Backend>(
         .map_err(|e| format!("failed to write model_weights.bin: {e:?}"))?;
 
     let tokenizer_path = output_dir.join("custom_tokenizer.json");
-    let tokenizer = tokenizer_json(&tokens, &merges, token_types.as_deref());
-    std::fs::write(
-        &tokenizer_path,
-        serde_json::to_string(&tokenizer).map_err(|e| format!("tokenizer JSON: {e}"))?,
-    )
-    .map_err(|e| format!("failed to write custom_tokenizer.json: {e}"))?;
+    if let Some(source) = tokenizer_override {
+        std::fs::copy(source, &tokenizer_path)
+            .map_err(|e| format!("failed to copy the tokenizer override: {e}"))?;
+    } else {
+        let pre = meta_string(&gguf.metadata, "tokenizer.ggml.pre").unwrap_or_default();
+        if !pre.is_empty() && pre != "gpt-2" && pre != "gpt2" {
+            println!(
+                "  warning: the GGUF declares the '{pre}' pre-tokenizer; the rebuilt byte-level \
+                 BPE may tokenize differently. Pass --tokenizer <tokenizer.json> for exact \
+                 tokenization."
+            );
+        }
+        let tokenizer = tokenizer_json(&tokens, &merges, token_types.as_deref());
+        std::fs::write(
+            &tokenizer_path,
+            serde_json::to_string(&tokenizer).map_err(|e| format!("tokenizer JSON: {e}"))?,
+        )
+        .map_err(|e| format!("failed to write custom_tokenizer.json: {e}"))?;
+    }
     // Validate the rebuilt tokenizer before declaring success.
     crate::data::LlmTokenizer::from_file(&tokenizer_path)
         .map_err(|e| format!("rebuilt tokenizer is invalid: {e}"))?;
@@ -773,6 +821,7 @@ mod tests {
 #[cfg(test)]
 mod roundtrip_tests {
     use super::*;
+    use crate::export::permute_rope_weight;
     use burn::backend::wgpu::WgpuDevice;
     use burn::backend::Wgpu;
 
@@ -822,8 +871,26 @@ mod roundtrip_tests {
         .unwrap();
         assert!(gguf.exists());
 
+        // Golden layout: the exported GGUF must follow the Hugging Face flat
+        // convention ([out][in] row-major with the llama RoPE permutation), not
+        // merely invert our own importer. This pins the non-square tensors,
+        // where a swapped transpose still round-trips but breaks third-party
+        // compatibility.
+        let parsed = parse_gguf(&gguf).unwrap();
+        let n_kv_head = config.get_n_kv_head();
+        let head_dim = config.n_embd / config.n_head;
+        let kv_dim = n_kv_head * head_dim;
+        let k_burn = model.kv[0].k_proj.weight.val().into_data().to_vec::<f32>().unwrap();
+        let expected = transpose_2d(&k_burn, config.n_embd, kv_dim);
+        let expected = permute_rope_weight(&expected, n_kv_head, head_dim, config.n_embd);
+        let k_tensor = parsed.tensors.get("blk.0.attn_k.weight").expect("k tensor");
+        assert_eq!(k_tensor.data.len(), expected.len());
+        for (a, b) in k_tensor.data.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-6, "exported k layout mismatch: {a} vs {b}");
+        }
+
         let out = dir.join("imported");
-        import_gguf::<Wgpu>(&gguf, &out, true, &device).unwrap();
+        import_gguf::<Wgpu>(&gguf, &out, true, &device, None).unwrap();
 
         let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
         let record = recorder.load(out.join("model_weights"), &device).unwrap();
@@ -861,4 +928,3 @@ mod roundtrip_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-

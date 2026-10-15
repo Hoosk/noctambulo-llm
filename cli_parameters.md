@@ -36,7 +36,7 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--val-split` | `f32` | `0.1` | Percentage of the dataset reserved for validation and perplexity computation ($\text{PPL} = e^{\text{loss}}$). |
 | `--grad-accum` | `usize` | `1` | Gradient accumulation steps before running the AdamW step. |
 | `--save-dir` | `Option<String>`| `None` | Directory to save automatic model checkpoints at the end of each epoch. |
-| `--resume` | `Option<String>`| `None` | Path to a checkpoint file or previous weights to resume training from. |
+| `--resume` | `Option<String>`| `None` | Checkpoint file or **model directory** to resume from. A directory with `config.json` warm-starts (fine-tunes) that model: its architecture and tokenizer are used, and CLI architecture flags are ignored. |
 | `--seq-warmup-steps` | `usize` | `0` | Initial steps for **Progressive Sequence Scaling** (grows the context window from $N/4$ to $N$). `0` disables it. |
 | `--early-stop-patience` | `usize` | `0` | Stops training after $N$ epochs without `val_loss` improvement. `0` disables it. |
 | `--weight-decay` | `f64` | `0.1` | Decoupled weight decay (AdamW) applied to all parameters. `0` disables it. |
@@ -142,12 +142,25 @@ Imports a GGUF file produced by `export` (or a compatible llama-style GGUF with 
 | `<gguf>` | `String` | *Required* | Path to the `.gguf` file to import. |
 | `--output-dir` | `String` | GGUF file stem | Directory (under the models root) that will receive the imported model. |
 | `--force` | `bool` (flag) | `false` | Overwrite the output directory if it already contains a model. |
+| `--tokenizer` | `Option<String>` | `None` | Exact `tokenizer.json` to use instead of the one rebuilt from the GGUF vocabulary (recommended for third-party GGUFs whose pre-tokenizer differs). |
 
 The inverse of the exporter is exact (transposes + GPT-NeoX RoPE row permutation are inverted); quantized GGUFs (Q4/Q8...) are rejected with a clear error.
 
 ---
 
-## ⬇️ 8. `download` Subcommand Parameters
+## 🧲 8. `import-hf` Subcommand Parameters
+Converts a Hugging Face model (`config.json` + `tokenizer.json` + `model.safetensors`) into the native format. Supports Llama / Qwen2 / Mistral decoder models with SwiGLU, RMSNorm, GQA, RoPE and tied word embeddings; f32/f16/bf16 safetensors, single-file or sharded.
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `--repo` | `Option<String>` | `None` | Hugging Face repo id (e.g. `Qwen/Qwen2.5-0.5B-Instruct`); config, tokenizer and safetensors are downloaded. Exactly one of `--repo`/`--dir`. |
+| `--dir` | `Option<String>` | `None` | Local directory containing `config.json`, `tokenizer.json` and the safetensors (or their index). |
+| `--output-dir` | `Option<String>` | source name | Directory that receives the converted model. |
+| `--force` | `bool` (flag) | `false` | Overwrite the output directory if it already contains a model. |
+
+QK-norm architectures (Qwen3), SentencePiece tokenizers, untied `lm_head` weights and quantized (GPTQ/AWQ) safetensors are rejected with a clear error. Weights are converted to f32.
+
+## ⬇️ 9. `download` Subcommand Parameters
 Downloads a dataset file from Hugging Face Hub; Parquet files are automatically text-extracted.
 
 | Parameter | Type | Default | Technical Description / Function |
@@ -159,12 +172,12 @@ Downloads a dataset file from Hugging Face Hub; Parquet files are automatically 
 
 ---
 
-## 📈 9. `stats` Subcommand Parameters
+## 📈 10. `stats` Subcommand Parameters
 Prints the model parameter count, VRAM footprint, FLOPs statistics and KV cache estimates for every storage format (`f32`, `f16`, `int8`, `q4`, in bytes/token and total MB at `n_ctx`). When the checkpoint enables heavy-hitter eviction it also reports the geometry (`sinks + recent + hitters`), the resident budget in MB per storage format and the f32 score overhead. It takes no parameters.
 
 ---
 
-## 🌐 10. `serve` Subcommand Parameters
+## 🌐 11. `serve` Subcommand Parameters
 Serves the web console (React build in `web/dist`) and the JSON/SSE API to control training, generation, and export from the browser.
 
 | Parameter | Type | Default | Technical Description / Function |

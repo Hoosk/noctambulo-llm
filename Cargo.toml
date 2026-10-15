@@ -47,7 +47,5 @@ async-stream = "0.3"
 wgpu = "29.0.4"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 sysinfo = "0.39.6"
-
-[dev-dependencies]
-# CPU-only deterministic backend for training/resume verification tests.
+# CPU-only backend: deterministic tests and GPU-free model conversion.
 burn-ndarray = "0.21"

@@ -47,7 +47,7 @@ Kuro-Neko implements **Tied Word Embeddings** (`tie_word_embeddings = true`).
 
 Positional information is not added to the input embeddings; instead, it is incorporated through complex rotations on the Query ($Q$) and Key ($K$) vectors within each attention head.
 
-- **Frequency Base**: $\theta = 10.000,0$ (or $1.000.000$ for long contexts).
+- **Frequency Base**: $\theta = 10.000,0$ by default; imported models carry their own value (`rope_theta` / `rope.freq_base`, e.g. $10^6$ for Qwen2.5, $5\cdot10^5$ for Llama-3).
 - **Positional Frequencies**: For each even dimension $2i \in [0, d_k)$:
   $$\theta_i = \frac{1}{\theta^{2i / d_k}}$$
 - **2D Plane Rotation**:
@@ -101,7 +101,7 @@ Both the pre-attention normalizations (*Pre-Attention Norm*) and the pre-MLP nor
 
 - **Equation**:
   $$\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d} \sum_{i=1}^d x_i^2 + \epsilon}} \odot \gamma$$
-- **Epsilon Parameter**: $\epsilon = 10^{-6}$ (Qwen2.5 / Qwen3 standard).
+- **Epsilon Parameter**: $\epsilon = 10^{-6}$ by default; imported models use their `rms_norm_eps` (e.g. $10^{-5}$ for Llama).
 - **Efficiency**: It skips the population mean computation, reducing memory passes on the GPU by 50% compared to LayerNorm.
 
 ---

@@ -1,6 +1,6 @@
 # 🗺️ Kuro-Neko Roadmap
 
-Last updated: 2026-10-13 (KV cache modernization complete: Phase 6 heavy-hitter eviction plus host-RAM spill/replay landed across engine, training, CLI, API and web; third-party model support remains as backlog).
+Last updated: 2026-10-15 (Third-party model support landed: HF safetensors converter, relaxed GGUF import with the non-square layout fix, fine-tuning from a model directory, and the web/API surface; quantized GGUF dequantization remains as backlog).
 
 ## Current Status
 
@@ -65,14 +65,15 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 - ✅ **Translate all documentation to English**: README, `cli_parameters.md`, `doc/*.md`, ROADMAP and the auxiliary notes, with no Spanish copies.
 - ✅ **Code strings and help text**: the remaining Spanish comments/messages in `src/` were translated; `serve --token` now documents that omitting it disables auth and `train --dtype` states that `bf16` is rejected by the WGPU backend.
 
-## Future Backlog — Third-Party Model Support
+## Third-Party Model Support
 
-Today `import` only inverts this engine's own GGUF exports (`general.architecture = "llama"`, this SwiGLU hidden layout, f32/f16 only, BPE tokenizer, fixed RMSNorm eps, tied embeddings) and `train` rebuilds the architecture from CLI flags. Loading/fine-tuning models downloaded from elsewhere needs:
-
-1. A converter from Hugging Face safetensors to the native format (name mapping, transposed linear weights, GPT-NeoX RoPE permutation, tied embeddings, optional biases).
-2. A relaxed GGUF import: `llama`/`qwen2`-style architectures beyond this layout, `layer_norm_rms_epsilon` from metadata, SentencePiece tokenizers and dequantization of quantized GGUF tensors at import time.
-3. Fine-tuning imported models using the checkpoint `config.json` as the architecture source (not CLI flags) and the model directory tokenizer.
+- ✅ **Configurable architecture**: `ffn_hidden` (any `intermediate_size`), `rms_norm_eps` and `rope_base` (`rope_theta`) live in `ModelConfig` (defaults keep the engine layout); `arch_version` 5 loads v4 checkpoints and the CLI `stats`/`export`/`param_count` use the configured FFN size.
+- ✅ **Hugging Face converter (`import-hf`)**: reads `config.json` + `tokenizer.json` + `model.safetensors` (single or sharded, f32/f16/bf16) from a Hub repo or a local directory; supports Llama/Qwen2/Mistral decoder models (SwiGLU, GQA, tied embeddings, optional biases, linear/dynamic/yarn rope scaling) and rejects QK-norms (Qwen3), SentencePiece tokenizers, untied `lm_head` and GPTQ/AWQ with clear errors. Conversion runs on the CPU backend (`burn-ndarray`), so large models do not need VRAM to convert. Verified end-to-end: `Qwen/Qwen2.5-0.5B-Instruct` converts and generates coherent English.
+- ✅ **Relaxed GGUF import**: accepts `llama` and `qwen2` metadata prefixes, arbitrary `feed_forward_length`, `layer_norm_rms_epsilon` and `rope.freq_base` from metadata, GQA and biases; de-permutes Q/K only for the `llama` layout (qwen2 uses NEOX rope), and `--tokenizer <file>` overrides the rebuilt vocabulary when the GGUF pre-tokenizer differs. Fixed the non-square weight transpose that only round-tripped with this engine's own exporter (verified against bartowski's f16 Qwen2.5-0.5B: byte-identical to the HF safetensors, coherent generation) and added a golden-layout regression test.
+- ✅ **Fine-tuning imported models**: `train --resume <model_dir>` reads the directory `config.json` (architecture, eviction geometry) and `custom_tokenizer.json`, loading the weights as a warm start (fresh optimizer when no sidecars exist); the web Train wizard exposes it as “Warm start from a model”. The directory resume path now resolves `model_weights.bin`.
+- ✅ **Web/API**: `POST /api/models/import-hf` runs as a cancellable background op with phase progress; `ModelInfo` reports `ffn_hidden`, `rope_base`, `rms_norm_eps` and `import_source`, shown in the Models view together with a new “Import from Hugging Face” card.
+- ⏳ **Backlog — quantized GGUF dequantization** (Q4_0/Q8_0/K-quants) at import time; today only f32/f16 GGUF tensors are converted (the error suggests `import-hf` or an f16 GGUF).
 
 ## Suggested Order
 
-Phases 0–6 of the KV cache modernization plus host-RAM spill/replay are complete. Next: the third-party model converter/import backlog. Separate known gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. Re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above) before measuring quality.
+Phases 0–6 of the KV cache modernization plus host-RAM spill/replay are complete, and third-party model support (HF safetensors converter, relaxed GGUF import, fine-tuning from a model directory, web/API surface) has landed. Remaining backlog: quantized GGUF dequantization. Separate known gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. Re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above) before measuring quality.

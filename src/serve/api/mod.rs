@@ -35,7 +35,10 @@ use devices::devices;
 use download::download;
 use export::export_model;
 use generate::{generate_stream, generate_text};
-use models::{checkpoints, model_delete, model_file, model_files, model_import, model_rename, models};
+use models::{
+    checkpoints, model_delete, model_file, model_files, model_import, model_import_hf,
+    model_rename, models,
+};
 use train::{train, train_logs, train_pause, train_resume, train_status, train_stop, train_stream};
 
 /// Build the API router. Also returns the job registry so the server can
@@ -63,6 +66,7 @@ pub fn router(state: Arc<ServerState>) -> (Router, Arc<JobRegistry>) {
         .route("/api/models/file", get(model_file))
         .route("/api/models/rename", post(model_rename))
         .route("/api/models/import", post(model_import))
+        .route("/api/models/import-hf", post(model_import_hf))
         .route("/api/models/:name", delete(model_delete))
         .route("/api/checkpoints", get(checkpoints))
         .route("/api/train", post(train))
