@@ -88,7 +88,7 @@ fn resolve_arch(
 }
 
 #[derive(Parser)]
-#[command(name = "kuro-neko", author, version, about = "🐈‍⬛ Kuro-Neko 2026 Engine", long_about = None)]
+#[command(name = "noctambulo", author, version, about = "Noctámbulo 2026 Engine", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -433,7 +433,7 @@ struct GenerateArgs {
 #[derive(Args)]
 struct ExportArgs {
     /// Name of the exported GGUF model binary
-    #[arg(long, default_value = "kuro-neko-qwen")]
+    #[arg(long, default_value = "noctambulo")]
     model_name: String,
     /// Allow exporting a cross-layer KV sharing model as a standard-attention
     /// approximation (duplicated K/V weights; not bit-identical to the engine).
@@ -443,7 +443,7 @@ struct ExportArgs {
 
 #[derive(Args)]
 struct ImportArgs {
-    /// Path to the GGUF file (e.g. exported/kuro-neko-v2.gguf)
+    /// Path to the GGUF file (e.g. exported/noctambulo-v2.gguf)
     gguf: String,
     /// Output model directory (default: the GGUF file stem)
     #[arg(long)]
@@ -1106,7 +1106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let flops_per_token = 2 * total_params;
 
             println!("===============================================================================");
-            println!("🐈‍⬛ Kuro-Neko 2026 Model Architecture Statistics");
+            println!("Noctámbulo 2026 Model Architecture Statistics");
             println!("===============================================================================");
             println!("  Vocab Size       : {} tokens", vocab_size);
             println!("  Context Window   : {} tokens", model_config.n_ctx);

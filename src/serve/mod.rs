@@ -65,7 +65,7 @@ pub async fn run(
         .fallback_service(spa);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    println!("🐈‍⬛ Kuro-Neko serve listening on http://{bind}");
+    println!("Noctámbulo serve listening on http://{bind}");
     if let Some(t) = &*state.token.read().unwrap() {
         println!("   API token: {}", t);
         println!("   Send the `X-API-Token: {t}` header with every request.");

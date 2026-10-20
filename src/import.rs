@@ -800,7 +800,7 @@ mod tests {
             bytes.extend_from_slice(&(v as f32).to_le_bytes());
         }
 
-        let dir = std::env::temp_dir().join(format!("kuro_gguf_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noctambulo_gguf_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tiny.gguf");
         std::fs::write(&path, &bytes).unwrap();
@@ -848,7 +848,7 @@ mod roundtrip_tests {
 
     #[test]
     fn test_export_import_roundtrip_preserves_weights() {
-        let dir = std::env::temp_dir().join(format!("kuro_gguf_rt_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noctambulo_gguf_rt_{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let tok_path = dir.join("tok.json");

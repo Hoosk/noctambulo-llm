@@ -7,7 +7,7 @@ import { useHeartbeat } from "./useHeartbeat";
 import { useOpsStream } from "./useOpsStream";
 import { useTrainingJob } from "./useTrainingJob";
 
-const ACTIVE_MODEL_KEY = "kuro_active_model";
+const ACTIVE_MODEL_KEY = "noctambulo_active_model";
 
 export function AppStateProvider({ children }: { children: ReactNode }) {
   const [authState, setAuthState] = useState<AuthState>("checking");

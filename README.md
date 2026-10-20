@@ -1,383 +1,223 @@
-# 🐈‍⬛ Kuro-Neko (kuro-neko-llm)
+# Noctámbulo
 
-**Kuro-Neko** is a training and inference engine for Large Language Models (LLMs) with a **Qwen (Qwen2.5 / Qwen3)** architecture written entirely in **Rust**, GPU-accelerated through **Burn 0.21** and **WGPU**, with first-class export to **GGUF v3** (compatible with LM Studio, llama.cpp and Ollama) and a React web console to drive everything from the browser.
+**Train it overnight. Wake up to a model.**
 
----
+[![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
+[![Burn](https://img.shields.io/badge/Burn-0.21-blue)](https://burn.dev/)
+[![GPU](https://img.shields.io/badge/GPU-WGPU%20%7C%20CUDA-6f42c1)](https://wgpu.rs/)
+[![Tests](https://img.shields.io/badge/tests-109%20passing-brightgreen)](#verification)
+[![GGUF](https://img.shields.io/badge/export-GGUF%20v3-9cf)](doc/models/export.md)
+[![Web](https://img.shields.io/badge/console-React%2019%20%2B%20Axum-0ea5e9)](#web-console)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## 🚀 Main Features
+Noctámbulo (`noctambulo-llm`) is an end-to-end LLM engine written in **Rust** on top of
+**Burn 0.21** and **WGPU**: byte-level BPE tokenizer, dataset pipeline, training,
+evaluation, inference, GGUF import/export, third-party model conversion and a React web
+console. One CLI, one binary, no Python runtime.
 
-- **Causal Transformer architecture (Qwen2.5 / Qwen3)**:
-  - Causal multi-head attention with **RoPE** ($\theta = 10{,}000$), bias enabled on the QKV projections (`with_bias(true)`) and a `triu_mask` triangular mask.
-  - MLP layers with **SwiGLU** (SiLU activations aligned to multiples of 256).
-  - **RMSNorm** normalization with precision $\epsilon = 10^{-6}$.
-  - **Tied word embeddings** with normal Gaussian initialization $\mathcal{N}(0, 0.02)$ to avoid logit saturation.
-  - **Dropout** and **weight decay** ($0.1$) regularization.
-- **GPU acceleration with WGPU / Burn 0.21**: cross-platform execution (Vulkan, Metal, DX12, WebGPU). Training is f32-only (Burn 0.21's f16 optimizer state underflows); generation supports `--dtype f16` on the non-fused backend. The KV cache can be stored as f16, int8 or q4.
-- **Streaming parallel tokenization**: multithreaded line-by-line streaming loading with a byte-level BPE tokenizer, dynamic capacity estimation and error reporting.
-- **Optimized training pipeline**:
-  - **Data shuffling** per epoch (Fisher-Yates) for better convergence.
-  - **Gradient clipping** by $L_2$ norm (`Norm(1.0)`) and **weight decay** (`0.1`).
-  - **Cosine LR schedule** with configurable warmup.
-  - **Sparse loss computation ($NLL$)** with `log_softmax` + `gather`.
-  - **GPU loss accumulation** with no per-batch GPU $\to$ CPU synchronization stalls.
-  - **Gradient accumulation**, **progressive sequence scaling** warmup and **early stopping**.
-  - **Decoupled weight decay** (AdamW) applied to all parameters, optional **label smoothing** and **z-loss**.
-- **Context extension (RoPE scaling)**: `linear`, `ntk` and `yarn` strategies with a configurable factor; RoPE angles are computed per position (no table cap), generation and evaluation can run past the trained `n_ctx`, and GGUF exports carry the `rope.scaling.*` metadata.
-- **Bounded KV cache**: `--sliding-window` plus `--sink-tokens` turn the per-layer cache into a ring buffer of `window + sinks` rows (long prompts are prefilled in chunks); without a window the cache is preallocated to the context and written in place.
-- **Heavy-hitter KV eviction (H2O)**: `--kv-eviction h2o --kv-budget N [--kv-recent R]` bounds the cache to `N` rows that keep attention sinks, the last `R` tokens and the rows with the highest accumulated attention mass. Inference accumulates the mass in f32 (any cache dtype) and recycles the lowest-score unprotected row; training aligns the attention mask with the same geometry using a per-forward pseudo-random keep-set (a conservative lower bound). Mutually exclusive with `--sliding-window`.
-- **Host-RAM spill and replay**: `--kv-spill` archives every evicted row (f32, with position and score) in host RAM, and `--kv-max-budget N --kv-grow R --kv-grow-interval T` grows the resident budget deterministically, refilling each new slot with the highest-score archived rows. Lossless bounded decoding for long RoPE-extended generations, on top of any cache dtype or MLA.
-- **Cross-layer KV sharing**: `--kv-share-group N` makes each group of N layers share one K/V projection and cache (DeepSeek CSA-style), shrinking KV memory by N. Checkpoints carry an `arch_version`; GGUF export of grouped models requires `--approx` and is documented as an approximation.
-- **MLA latent cache**: `--mla-latent-dim D` compresses K/V through a `D`-wide latent and caches only the latent (4× smaller for a typical D), expanding K/V on the fly at attention time. This variant has no decoupled RoPE, so GGUF export folds `kv_down · k_up` into exact standard K/V weights.
-- **Third-party models**: `import-hf` converts Hugging Face safetensors (Llama / Qwen2 / Mistral, f32/f16/bf16, sharded, custom FFN size, RoPE base/eps from the config) and `import` reads compatible `llama`/`qwen2` GGUFs; both are tagged with their origin and can be generated, evaluated, exported and fine-tuned with `train --resume <model_dir>`.
-- **Direct Parquet/HF ingestion**: `prepare-dataset` tokenizes a Parquet text column straight into `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents.
-- **Full-state checkpoints and resume**: weights, AdamW moments, LR schedule and shuffler RNG; safe stop with Ctrl+C saves an interrupted checkpoint.
-- **Evaluation with BPB**: cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and bits-per-byte (comparable across tokenizers), over all batches by default.
-- **Native GGUF v3 exporter**: direct serialization of all weight and bias tensors aligned to 32 bytes with GGUF v3 headers and the `general.alignment` key.
-- **Streaming generation over SSE**: the API streams tokens as they are produced, supports cancellation and reports live tokens/second. The CLI exposes the same sampler (Top-K, Top-P, Min-P, repetition penalty).
-- **React web console**: React 19 + Vite + TypeScript + Tailwind v4 (built locally, no CDN) with Train, Datasets, Generate, Models, Export and Devices views, HttpOnly-cookie authentication and a self-contained production build served by Axum.
-- **Model management from the browser**: rename, delete and pick models, download their weights/config/tokenizer, and export to GGUF. Long operations (Hugging Face downloads, weighted mixes, GGUF exports) run as cancellable background jobs with live byte/char/tensor progress.
-- **Run history and telemetry**: every training run is persisted with its config, final loss/PPL and train/val curves so runs can be overlaid and compared, while `/api/telemetry` reports live process CPU/RSS, system memory and GPU memory counters where the OS exposes them.
-- **Modern CLI with Clap**: derive-macro CLI with strict validation and automatic `--help`.
-
----
-
-## 🛠️ Requirements
-
-- **Rust**: 1.80+ on the **Stable** channel (`cargo` and `rustc`).
-- **GPU drivers**: Vulkan / Metal / DX12 support. For NVIDIA machines, build with `cargo build --release --features cuda` to use the CUDA backend in the CLI.
-- **Node.js 20+**: only needed to build the web console (`web/`).
-
----
-
-## ⚙️ Command-Line Interface (CLI) Usage
-
-### 1. Train the Model (`train`)
-
-Runs GPU-accelerated training on a Hugging Face dataset or a local file:
-
-```bash
-# Train on TinyStories (default configuration: 100M tokens, batch 128, 3 epochs)
-cargo run --release -- train --dataset roneneldan/TinyStories
+```mermaid
+flowchart LR
+  A[Text / Parquet / HF Hub] --> B[BPE tokenizer]
+  B --> C[Tokenized .bin]
+  C --> D[Train<br/>WGPU / CUDA]
+  D --> E[Checkpoints<br/>full-state resume]
+  E --> F[Evaluate<br/>PPL + BPB]
+  E --> G[Generate<br/>CLI + SSE]
+  E --> H[GGUF v3 export]
+  H <--> I[GGUF / HF import]
+  G --> J[React console]
+  F --> J
 ```
 
-#### Trainer Options (CLI Flags)
+## Why “Noctámbulo”?
 
-| Flag | Description | Default |
-|:---|:---|:---|
-| `--dataset <repo>` | Hugging Face repository ID(s) (e.g. `roneneldan/TinyStories`) | `[]` |
-| `--file <path>` | Local plain-text or binary (`.bin`) file to train on | `None` |
-| `--dataset-file <filename>` | File name inside the HF repo | `TinyStories-train.txt` |
-| `--preset <name>` | Architecture preset: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M) | `None` |
-| `--dtype <f32\|f16>` | Compute precision. Only `f32` is trainable; `f16` is rejected (Burn 0.21's AdamW state underflows in f16) | `f32` |
-| `--batch-size <n>` | Batch size | `128` |
-| `--epochs <n>` | Number of training epochs | `3` |
-| `--max-tokens <n>` | Maximum tokens to load (`0` = no limit). The Chinchilla reference is ~20 tokens/parameter | `100000000` |
-| `--step <n>` | Sliding window step (`None` = `n-ctx`) | `None` |
-| `--n-ctx <n>` | Model context window | `256` (or preset) |
-| `--n-embd <n>` | Embedding dimension | `256` (or preset) |
-| `--n-head <n>` | Causal attention heads (Query) | `4` (or preset) |
-| `--n-kv-head <n>` | Key/Value heads for GQA (`None` = same as `n-head`) | `None` |
-| `--n-layer <n>` | Number of Transformer blocks | `4` (or preset) |
-| `--lr <float>` | Learning rate | `0.0003` |
-| `--dropout <float>` | Dropout probability | `0.1` |
-| `--attn-softcap <float>` | Attention capping (`0.0` disabled, `50.0` Gemma-style) | `0.0` |
-| `--sliding-window <n>` | Sliding attention window (`0` = full causal); bounds the inference KV cache to `n + sink-tokens` | `0` |
-| `--sink-tokens <n>` | Initial tokens always kept attendable (attention sinks) | `0` |
-| `--kv-share-group <n>` | Layers per cross-layer K/V sharing group (`1` = off); one K/V projection and cache per group | `1` |
-| `--mla-latent-dim <n>` | MLA latent size (`0` = off); caches only the compressed latent, GGUF export folds the weights exactly | `0` |
-| `--kv-eviction <kind>` | Bounded-cache policy: `none` or `h2o` (heavy-hitter eviction, mutually exclusive with `--sliding-window`) | `none` |
-| `--kv-budget <n>` | Resident KV cache rows (required by `--kv-eviction h2o`; must exceed sinks + recent) | `0` |
-| `--kv-recent <n>` | Most recent tokens never evicted | `64` |
-| `--val-split <float>` | Fraction reserved for validation and perplexity ($PPL$) | `0.1` |
-| `--grad-accum <n>` | Micro-batches accumulated per AdamW step (true gradient mean, equivalent to a larger batch) | `1` |
-| `--save-dir <path>` | Directory for automatic per-epoch checkpoint saving | `None` |
-| `--resume <path>` | Checkpoint file or **model directory** to resume from. A directory with `config.json` warm-starts (fine-tunes) that model using its architecture and tokenizer; checkpoint files restore weights, AdamW, schedule and RNG (`--epochs` = additional epochs) | `None` |
-| `--seq-warmup-steps <n>` | Initial steps for **Progressive Sequence Scaling** (from $N/4$ to $N$) | `0` |
-| `--early-stop-patience <n>` | Stops training after `n` epochs without improving `val_loss` (`0` = disabled) | `0` |
-| `--weight-decay <float>` | Decoupled weight decay (AdamW) applied to all parameters (`0` disables it) | `0.1` |
-| `--label-smoothing <float>` | Label-smoothing factor for the cross-entropy loss | `0.0` |
-| `--z-loss <float>` | Z-loss coefficient on `logsumexp(logits)²` | `0.0` |
+*Noctámbulo* is Spanish for **night owl**. The engine is designed for exactly that:
+long, unattended training runs.
 
-#### Custom Training Examples
+- **Full-state checkpoints**: weights, AdamW moments, LR schedule and shuffler RNG survive
+  a restart; `--resume` continues exactly where it stopped.
+- **Safe stop**: `Ctrl+C` saves an interrupted checkpoint instead of losing the night.
+- **Early stopping, sequence warmup, gradient accumulation** and cosine LR with warmup.
+- **Bounded caches** for long generations: the KV cache never grows without control.
+- **Run history + live telemetry** in the web console: loss/val curves, tok/s, CPU/RSS/GPU.
+- **Background operations** with progress and cancellation: downloads, mixes, imports,
+  exports.
+
+Start it before bed. Check the loss curve over coffee.
+
+## Highlights
+
+**Training**
+- Qwen-style decoder: RMSNorm, SwiGLU, RoPE, GQA, tied word embeddings, optional
+  attention softcap.
+- Configurable architecture: presets (`nano`/`tiny`/`small`/`base`) or explicit
+  `--n-embd/--n-head/--n-kv-head/--n-layer/--n-ctx`, plus custom FFN size, RMSNorm epsilon
+  and RoPE theta for imported models.
+- AdamW with decoupled weight decay, gradient clipping, label smoothing, z-loss.
+- Datasets from plain text, Parquet (direct ingest, no intermediate `.txt`) or the Hugging
+  Face Hub; exact-duplicate removal, weighted mixing, `.bin` fingerprints.
+- f32 training on WGPU (or CUDA with `--features cuda`); records are always f32.
+
+**Inference**
+- Top-K, Top-P, Min-P, temperature and repetition penalty.
+- Streaming tokens over SSE with cancellation and live tok/s.
+- f32/f16 compute and f32/f16/int8/q4 KV cache storage.
+- RoPE context extension: `linear`, `ntk`, `yarn` — generate past the trained window.
+
+**KV cache engineering** (the part most engines leave on the table)
+
+| Feature | Flags | What it does |
+| --- | --- | --- |
+| Preallocated ring cache | — | In-place `slice_assign`, no per-token reallocation |
+| Sliding window + sinks | `--sliding-window`, `--sink-tokens` | Bounded ring with StreamingLLM sinks |
+| Cross-layer KV sharing | `--kv-share-group N` | One K/V projection + cache per N layers |
+| MLA latent cache | `--mla-latent-dim D` | Cache only a compressed latent, expand on the fly |
+| Heavy-hitter eviction (H2O) | `--kv-eviction h2o --kv-budget N` | Keep sinks + recent + highest attention mass |
+| Host-RAM spill/replay | `--kv-spill --kv-max-budget N --kv-grow R` | Archive evicted rows and replay by score |
+| Quantized cache | `--kv-cache-dtype int8\|q4` | Packed integers + per-block scales |
+
+**Third-party models**
+- `import-hf`: convert Hugging Face safetensors (Llama / Qwen2 / Mistral, f32/f16/bf16,
+  sharded, custom FFN size, RoPE base/eps from the config) on the CPU, without VRAM.
+- `import`: read compatible `llama`/`qwen2` GGUFs (f32/f16), with `--tokenizer` override.
+- Fine-tune any imported model with `train --resume <model_dir>`.
+- Clear errors for QK-norms (Qwen3), SentencePiece tokenizers, untied `lm_head` and
+  quantized safetensors.
+- `export`: GGUF v3 with llama.cpp-compatible tensor layout, RoPE scaling and sliding
+  window metadata.
+
+**Web console**
+- React 19 + Vite + TypeScript + Tailwind v4, built locally (no CDN), served by Axum.
+- Train wizard (data → architecture → schedule → review) with inline validation and live
+  parameter count.
+- Live loss/val charts, worker logs over SSE, run history with overlay.
+- Datasets: HF file picker, downloads, weighted mixing, duplicate removal.
+- Models: source badges, architecture details, file downloads, rename/delete, GGUF and HF
+  imports with progress.
+- Devices: CPU/GPU/NPU detection, host system card, real-time telemetry.
+
+## Quickstart
+
+Requirements: Rust 1.80+, a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
+console.
 
 ```bash
-# Quick test run with 1M tokens and GQA (n_kv_head=2)
-cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 1000000 --n-kv-head 2
-
-# Train on the FULL dataset with no token limit
-cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 0
-
-# Configure training with Sequence Length Warmup (Progressive Scaling), accumulation and checkpointing
-cargo run --release -- train --file corpus.txt --seq-warmup-steps 1000 --grad-accum 4 --val-split 0.1 --save-dir checkpoints
-
-# Configure a larger model with GQA and softcapping
-cargo run --release -- train --dataset roneneldan/TinyStories --n-embd 512 --n-head 8 --n-kv-head 2 --n-layer 8 --attn-softcap 50.0
+git clone https://github.com/Hoosk/noctambulo-llm.git
+cd noctambulo-llm
+cargo build --release
 ```
 
----
-
-### 2. Pre-tokenize a Dataset to Binary (`prepare-dataset`)
-
-Pre-tokenizes a corpus or Hugging Face dataset into an ultra-compact `.bin` file for instant `mmap` loading:
-
 ```bash
-cargo run --release -- prepare-dataset --file corpus.txt --output datasets/corpus.bin
-```
-
-> [!NOTE]
-> `.bin` v2 datasets embed a fingerprint of the tokenizer vocabulary. If you retrain the tokenizer, re-run `prepare-dataset`: loading a `.bin` tokenized with another vocabulary now fails with an explicit error instead of training on corrupt IDs.
-
-Parquet files are ingested directly (the `text`/`content`/`body` column is tokenized on the fly, no intermediate `.txt`), and `--dedupe` removes exact duplicate lines/documents before tokenizing:
-
-```bash
-cargo run --release -- prepare-dataset \
-  --file datasets/cosmopedia.parquet \
-  --output datasets/cosmopedia.bin \
-  --dedupe
-```
-
-Weighted mixing is also supported, so several sources can be blended by proportion while writing a single `.bin`:
-
-```bash
-cargo run --release -- prepare-dataset \
-  --file stories.txt,code.txt \
-  --weights 0.8,0.2 \
-  --output datasets/mixed.bin
-```
-
----
-
-### 2b. Resume Training and Safe Stop
-
-Training progress is persisted in `train_state.json` (schedule position, shuffler RNG, best `val_loss`) and `optimizer_state.bin` (AdamW moments), next to the weights:
-
-```bash
-# Resume 2 additional epochs from the epoch-3 checkpoint
-cargo run --release -- train --dataset roneneldan/TinyStories --resume checkpoints/checkpoint_epoch_3.bin --epochs 2
-
-# Stopping with Ctrl+C or from the web saves checkpoint_interrupted.bin + full state
-```
-
-With `--resume`, `--epochs` means **additional epochs** and the cosine schedule continues where it left off. If the checkpoint is old (no sidecars), only the weights are loaded, with a warning.
-
----
-
-### 3. Evaluate Model, Perplexity and BPB (`eval`)
-
-Evaluates the cross-entropy loss, perplexity ($PPL = e^{\text{loss}}$) and **bits-per-byte** (BPB, comparable across tokenizers) of a trained model. By default it evaluates **all** dataset batches (`--eval-batches 0`) and tokenizes the full dataset (`--max-tokens 0`); `--max-tokens <n>` tokenizes at most `n` tokens first (it pairs with `--eval-batches`) to evaluate a slice of a huge corpus. BPB is not available with `.bin` datasets because they do not keep the original size in bytes:
-
-```bash
-cargo run --release -- eval --model-dir model_output --file datasets/corpus.txt
-```
-
-For checkpoints trained with heavy-hitter eviction the evaluation follows the training
-keep-mask automatically; add `--dense` to measure the same weights with a dense past as an
-upper-bound reference.
-
----
-
-### 4. Train a Custom Tokenizer (`train-tokenizer`)
-
-Trains a byte-level BPE tokenizer from scratch on a specific corpus:
-
-```bash
+# 1. Train a BPE tokenizer (8k vocabulary)
 cargo run --release -- train-tokenizer --dataset roneneldan/TinyStories --vocab-size 8000
-```
 
-#### Tokenizer Options (CLI Flags)
+# 2. Train a tiny model (Chinchilla-style token budget warning included)
+cargo run --release -- train --dataset roneneldan/TinyStories \
+  --max-tokens 100000000 --epochs 3 --save-dir checkpoints
 
-| Flag | Description | Default |
-|:---|:---|:---|
-| `--dataset <repo>` | Hugging Face repository ID(s) (comma-separated, e.g. `roneneldan/TinyStories`) | `[]` |
-| `--file <path>` | Local plain-text file(s) to train the vocabulary on | `[]` |
-| `--dataset-file <filename>` | Target file name inside the HF dataset repository | `TinyStories-train.txt` |
-| `--vocab-size <n>` | Total size of the resulting vocabulary table | `8000` |
-| `--weights <w1,w2,...>` | Mix weights per source (same order as `--file`) | `None` |
-| `--max-chars <n>` | Maximum characters of the mixed corpus to train on (`0` = all) | `0` |
+# 3. Generate
+cargo run --release -- generate "Once upon a time" \
+  --temp 0.7 --top-k 40 --top-p 0.9 --min-p 0.05
 
----
-
-### 5. Generate Text / Inference (`generate`)
-
-Generates autoregressive text from a seed phrase using the trained model, with Top-K, Top-P, Min-P and repetition penalty sampling:
-
-```bash
-cargo run --release -- generate "Once upon a time" --temp 0.9 --top-k 60 --top-p 0.9 --min-p 0.1 --max-tokens 50
-```
-
-#### Generator Options (CLI Flags)
-
-| Flag / Argument | Description | Default |
-|:---|:---|:---|
-| `<prompt>` | Seed phrase (prompt) to start generation (positional) | *Required* |
-| `--temp <float>` | Sampling temperature controlling creativity/randomness | `0.9` |
-| `--top-k <n>` | Upper bound of candidate tokens to consider (Top-K sampling) | `60` |
-| `--top-p <float>` | Cumulative probability threshold for nucleus sampling (Top-P) | `0.9` |
-| `--min-p <float>` | Min-P relative probability threshold | `0.1` |
-| `--rep-penalty <float>` | Repetition penalty factor for repeated tokens | `1.6` |
-| `--max-tokens <n>` | Maximum number of new tokens to generate | `50` |
-| `--seed <n>` | Pseudo-random generator seed for reproducibility | `None` |
-| `--dtype <kind>` | Compute precision: `f32` or `f16` (non-fused backend) | `f32` |
-| `--kv-cache-dtype <kind>` | KV cache precision: `f32`, `f16`, `int8` or `q4` (quantized formats pack integers with per-block scales) | `f32` |
-| `--kv-eviction <kind>` | Eviction override: `h2o`, `none` or empty to keep the checkpoint config | `""` |
-| `--kv-budget <n>` | Resident KV cache rows (`0` = checkpoint config) | `0` |
-| `--kv-recent <n>` | Recent tokens never evicted (`0` = checkpoint config) | `0` |
-| `--kv-spill` | Archive evicted rows in host RAM and replay them when the budget grows | off |
-| `--kv-max-budget <n>` | Physical cache rows / replay ceiling (`0` = initial budget) | `0` |
-| `--kv-grow <n>` | Rows added to the resident budget per growth step | `0` |
-| `--kv-grow-interval <n>` | Processed tokens between growth steps | `64` |
-| `--rope-scaling <kind>` | Context extension: `none`, `linear`, `ntk` or `yarn` | `none` |
-| `--rope-factor <float>` | Extension factor (e.g. `2.0` doubles the usable context) | `1.0` |
-
-The web API additionally exposes `POST /api/generate/stream` (SSE), which streams tokens as they are generated and supports cancellation. The web Generate form also exposes the compute precision (`f32`/`f16`) and the heavy-hitter eviction overrides (`kvEviction`, `kvBudget`, `kvRecent`).
-
----
-
-### 6. Inspect Model Statistics (`stats`)
-
-Prints the total parameter count, FP32 memory footprint, FLOPs per token, GQA compression and KV cache estimates (f32/f16/int8/q4, in bytes/token and total MB at `n_ctx`):
-
-```bash
+# 4. Evaluate (PPL + bits-per-byte) and inspect memory
+cargo run --release -- eval --file datasets/corpus.txt
 cargo run --release -- stats
+
+# 5. Export to GGUF v3 (llama.cpp / LM Studio / Ollama)
+cargo run --release -- export --model-name noctambulo
 ```
 
----
+The finished model lives in `model_output/` (`config.json`, `model_weights.bin`,
+`custom_tokenizer.json`).
 
-### 7. Export to GGUF Format (`export`)
-
-Exports the model weights stored in `model_output` directly to a **GGUF v3** binary:
+### Web console
 
 ```bash
-cargo run --release -- export --model-name kuro-neko-2026
+cd web && npm install && npm run build && cd ..
+cargo run --release -- serve --bind 127.0.0.1:8080 --token change-me
 ```
 
-The resulting `.gguf` file is saved to `exported/kuro-neko-2026.gguf` and can be opened directly in **LM Studio**, **llama.cpp** or **Ollama**.
+Open `http://127.0.0.1:8080`, log in with the token, and drive training, datasets,
+generation, models and exports from the browser.
 
-#### Export Options (CLI Flags)
-
-| Flag | Description | Default |
-|:---|:---|:---|
-| `--model-name <name>` | Base name of the resulting `.gguf` file | `kuro-neko-qwen` |
-| `--approx` | Export grouped-KV models as a standard-attention approximation (duplicated K/V weights) | off |
-
----
-
-### 8. Import a GGUF Back (`import`)
-
-Rebuilds a native model (`config.json` + `model_weights.bin` + `custom_tokenizer.json`) from a GGUF export, so a model that only survives as GGUF can be generated, evaluated or resumed:
+### Third-party models
 
 ```bash
-cargo run --release -- import exported/kuro-neko-v3.gguf --output-dir imported_v3
+# Convert Qwen2.5-0.5B-Instruct from the Hub (CPU conversion, ~2 GB f32 output)
+cargo run --release -- import-hf --repo Qwen/Qwen2.5-0.5B-Instruct \
+  --output-dir model_output/qwen2.5-0.5b
+
+cargo run --release -- generate --model-dir model_output/qwen2.5-0.5b \
+  "The capital of France is"
+
+# Fine-tune the imported model; its config.json defines the architecture
+cargo run --release -- train --resume model_output/qwen2.5-0.5b \
+  --file datasets/corpus.txt --epochs 1 --lr 0.00002 --max-tokens 5000000
 ```
 
-| Flag | Description | Default |
-| :--- | :--- | :--- |
-| `--output-dir <name>` | Directory under the models root that receives the model | GGUF file stem |
-| `--force` | Overwrite the output directory if it already contains a model | off |
-| `--tokenizer <path>` | Exact `tokenizer.json` instead of the one rebuilt from the GGUF vocab | off |
+See [doc/models/import.md](doc/models/import.md) for supported architectures, GGUF details and known
+limitations.
 
-This engine's own exports round-trip exactly. Third-party GGUFs are supported when they use the `llama` or `qwen2` architecture with f32/f16 tensors and a byte-level BPE vocabulary: the metadata (`feed_forward_length`, `layer_norm_rms_epsilon`, `rope.freq_base`, GQA, biases) is honored, and Q/K are de-permuted only for the `llama` layout. Quantized GGUFs are rejected with a clear error.
-
----
-
-### 9. Import a Hugging Face Model (`import-hf`)
-
-Converts a Hugging Face model (`config.json` + `tokenizer.json` + `model.safetensors`) into the native format. Llama / Qwen2 / Mistral decoder models with SwiGLU, RMSNorm, GQA, RoPE and tied embeddings are supported (f32/f16/bf16 safetensors, single-file or sharded):
+## Verification
 
 ```bash
-# Download and convert straight from the Hub
-cargo run --release -- import-hf --repo Qwen/Qwen2.5-0.5B-Instruct --output-dir qwen2.5-0.5b
-
-# Or from a directory you already downloaded
-cargo run --release -- import-hf --dir downloads/my-model --output-dir my-model
+cargo test                  # 109 tests
+cargo clippy --all-targets  # clean
+cd web && npm run lint && npm run build
 ```
 
-The converted model carries its own `custom_tokenizer.json`, is tagged with `import_source`, and can be generated (`generate`), evaluated (`eval`), exported (`export`) and **fine-tuned** with `train --resume <model_dir>` (the directory's `config.json` and tokenizer define the architecture, so no architecture flags are needed). QK-norm architectures (Qwen3), SentencePiece tokenizers, untied `lm_head` weights and quantized safetensors are rejected. See [doc/import.md](doc/import.md). The web Models view offers **Import from Hugging Face** as a cancellable background job with live progress.
+Covered: tokenizer/datasets, full-state resume, gradient accumulation, eval/BPB, cached
+decode parity (f32/f16/int8/q4, MLA, sharing, sliding window), H2O eviction invariants,
+spill/replay dense-context parity, GGUF export/import golden layout, HF safetensors
+conversion roundtrip, API paths and web build.
 
----
+### Measured on the development machine
 
-### 10. Download a Dataset (`download`)
+Internal smoke benchmarks — useful as a sanity check, not as marketing numbers:
 
-Downloads a single dataset file from Hugging Face Hub; Parquet files are automatically text-extracted:
+| Workload | Result |
+| --- | --- |
+| Tiny 2-layer model, dense decode | 73–78 tok/s |
+| Same model, H2O eviction (budget 64) | 65–68 tok/s (~10% overhead) |
+| Same model, spill/replay with budget growth | 36–43 tok/s |
+| Qwen2.5-0.5B-Instruct, f32 on WGPU (integrated GPU) | ~1 tok/s |
+| Qwen2.5-0.5B safetensors → native conversion | ~2m45s (download + CPU convert) |
+| Compatible f16 GGUF import | 12–45s |
 
-```bash
-cargo run --release -- download --repo HuggingFaceTB/cosmopedia-100k --file data/train-00000-of-00001.parquet --out-dir datasets
+## Project layout
+
+```text
+src/
+  main.rs        CLI (clap)
+  model.rs       decoder, attention, KV cache formats + eviction
+  train.rs       training loop, eval, checkpoints
+  generate.rs    sampling, SSE streaming, growth schedule
+  data.rs        tokenizer, datasets, HF downloads
+  export.rs      GGUF v3 writer
+  import.rs      GGUF reader
+  hf_import.rs   safetensors → native converter
+  serve/         Axum API, ops, run history, telemetry
+web/             React console (Vite + Tailwind)
+doc/             architecture, training/, inference/, models/
 ```
 
-#### Download Options (CLI Flags)
+## Documentation
 
-| Flag | Description | Default |
-|:---|:---|:---|
-| `--repo <repo>` | HF dataset repo ID | *Required* |
-| `--file <file>` | File name inside the repo | *Required* |
-| `--out-dir <path>` | Output directory for the downloaded file | `datasets` |
-| `--extract-text` | Extract the text column to `.txt` when the file is Parquet | enabled |
+- [Architecture](doc/architecture.md) — decoder, RoPE, GQA, RMSNorm, SwiGLU.
+- [Training](doc/training/train.md) — schedule, optimizer, regularization, datasets, eviction mask.
+- [Generation](doc/inference/generate.md) — sampling, KV cache, H2O eviction, spill/replay.
+- [GGUF export](doc/models/export.md) and [third-party import](doc/models/import.md).
+- [Statistics](doc/models/stats.md) — params, FLOPs, cache budgets.
+- [Roadmap](ROADMAP.md).
 
----
+## Known limits
 
-### 9. Web Console (`serve`)
+- Training and records are **f32 only** (Burn 0.21's f16 optimizer states underflow).
+- GGUF import accepts f32/f16 tensors; quantized GGUF dequantization is on the roadmap.
+- QK-norm architectures (Qwen3) and SentencePiece tokenizers are not supported yet.
+- The CUDA backend is compile-checked; validate it on your NVIDIA host before relying on it.
+- The web console is meant for trusted local networks: use `--token` when exposing it.
 
-Serves the React console (built into `web/dist`) plus the JSON/SSE API to control training, generation and export from the browser:
+## License
 
-```bash
-# Build the console once (or after changing web/)
-cd web && npm install && npm run build
-
-# Start the server
-cargo run --release -- serve --bind 127.0.0.1:8080 --token my-secret-token
-```
-
-Open `http://127.0.0.1:8080`, paste the token and the UI logs in. Authentication uses an **HttpOnly cookie** set by `POST /api/login`; the `X-API-Token` header is still accepted for scripts and `curl`. If `--token` is omitted, the server runs without authentication (trusted local networks only).
-
-#### Server Options (CLI Flags)
-
-| Flag | Description | Default |
-|:---|:---|:---|
-| `--bind <addr:port>` | Address and port to bind (`0.0.0.0:8080` for remote access) | `127.0.0.1:8080` |
-| `--token <token>` | API token required in the `X-API-Token` header | `None` (no auth) |
-| `--datasets-dir <path>` | Directory containing datasets to list/train on | `datasets` |
-| `--models-dir <path>` | Directory containing model outputs and checkpoints | `model_output` |
-
-For UI development, run the Vite dev server instead; it proxies `/api` to `http://127.0.0.1:8080`:
-
-```bash
-cd web && npm run dev
-```
-
----
-
-## 🏗️ Project Structure
-
-```
-kuro-neko/
-├── Cargo.toml          # Dependencies (Burn 0.21, tokenizers, hf-hub, serde, clap)
-├── src/
-│   ├── main.rs         # Entry point and Clap derive CLI
-│   ├── config.rs       # Unified ModelConfig struct
-│   ├── model.rs        # LLaMA/Qwen architecture (Llm, Block, Attention, SwiGLU, weight tying)
-│   ├── data.rs         # LlmTokenizer and multithreaded streaming loading
-│   ├── train.rs        # GPU loop with shuffling, grad clipping, weight decay, AdamW and resume
-│   ├── generate.rs     # Autoregressive inference with bounds check and XorshiftRng
-│   ├── export.rs       # GGUF v3 binary serializer (32-byte aligned weights)
-│   ├── backend.rs      # WGPU backend/dtype selection (fused vs non-fused)
-│   ├── tui.rs          # Terminal visual utilities (ANSI, Unicode boxes and progress)
-│   └── serve/          # Axum server: api/ (JSON + SSE), runner, state
-├── web/                # React 19 + Vite + TypeScript + Tailwind v4 console
-│   └── src/            # Shell, typed API client, state and views (Train, Datasets, Generate, Models, Export, Devices)
-├── doc/                # Detailed documentation (architecture, train, generate, export, stats)
-└── cli_parameters.md   # Full CLI parameter dictionary
-```
-
-## ✅ Tests and Quality
-
-```bash
-cargo test                    # 66 tests (data, model, train/resume, serve API, GGUF export)
-cargo clippy --all-targets
-cargo check --features cuda   # optional CUDA backend (runtime requires an NVIDIA GPU)
-
-cd web
-npm run lint                  # ESLint
-npm run doctor                # react-doctor quality gate
-npm run build                 # TypeScript check + production build in web/dist
-npm run smoke                 # CDP browser suite (see web/smoke/README.md)
-```
+[MIT](LICENSE) © 2026 Hoosk

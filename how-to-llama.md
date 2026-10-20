@@ -1,4 +1,4 @@
-# 🦙 The Adventure of Making Kuro-Neko Work in `llama.cpp` (`how-to-llama.md`)
+# 🦙 The Adventure of Making Noctámbulo Work in `llama.cpp` (`how-to-llama.md`)
 
 This document recounts the technical process, the obstacles overcome, and the exact specifications of the **GGUF v3** standard required to get a model trained from scratch in Rust with **Burn 0.21** to run natively in **`llama.cpp`** (`llama-cli`) and **LM Studio** at **200 tokens/second**.
 
@@ -6,7 +6,7 @@ This document recounts the technical process, the obstacles overcome, and the ex
 
 ## 🎯 The Goal
 
-Getting our engine written in Rust (**Kuro-Neko**) to export its modern 2026 architecture (RoPE, RMSNorm, SwiGLU) into a single binary `.gguf` file that could be executed directly by the industry-standard tool: **`llama.cpp`**.
+Getting our engine written in Rust (**Noctámbulo**) to export its modern 2026 architecture (RoPE, RMSNorm, SwiGLU) into a single binary `.gguf` file that could be executed directly by the industry-standard tool: **`llama.cpp`**.
 
 ---
 
@@ -87,14 +87,14 @@ fn permute_rope_weight(data: &[f32], n_head: usize, n_embd: usize) -> Vec<f32> {
 After applying the 2D matrix transposition and the RoPE weight permutation together with the complete GGUF v3 metadata, we ran:
 
 ```bash
-llama-cli -m exported/kuro-neko-2026.gguf -p "There was a little cat named" -n 50
+llama-cli -m exported/noctambulo-2026.gguf -p "There was a little cat named" -n 50
 ```
 
 ### Actual Inference Log obtained:
 
 ```text
 build      : b0-
-model      : kuro-neko-2026.gguf
+model      : noctambulo-2026.gguf
 modalities : text
 
 > There was a little cat named

@@ -193,7 +193,7 @@ function ImportPanel({ onDone }: { onDone: () => void }) {
         <Field label="GGUF path (relative to the server)">
           <Input
             type="text"
-            placeholder="exported/kuro-neko-v3.gguf"
+            placeholder="exported/noctambulo-v3.gguf"
             value={ggufPath}
             onChange={(e) => setGgufPath(e.target.value)}
           />

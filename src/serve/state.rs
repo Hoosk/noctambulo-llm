@@ -30,7 +30,7 @@ pub struct JobStatus {
     pub message: Option<String>,
 }
 
-/// Everything persisted to `.kuro/state.json` between server restarts.
+/// Everything persisted to `.noctambulo/state.json` between server restarts.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct PersistedState {
     job: JobStatus,
@@ -81,8 +81,8 @@ struct LogBuffer {
 }
 
 const MAX_LOG_LINES: usize = 5000;
-const STATE_FILE: &str = ".kuro/state.json";
-const STATE_TMP: &str = ".kuro/state.json.tmp";
+const STATE_FILE: &str = ".noctambulo/state.json";
+const STATE_TMP: &str = ".noctambulo/state.json.tmp";
 
 impl ServerState {
     pub fn new(token: Option<String>, datasets_dir: PathBuf, models_dir: PathBuf) -> Self {
@@ -207,7 +207,7 @@ impl ServerState {
         self.val_points.read().unwrap().clone()
     }
 
-    /// Persist job status + loss history to `.kuro/state.json`.
+    /// Persist job status + loss history to `.noctambulo/state.json`.
     /// Written atomically (temp + rename) so a crash mid-write can never
     /// leave a truncated file that would wipe the state on next load.
     pub fn persist(&self) {
@@ -217,13 +217,13 @@ impl ServerState {
             val_points: self.val_points_snapshot(),
         };
         if let Ok(bytes) = serde_json::to_vec(&state) {
-            if std::fs::create_dir_all(".kuro").is_ok() && std::fs::write(STATE_TMP, bytes).is_ok() {
+            if std::fs::create_dir_all(".noctambulo").is_ok() && std::fs::write(STATE_TMP, bytes).is_ok() {
                 let _ = std::fs::rename(STATE_TMP, STATE_FILE);
             }
         }
     }
 
-    /// Load `.kuro/state.json` if present. A restarted server is never running;
+    /// Load `.noctambulo/state.json` if present. A restarted server is never running;
     /// the job it "remembers" is a stale snapshot, not a live worker.
     fn load_state(&self) {
         let Ok(bytes) = std::fs::read(STATE_FILE) else {
@@ -288,7 +288,7 @@ mod tests {
 
     fn fresh_state() -> ServerState {
         let st = ServerState::new(None, PathBuf::from("d"), PathBuf::from("m"));
-        // A real .kuro/state.json may exist in the working directory; tests
+        // A real .noctambulo/state.json may exist in the working directory; tests
         // must not depend on (or mutate) it.
         st.loss_points.write().unwrap().clear();
         st.logs.write().unwrap().lines.clear();

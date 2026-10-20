@@ -4524,33 +4524,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kuro-neko-llm"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "async-stream",
- "axum 0.7.9",
- "burn",
- "burn-ndarray",
- "clap",
- "futures",
- "futures-core",
- "futures-util",
- "hf-hub",
- "libc",
- "parquet",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "sysinfo 0.39.6",
- "tokenizers 0.23.1",
- "tokio",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "wgpu",
-]
-
-[[package]]
 name = "lab"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5131,6 +5104,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "noctambulo-llm"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-stream",
+ "axum 0.7.9",
+ "burn",
+ "burn-ndarray",
+ "clap",
+ "futures",
+ "futures-core",
+ "futures-util",
+ "hf-hub",
+ "libc",
+ "parquet",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sysinfo 0.39.6",
+ "tokenizers 0.23.1",
+ "tokio",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "wgpu",
 ]
 
 [[package]]

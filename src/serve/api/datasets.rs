@@ -246,7 +246,7 @@ pub(super) async fn dataset_search(
                 .map_err(|e| e.to_string())?;
             let resp = client
                 .get(&url)
-                .header("User-Agent", "kuro-neko-llm/0.1")
+                .header("User-Agent", "noctambulo-llm/0.1")
                 .send()
                 .map_err(|e| e.to_string())?;
             if !resp.status().is_success() {

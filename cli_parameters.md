@@ -1,6 +1,6 @@
-# 🐈‍⬛ Kuro-Neko — Command-Line Interface (CLI) Parameters Dictionary
+# Noctámbulo — Command-Line Interface (CLI) Parameters Dictionary
 
-This file contains the dictionary of all parameters accepted by the different subcommands of the **Kuro-Neko** CLI.
+This file contains the dictionary of all parameters accepted by the different subcommands of the **Noctámbulo** CLI.
 
 ---
 
@@ -129,7 +129,7 @@ Exports weights to GGUF v3 binary format for external inference.
 
 | Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
-| `--model-name` | `String` | `"kuro-neko-qwen"` | Base name of the `.gguf` file that will be saved in `exported/`. |
+| `--model-name` | `String` | `"noctambulo"` | Base name of the `.gguf` file that will be saved in `exported/`. |
 | `--approx` | `bool` (flag) | `false` | Allow exporting a cross-layer KV sharing model (`kv_share_group > 1`) as a standard-attention approximation: the shared K/V weights are duplicated per layer, so the exported model is not identical to the engine's grouped computation. |
 
 ---

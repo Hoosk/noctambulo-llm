@@ -1,4 +1,6 @@
-# 📊 Kuro-Neko — Model Statistics (`stats`)
+# 📊 Noctámbulo — Model Statistics (`stats`)
+
+> Part of the [Noctámbulo documentation](../README.md) · Models.
 
 The `stats` subcommand provides a comprehensive diagnosis of the model architecture, the exact number of trainable parameters, the memory consumption in single precision FP32, the estimated computational intensity in FLOPs per token, the VRAM compression achieved through **Grouped Query Attention (GQA)**, and the estimated KV cache footprint per token and at full context (f32/f16).
 
@@ -72,7 +74,7 @@ When running `cargo run --release -- stats` with the base configuration, the sub
 
 ```text
 ===============================================================================
-🐈‍⬛ Kuro-Neko 2026 Model Architecture Statistics
+Noctámbulo 2026 Model Architecture Statistics
 ===============================================================================
   Vocab Size       : 8000 tokens
   Context Window   : 256 tokens

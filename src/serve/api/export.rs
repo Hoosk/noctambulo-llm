@@ -19,7 +19,7 @@ pub(super) struct ExportRequest {
 }
 
 fn default_model_name() -> String {
-    "kuro-neko".into()
+    "noctambulo".into()
 }
 
 pub(super) async fn export_model(

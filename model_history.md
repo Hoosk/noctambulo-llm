@@ -1,6 +1,6 @@
-# 📖 History and Development Tutorial: Kuro-Neko (kuro-neko-llm)
+# 📖 History and Development Tutorial: Noctámbulo (noctambulo-llm)
 
-This document objectively records the technical evolution of **Kuro-Neko**, from a basic toy model to a state-of-the-art (2026 standard) training and inference engine written entirely in **Rust**, GPU-accelerated with **Burn 0.21** and **WGPU**, and exportable to the native binary format **GGUF v3**.
+This document objectively records the technical evolution of **Noctámbulo**, from a basic toy model to a state-of-the-art (2026 standard) training and inference engine written entirely in **Rust**, GPU-accelerated with **Burn 0.21** and **WGPU**, and exportable to the native binary format **GGUF v3**.
 
 ---
 
@@ -83,7 +83,7 @@ For a small model of **~7M to 30M parameters**, trying to train it on 447 millio
 
 With the base stabilized, the model architecture was refactored in `src/model.rs` to align with the standard of modern 2026 LLMs (such as LLaMA 3/4, Qwen 2.5/3 and Gemma 2/3):
 
-| Component | GPT-2 Baseline (Previous) | Kuro-Neko 2026 (Current) | Technical Benefit |
+| Component | GPT-2 Baseline (Previous) | Noctámbulo 2026 (Current) | Technical Benefit |
 |:---|:---|:---|:---|
 | **Positions** | Learned Embeddings (`wpe`) | **RoPE (Rotary Position Embeddings)** | Eliminates the fixed `wpe` matrix. Enables dynamic context at inference. |
 | **Normalization** | `LayerNorm` (with bias) | **RMSNorm** | Root-mean-square normalization without bias. ~15% faster on GPU. |
@@ -98,7 +98,7 @@ With the base stabilized, the model architecture was refactored in `src/model.rs
 A pure binary serializer was created in Rust (`src/export.rs`) that writes the model directly in **GGUF v3** format:
 
 1. **Header Structure**: Writes the magic signature `b"GGUF"` and the version `3u32`.
-2. **Architecture Metadata**: Configures `"general.architecture" = "llama"`, `"general.name" = "kuro-neko-2026"`, and inserts the number of layers, heads and context length.
+2. **Architecture Metadata**: Configures `"general.architecture" = "llama"`, `"general.name" = "noctambulo-2026"`, and inserts the number of layers, heads and context length.
 3. **LLaMA Tensor Mapping**: Maps the Burn tensors to the standard llama.cpp nomenclature:
    - `token_embd.weight`
    - `blk.N.attn_norm.weight`
@@ -129,7 +129,7 @@ cargo run --release generate "Once upon a time" --temp 0.7 --top-k 40 --top-p 0.
 
 ### 3. Export to GGUF for LM Studio / Ollama
 ```bash
-cargo run --release -- export --model-name kuro-neko-qwen
+cargo run --release -- export --model-name noctambulo
 ```
 The `.gguf` file generated in `exported/` can be dragged directly into **LM Studio** or loaded in **llama.cpp**.
 

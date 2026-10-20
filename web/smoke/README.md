@@ -12,14 +12,14 @@ training run history, worker logs and the val-loss curve.
 
    ```bash
    (cd web && npm install && npm run build)
-   cargo run --release -- serve --token kuro-neko-demo --datasets-dir datasets --models-dir .
+   cargo run --release -- serve --token noctambulo-demo --datasets-dir datasets --models-dir .
    ```
 
 2. A headless Chromium exposing CDP:
 
    ```bash
    chromium --headless=new --no-sandbox --remote-debugging-port=9222 \
-     --user-data-dir=/tmp/kuro-smoke-profile about:blank
+     --user-data-dir=/tmp/noctambulo-smoke-profile about:blank
    ```
 
 3. Node 22+ (global `fetch` and `WebSocket`).

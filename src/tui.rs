@@ -1,4 +1,4 @@
-//! Terminal UI helpers for Kuro-Neko training output.
+//! Terminal UI helpers for Noctámbulo training output.
 //!
 //! Uses ANSI escape codes and Unicode box-drawing characters
 //! for styled terminal output. No external TUI dependencies.
@@ -194,7 +194,7 @@ pub fn print_training_header(
     box_top();
 
     let title = format!(
-        "{}{}KURO-NEKO · Training Engine{}",
+        "{}{}NOCTÁMBULO · Training Engine{}",
         color::BOLD,
         color::CYAN,
         color::RESET,

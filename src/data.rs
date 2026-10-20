@@ -439,7 +439,7 @@ pub fn hf_repo_files(repo_id: &str) -> Result<Vec<String>, String> {
         .ok()
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
     let client = reqwest::blocking::Client::builder()
-        .user_agent("kuro-neko-llm/0.1")
+        .user_agent("noctambulo-llm/0.1")
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| e.to_string())?;
@@ -544,7 +544,7 @@ pub fn download_dataset_streaming(
                 .ok()
                 .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
             let client = reqwest::blocking::Client::builder()
-                .user_agent("kuro-neko-llm/0.1")
+                .user_agent("noctambulo-llm/0.1")
                 .build()?;
 
             let encoded: Vec<String> = filename.split('/').map(encode_path_segment).collect();
@@ -1286,7 +1286,7 @@ mod tests {
 
     #[test]
     fn test_binary_dataset_roundtrip() {
-        let path = std::env::temp_dir().join("test_kuro_bin_roundtrip.bin");
+        let path = std::env::temp_dir().join("test_noctambulo_bin_roundtrip.bin");
 
         let original_tokens = vec![1, 100, 500, 1000, 7999, 42];
         let original_vocab_size = 8000;
@@ -1310,7 +1310,7 @@ mod tests {
 
     #[test]
     fn test_binary_dataset_max_tokens_limit() {
-        let path = std::env::temp_dir().join("test_kuro_bin_limit.bin");
+        let path = std::env::temp_dir().join("test_noctambulo_bin_limit.bin");
 
         let original_tokens: Vec<u32> = (0..100).collect();
         save_tokens_to_binary(&path, &original_tokens, 1000, 0x1234).unwrap();
@@ -1324,7 +1324,7 @@ mod tests {
 
     #[test]
     fn test_binary_vocab_hash_mismatch_rejected() {
-        let path = std::env::temp_dir().join("test_kuro_bin_mismatch.bin");
+        let path = std::env::temp_dir().join("test_noctambulo_bin_mismatch.bin");
 
         save_tokens_to_binary(&path, &[1, 2, 3], 100, 0xAAAA).unwrap();
 
@@ -1339,7 +1339,7 @@ mod tests {
 
     #[test]
     fn test_binary_v1_without_hash_still_loads() {
-        let path = std::env::temp_dir().join("test_kuro_bin_v1.bin");
+        let path = std::env::temp_dir().join("test_noctambulo_bin_v1.bin");
 
         let tokens: Vec<u32> = vec![5, 6, 7];
         let mut bytes = Vec::new();
@@ -1387,9 +1387,9 @@ mod tests {
 
     #[test]
     fn test_combine_and_mix_weighted_rejects_bin_sources() {
-        let txt = std::env::temp_dir().join("test_kuro_mix_a.txt");
-        let bin = std::env::temp_dir().join("test_kuro_mix_b.bin");
-        let out = std::env::temp_dir().join("test_kuro_mix_out.txt");
+        let txt = std::env::temp_dir().join("test_noctambulo_mix_a.txt");
+        let bin = std::env::temp_dir().join("test_noctambulo_mix_b.bin");
+        let out = std::env::temp_dir().join("test_noctambulo_mix_out.txt");
         std::fs::write(&txt, "hello\nworld\n").unwrap();
         std::fs::write(&bin, b"not really tokens").unwrap();
 
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("kuro_data_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noctambulo_data_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

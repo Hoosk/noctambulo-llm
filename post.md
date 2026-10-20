@@ -6,7 +6,7 @@
 
 Why use PyTorch and Python when you can build your own LLM engine from scratch in Rust?
 
-I have been developing Kuro-Neko for a while, a Language Model training and inference engine built in pure Rust, GPU-accelerated with Burn 0.21 and WGPU, capable of exporting directly to GGUF v3 packages.
+I have been developing Noctámbulo for a while, a Language Model training and inference engine built in pure Rust, GPU-accelerated with Burn 0.21 and WGPU, capable of exporting directly to GGUF v3 packages.
 
 No calling the OpenAI API and no wrappers. It is the complete mathematical implementation of the 2026 Transformer architecture, written line by line:
 

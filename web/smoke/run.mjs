@@ -1,13 +1,13 @@
 #!/usr/bin/env node
-// CDP browser smoke test for the kuro-neko web console.
+// CDP browser smoke test for the noctambulo web console.
 //
 // Prerequisites:
 //   1. Server running:      cargo run --release -- serve --token <token> --datasets-dir datasets --models-dir .
-//   2. Headless Chromium:   chromium --headless=new --remote-debugging-port=9222 --user-data-dir=/tmp/kuro-smoke-profile about:blank
+//   2. Headless Chromium:   chromium --headless=new --remote-debugging-port=9222 --user-data-dir=/tmp/noctambulo-smoke-profile about:blank
 //   3. Node 22+ (global fetch + WebSocket).
 //
 // Usage:
-//   node web/smoke/run.mjs [--url http://127.0.0.1:8080/] [--token kuro-neko-demo]
+//   node web/smoke/run.mjs [--url http://127.0.0.1:8080/] [--token noctambulo-demo]
 //                          [--cdp http://127.0.0.1:9222] [--models-dir .] [--datasets-dir datasets]
 //                          [--fixture MODEL_DIR] [--skip-training] [--keep-artifacts]
 //
@@ -24,7 +24,7 @@ const REPO = resolve(HERE, "..", "..");
 function parseArgs(argv) {
   const opts = {
     url: "http://127.0.0.1:8080/",
-    token: "kuro-neko-demo",
+    token: "noctambulo-demo",
     cdp: "http://127.0.0.1:9222",
     modelsDir: REPO,
     datasetsDir: resolve(REPO, "datasets"),

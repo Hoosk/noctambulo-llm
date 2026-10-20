@@ -12,7 +12,7 @@ use super::router;
 fn test_is_safe_rel_path() {
     assert!(is_safe_rel_path("checkpoints_web"));
     assert!(is_safe_rel_path("checkpoints_web/checkpoint_epoch_1.bin"));
-    assert!(is_safe_rel_path("exported/kuro-neko.gguf"));
+    assert!(is_safe_rel_path("exported/noctambulo.gguf"));
 
     assert!(!is_safe_rel_path(""));
     assert!(!is_safe_rel_path(".."));
@@ -48,7 +48,7 @@ fn test_is_safe_child_name() {
 
 #[test]
 fn test_is_safe_export_name() {
-    assert!(is_safe_export_name("kuro-neko-2026"));
+    assert!(is_safe_export_name("noctambulo-2026"));
     assert!(is_safe_export_name("model_v3.gguf"));
 
     assert!(!is_safe_export_name("../evil"));
@@ -69,10 +69,10 @@ fn test_cookie_roundtrip_and_parsing() {
     assert_eq!(cookie_decode("%zz"), None);
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::COOKIE, "a=1; kuro_token=se%20cret; b=2".parse().unwrap());
+    headers.insert(header::COOKIE, "a=1; noctambulo_token=se%20cret; b=2".parse().unwrap());
     assert_eq!(cookie_token(&headers), Some("se cret".into()));
 
-    headers.insert(header::COOKIE, "kuro_token=".parse().unwrap());
+    headers.insert(header::COOKIE, "noctambulo_token=".parse().unwrap());
     assert_eq!(cookie_token(&headers), Some("".into()));
 
     headers.insert(header::COOKIE, "other=1".parse().unwrap());
@@ -95,7 +95,7 @@ fn test_check_token_accepts_header_cookie_and_query() {
     assert!(check_token(&server, &headers, None).is_ok());
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::COOKIE, "kuro_token=s3cret".parse().unwrap());
+    headers.insert(header::COOKIE, "noctambulo_token=s3cret".parse().unwrap());
     assert!(check_token(&server, &headers, None).is_ok());
 
     assert!(check_token(&server, &HeaderMap::new(), Some("token=s3cret")).is_ok());
@@ -106,7 +106,7 @@ fn test_check_token_accepts_header_cookie_and_query() {
 async fn test_dataset_param_routes_match() {
     use tower::ServiceExt;
 
-    let dir = std::env::temp_dir().join(format!("kuro_routes_test_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("noctambulo_routes_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("sample.txt"), "hello\nworld\n").unwrap();
@@ -141,36 +141,36 @@ async fn test_dataset_param_routes_match() {
 
 #[test]
 fn test_resolve_model_dir_blocks_traversal() {
-    let root = std::env::temp_dir().join(format!("kuro_models_test_{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("noctambulo_models_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("model_output")).unwrap();
     std::fs::create_dir_all(root.join("model_output_v2")).unwrap();
-    std::fs::create_dir_all(root.parent().unwrap().join("kuro_outside_models")).unwrap();
+    std::fs::create_dir_all(root.parent().unwrap().join("noctambulo_outside_models")).unwrap();
 
     assert!(resolve_model_dir(&root, "model_output").is_ok());
     assert!(resolve_model_dir(&root, "").is_ok());
     assert!(resolve_model_dir(&root, "does_not_exist").is_err());
     // Traversal / outside paths must be rejected.
-    assert!(resolve_model_dir(&root, "../kuro_outside_models").is_err());
-    assert!(resolve_model_dir(&root, "model_output/../../kuro_outside_models").is_err());
+    assert!(resolve_model_dir(&root, "../noctambulo_outside_models").is_err());
+    assert!(resolve_model_dir(&root, "model_output/../../noctambulo_outside_models").is_err());
 
     // Absolute path inside the root is accepted (frontend sends full dirs).
     let inside = root.join("model_output_v2");
     assert!(resolve_model_dir(&root, inside.to_str().unwrap()).is_ok());
 
     let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(root.parent().unwrap().join("kuro_outside_models"));
+    let _ = std::fs::remove_dir_all(root.parent().unwrap().join("noctambulo_outside_models"));
 }
 
 #[test]
 fn test_resolve_model_child_dir_rejects_nested_and_outside() {
     use super::paths::resolve_model_child_dir;
 
-    let root = std::env::temp_dir().join(format!("kuro_child_dir_test_{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("noctambulo_child_dir_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("model_output")).unwrap();
     std::fs::create_dir_all(root.join("nested/inner")).unwrap();
-    let outside = root.parent().unwrap().join("kuro_child_dir_outside");
+    let outside = root.parent().unwrap().join("noctambulo_child_dir_outside");
     std::fs::create_dir_all(&outside).unwrap();
 
     assert!(resolve_model_child_dir(&root, "model_output").is_ok());
@@ -178,7 +178,7 @@ fn test_resolve_model_child_dir_rejects_nested_and_outside() {
     assert!(resolve_model_child_dir(&root, "nested").is_ok());
     // Nested and outside paths must be rejected.
     assert!(resolve_model_child_dir(&root, "nested/inner").is_err());
-    assert!(resolve_model_child_dir(&root, "../kuro_child_dir_outside").is_err());
+    assert!(resolve_model_child_dir(&root, "../noctambulo_child_dir_outside").is_err());
     assert!(resolve_model_child_dir(&root, outside.to_str().unwrap()).is_err());
 
     let _ = std::fs::remove_dir_all(&root);
@@ -189,7 +189,7 @@ fn test_resolve_model_child_dir_rejects_nested_and_outside() {
 async fn test_model_files_rename_delete_routes() {
     use tower::ServiceExt;
 
-    let dir = std::env::temp_dir().join(format!("kuro_models_routes_test_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("noctambulo_models_routes_test_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("model_output")).unwrap();
     std::fs::write(dir.join("model_output/config.json"), "{}").unwrap();

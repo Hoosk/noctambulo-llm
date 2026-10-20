@@ -1,4 +1,6 @@
-# 🔤 Kuro-Neko — Generation and Inference (`generate`)
+# 🔤 Noctámbulo — Generation and Inference (`generate`)
+
+> Part of the [Noctámbulo documentation](../README.md) · Inference.
 
 The `generate` subcommand allows performing autoregressive text inference from a seed text (*prompt*). It loads the trained weights saved in `model_output/` together with the architecture configuration (`config.json`) and the BPE tokenizer (`custom_tokenizer.json`), generating tokens consecutively through a pipeline optimized with **KV Cache** (Key-Value Cache) and advanced stochastic sampling.
 
@@ -21,7 +23,7 @@ The `generate` subcommand allows performing autoregressive text inference from a
 
 ## 🎯 Detailed Explanation of Sampling Strategies
 
-Kuro-Neko applies a sequential pipeline of filtering and transformation on the unnormalized logits vector $z \in \mathbb{R}^{V}$ to select the next token:
+Noctámbulo applies a sequential pipeline of filtering and transformation on the unnormalized logits vector $z \in \mathbb{R}^{V}$ to select the next token:
 
 ```mermaid
 graph LR
@@ -70,7 +72,7 @@ let r = rng.next_f32();
 ## ⚙️ Recommended Generation Profiles
 
 > [!NOTE]
-> Small models (SLM) such as Kuro-Neko assign highly concentrated probabilities to the most frequent tokens. With low temperatures or weak penalties the model can fall into repetition loops. For SLMs, `temp >= 0.8` and `rep_penalty >= 1.5` are recommended.
+> Small models (SLM) such as Noctámbulo assign highly concentrated probabilities to the most frequent tokens. With low temperatures or weak penalties the model can fall into repetition loops. For SLMs, `temp >= 0.8` and `rep_penalty >= 1.5` are recommended.
 
 ### 🎨 Creative Profile (Story writing, poetry, ideas)
 Maximizes variability and vocabulary without losing grammatical coherence:
@@ -112,7 +114,7 @@ cargo run --release -- generate "Once upon a time" \
 
 ## ⚡ How the KV Cache Works (Prefill & Decode)
 
-To achieve extremely fast text generation on GPU without recomputing the key and value tensors for past tokens at each step, Kuro-Neko uses a **`KvCache`** structure:
+To achieve extremely fast text generation on GPU without recomputing the key and value tensors for past tokens at each step, Noctámbulo uses a **`KvCache`** structure:
 
 ```rust
 pub struct KvCache<B: Backend> {
@@ -159,7 +161,7 @@ cargo run --release -- generate "Once upon a time" \
 
 The effective window becomes `factor × n_ctx` (RoPE angles are computed per position, so
 there is no table cap), and the same flags are available on `eval`. The web Generate view
-exposes both fields, and GGUF exports record the strategy (see `doc/export.md`).
+exposes both fields, and GGUF exports record the strategy (see `doc/models/export.md`).
 
 ## Bounded KV Cache (Sliding Window)
 

@@ -1,6 +1,6 @@
 # 🔍 Research and Global Landscape of LLMs in 2026 (`search.md`)
 
-This document records the real data of the Artificial Intelligence industry in **2026** (Llama 4, DeepSeek V4, Qwen 3.8-Max, Gemma 4 families) and the direct comparison with the scale of our engine **Kuro-Neko**.
+This document records the real data of the Artificial Intelligence industry in **2026** (Llama 4, DeepSeek V4, Qwen 3.8-Max, Gemma 4 families) and the direct comparison with the scale of our engine **Noctámbulo**.
 
 ---
 
@@ -29,11 +29,11 @@ In 2026, the industry has massively migrated toward **Mixture-of-Experts (MoE)**
 
 ---
 
-## 📊 2. Comparison Table: Kuro-Neko vs. 2026 Models
+## 📊 2. Comparison Table: Noctámbulo vs. 2026 Models
 
 | Model | Architecture | Total Parameters | Active Parameters / Token | Max. Context | Training Tokens Seen | Execution Environment |
 |:---|:---|:---|:---|:---|:---|:---|
-| 🐈‍⬛ **Kuro-Neko 2026** | **Pure Dense** | **7 Million (0.007B)** | **7 Million** | **64 – 512** | **2.5M – 50M** | **Micro-devices (Raspberry Pi, watches, local terminals)** |
+| **Noctámbulo 2026** | **Pure Dense** | **7 Million (0.007B)** | **7 Million** | **64 – 512** | **2.5M – 50M** | **Micro-devices (Raspberry Pi, watches, local terminals)** |
 | 🟢 **Gemma 4 (E2B)** | **Dense** | **2 Billion (2B)** | **2B** | **256K** | **4 – 6 Trillion** | Mobile devices (smartphones, offline laptops) |
 | 🦙 **Llama 4 (Scout)** | **MoE** | **109 Billion (109B)** | **17B** | **10 Million** | **15 – 20 Trillion** | Local inference servers / Private cloud |
 | 🐳 **DeepSeek V4** | **MoE** | **1.6 Trillion (1,600B)** | **37B** | **1 Million** | **25+ Trillion** | Distributed supercomputing farms |
@@ -43,8 +43,8 @@ In 2026, the industry has massively migrated toward **Mixture-of-Experts (MoE)**
 
 ## 💡 3. Scale and Design Conclusions
 
-1. **Size Difference**: Kuro-Neko (7M) is approximately **228,000 times smaller** in number of parameters than a frontier model like DeepSeek V4 (1.6T).
+1. **Size Difference**: Noctámbulo (7M) is approximately **228,000 times smaller** in number of parameters than a frontier model like DeepSeek V4 (1.6T).
 2. **Memory Consumption**: 
    - **DeepSeek V4**: Requires clusters of H100/H200 GPUs accumulating terabytes of VRAM.
-   - **Kuro-Neko**: Uses **less than 50 Megabytes of RAM** and runs on any simple GPU with WGPU.
-3. **Use Cases**: Kuro-Neko demonstrates how to implement the complete mathematical architecture of a 2026 Transformer (RoPE, RMSNorm, SwiGLU, GGUF) in **pure Rust code without heavy dependencies**.
+   - **Noctámbulo**: Uses **less than 50 Megabytes of RAM** and runs on any simple GPU with WGPU.
+3. **Use Cases**: Noctámbulo demonstrates how to implement the complete mathematical architecture of a 2026 Transformer (RoPE, RMSNorm, SwiGLU, GGUF) in **pure Rust code without heavy dependencies**.

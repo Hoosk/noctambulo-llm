@@ -14,7 +14,7 @@ This document contains the comparative technical analysis of the main open-sourc
 | **Kimi K2.7 Code** | Moonshot AI *(June 2026)* | Sparse MoE | 1T / 32B active | **`false`** | **MLA** (Multi-head Latent Attention) | RMSNorm + SwiGLU | **256k** | Modified MIT |
 | **GLM-5.2** | Zhipu AI *(June 2026)* | Sparse MoE + IndexShare | 744B / ~36B active | **`false`** | **Sparse MHA + IndexShare** | RMSNorm + SwiGLU | **1M** | MIT |
 | **LLaMA 3.2 / 4** | Meta AI *(2025/2026)* | Dense & MoE | 1B – 405B | **`false`** | **GQA** (Grouped Query) | RMSNorm + SwiGLU | **128k - 1M** | LLaMA 3 Community |
-| **Kuro-Neko Engine** | Rust + WGPU *(2026)* | SLM Causal Decoder | Configurable (5M – 3B) | **`true`** *(Tied N(0,0.02))* | **GQA + QKV Bias + Min-P + Softcap** | RMSNorm + SwiGLU | **256 - 128k** | MIT / Open Source |
+| **Noctámbulo Engine** | Rust + WGPU *(2026)* | SLM Causal Decoder | Configurable (5M – 3B) | **`true`** *(Tied N(0,0.02))* | **GQA + QKV Bias + Min-P + Softcap** | RMSNorm + SwiGLU | **256 - 128k** | MIT / Open Source |
 
 ---
 

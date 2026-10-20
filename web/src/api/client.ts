@@ -19,7 +19,7 @@ import type {
   TrainStatus,
 } from "./types";
 
-export const UNAUTHORIZED_EVENT = "kuro:unauthorized";
+export const UNAUTHORIZED_EVENT = "noctambulo:unauthorized";
 
 export class ApiError extends Error {
   readonly status: number;

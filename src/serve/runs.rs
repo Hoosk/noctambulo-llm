@@ -1,5 +1,5 @@
 //! Persisted history of training runs, with train/val curves so the UI can
-//! compare runs. Records are appended as JSON lines (`.kuro/runs.jsonl`); on
+//! compare runs. Records are appended as JSON lines (`.noctambulo/runs.jsonl`); on
 //! load the last record for each id wins, so a run can be written twice
 //! (started, then finished) without losing history.
 
@@ -16,7 +16,7 @@ use crate::serve::state::LossPoint;
 
 /// Runs kept before pruning the oldest finished ones.
 pub const MAX_RUNS: usize = 100;
-pub const RUNS_FILE: &str = ".kuro/runs.jsonl";
+pub const RUNS_FILE: &str = ".noctambulo/runs.jsonl";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_run_lifecycle_and_persistence() {
-        let path = std::env::temp_dir().join(format!("kuro_runs_test_{}.jsonl", std::process::id()));
+        let path = std::env::temp_dir().join(format!("noctambulo_runs_test_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         let store = RunsStore::load(path.clone());
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_finish_unknown_run_is_ignored() {
-        let path = std::env::temp_dir().join(format!("kuro_runs_missing_{}.jsonl", std::process::id()));
+        let path = std::env::temp_dir().join(format!("noctambulo_runs_missing_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = RunsStore::load(path.clone());
         store.finish("nope", "done", None, None, Vec::new());

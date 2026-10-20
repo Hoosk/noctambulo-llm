@@ -1,4 +1,6 @@
-# 🔤 Kuro-Neko — Tokenizer Training (`train-tokenizer`)
+# 🔤 Noctámbulo — Tokenizer Training (`train-tokenizer`)
+
+> Part of the [Noctámbulo documentation](../README.md) · Training.
 
 The `train-tokenizer` subcommand allows training a **Byte-Level Byte-Pair Encoding (BPE)** tokenizer adapted to the specific vocabulary and domain of your training dataset.
 
@@ -29,7 +31,7 @@ The **Byte-Level Byte-Pair Encoding (BPE)** algorithm operates directly on raw U
 
 ## 🔠 NFKC Unicode Normalization
 
-Before proceeding with the BPE frequency computation, Kuro-Neko applies a strict Unicode normalization pipeline using the **NFKC (Normalization Form KC - Compatibility Decomposition followed by Canonical Composition)** standard:
+Before proceeding with the BPE frequency computation, Noctámbulo applies a strict Unicode normalization pipeline using the **NFKC (Normalization Form KC - Compatibility Decomposition followed by Canonical Composition)** standard:
 
 - **Character Unification**: Converts visually similar characters or compatibility variants (such as ligatures, superscripts, full-width variants) to a normalized canonical representation.
 - **Consistency in the Model**: Ensures that variants of the same character do not redundantly consume multiple entries in the vocabulary table.
@@ -49,7 +51,7 @@ The trained tokenizer includes and reserves two special tokens fundamental to se
 
 ## 💾 Output File: `custom_tokenizer.json`
 
-When the process completes, Kuro-Neko serializes the complete tokenizer structure in JSON format to the `custom_tokenizer.json` file at the project root. This file contains:
+When the process completes, Noctámbulo serializes the complete tokenizer structure in JSON format to the `custom_tokenizer.json` file at the project root. This file contains:
 
 - The BPE merge map (*merges*).
 - The token-to-ID and ID-to-token vocabulary table.

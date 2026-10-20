@@ -1,49 +1,72 @@
-# 📖 Kuro-Neko — Documentation
+# Noctámbulo — Documentation
 
-Welcome to the official documentation of **Kuro-Neko** (`kuro-neko-llm`), a training and inference engine for Large Language Models (LLM) with a **Qwen (Qwen2.5 / Qwen3)** architecture developed entirely in **Rust** and GPU-accelerated through **Burn 0.21** and **WGPU**.
+Welcome to the official documentation of **Noctámbulo** (`noctambulo-llm`), a training and
+inference engine for Large Language Models (LLM) with a **Qwen-style** architecture written
+entirely in **Rust** and GPU-accelerated through **Burn 0.21** and **WGPU**.
 
-This set of documents provides a detailed guide on the system architecture, the use of the command-line interface (CLI), text sampling strategies, tokenizer training and model export to the standard **GGUF v3** format.
+This documentation covers the architecture, the full CLI workflow, sampling and KV cache
+internals, tokenizer training, GGUF export/import and third-party model conversion.
 
 ---
 
-## 📚 Documentation Index
+## Guides
+
+### Architecture
 
 | Document | Description |
 | :--- | :--- |
-| 🏋️ **[Training (train.md)](train.md)** | Complete manual of the `train` subcommand. Detailed explanation of the 15 configuration parameters, AdamW optimizer, cosine learning rate schedule with warmup, gradient clipping and practical examples. |
-| 🔤 **[Generation and Inference (generate.md)](generate.md)** | Usage guide for the `generate` subcommand. Explanation of sampling strategies (Temperature, Top-K, Top-P, Min-P, Repetition Penalty) and how the KV Cache works (Prefill & Decode). |
-| 🧩 **[Custom Tokenizer (train-tokenizer.md)](train-tokenizer.md)** | Training guide for the byte-level BPE tokenizer through the `train-tokenizer` subcommand, NFKC Unicode normalization and handling of special tokens. |
-| 📦 **[GGUF v3 Export (export.md)](export.md)** | Manual for converting the model to the standard `GGUF v3` format through the `export` subcommand, 32-byte tensor alignment and integration with Ollama, LM Studio and llama.cpp. |
-| 📥 **[Third-Party Models (import.md)](import.md)** | Converting Hugging Face safetensors or compatible GGUF files into the native format, and fine-tuning them with `train --resume <model_dir>`. |
-| 📊 **[Model Statistics (stats.md)](stats.md)** | Manual of the `stats` subcommand to calculate the total number of parameters, FP32 memory footprint, FLOPs per token estimate and GQA memory savings. |
-| 🧠 **[Technical Architecture (architecture.md)](architecture.md)** | In-depth technical specification of the Qwen Transformer architecture: RoPE ($\theta=10.000$), SwiGLU aligned to 256, GQA, RMSNorm ($\epsilon=10^{-6}$), Tied Embeddings and Attention Softcapping. |
+| **[Technical Architecture](architecture.md)** | Decoder specification: RoPE (configurable theta), SwiGLU, GQA, RMSNorm (configurable eps), tied embeddings, attention softcapping, KV cache layouts and eviction. |
+
+### Training
+
+| Document | Description |
+| :--- | :--- |
+| **[Training (`train`)](training/train.md)** | Optimizer, cosine LR + warmup, gradient accumulation, sequence warmup, early stopping, regularization, datasets, checkpoints and the H2O eviction mask. |
+| **[Custom Tokenizer (`train-tokenizer`)](training/train-tokenizer.md)** | Byte-level BPE training, NFKC normalization, special tokens and the generated `custom_tokenizer.json`. |
+
+### Inference
+
+| Document | Description |
+| :--- | :--- |
+| **[Generation (`generate`)](inference/generate.md)** | Sampling strategies, prefill/decode, bounded KV caches (sliding window, sinks, H2O eviction, spill/replay), quantized cache and RoPE context extension. |
+
+### Models
+
+| Document | Description |
+| :--- | :--- |
+| **[GGUF v3 Export (`export`)](models/export.md)** | Tensor layout, 32-byte alignment, metadata keys and integration with llama.cpp, LM Studio and Ollama. |
+| **[Third-Party Models (`import`)](models/import.md)** | Hugging Face safetensors conversion, compatible GGUF import, fine-tuning with `train --resume <model_dir>` and supported architectures. |
+| **[Model Statistics (`stats`)](models/stats.md)** | Parameters, FP32 footprint, FLOPs per token, cache bytes/token per format and eviction budgets. |
 
 ---
 
-## ⚡ Quick Workflow (Quickstart)
+## Quick Workflow
 
-The complete model development lifecycle in Kuro-Neko consists of the following 5 steps:
+The complete model development lifecycle in Noctámbulo:
 
 ```bash
 # 1. Train a custom 8,000-token BPE tokenizer
 cargo run --release -- train-tokenizer --dataset roneneldan/TinyStories --vocab-size 8000
 
-# 2. Train the causal Transformer model with GPU acceleration (WGPU)
-cargo run --release -- train --dataset roneneldan/TinyStories --max-tokens 10000000 --batch-size 128 --epochs 3
+# 2. Train the causal Transformer with GPU acceleration (WGPU)
+cargo run --release -- train --dataset roneneldan/TinyStories \
+  --max-tokens 10000000 --batch-size 128 --epochs 3
 
 # 3. Generate autoregressive text from a seed
-cargo run --release -- generate "Once upon a time" --temp 0.7 --top-k 40 --top-p 0.9 --min-p 0.05
+cargo run --release -- generate "Once upon a time" \
+  --temp 0.7 --top-k 40 --top-p 0.9 --min-p 0.05
 
 # 4. Inspect the model architecture and memory usage
 cargo run --release -- stats
 
-# 5. Export the trained model to GGUF v3 format for external inference
-cargo run --release -- export --model-name kuro-neko-v1
+# 5. Export the trained model to GGUF v3 for external inference
+cargo run --release -- export --model-name noctambulo-v1
 ```
 
 ---
 
-## 🔗 Cross References
+## See Also
 
-- To check the repository's main manual, see the [root README.md](../README.md).
-- If you want to understand the source code structure, check the modules section in [architecture.md](architecture.md).
+- [Root README](../README.md) — install, quickstart, web console and benchmarks.
+- [Roadmap](../ROADMAP.md) — current status and backlog.
+- [CLI parameters](../cli_parameters.md) — every flag of every subcommand.

@@ -354,14 +354,14 @@ mod tests {
     fn test_parse_self_stat_handles_spaces_in_comm() {
         // Fields after the last ')': state + ppid..rss (see proc(5)).
         let rest = "R 1 1 1 0 -1 4194560 100 0 0 0 11 22 0 0 20 0 1 0 33 1000000 25";
-        let line = format!("42 (kuro (test) name) {rest}");
+        let line = format!("42 (noctambulo (test) name) {rest}");
         assert_eq!(parse_self_stat(&line), Some((33, 25, 33)));
     }
 
     #[test]
     fn test_parse_threads() {
-        assert_eq!(parse_threads("Name:\tkuro\nThreads:\t17\n"), Some(17));
-        assert_eq!(parse_threads("Name:\tkuro\n"), None);
+        assert_eq!(parse_threads("Name:\tnoctambulo\nThreads:\t17\n"), Some(17));
+        assert_eq!(parse_threads("Name:\tnoctambulo\n"), None);
     }
 
     #[test]

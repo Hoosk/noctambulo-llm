@@ -12,7 +12,7 @@ use super::error::ApiError;
 /// Name of the HttpOnly session cookie set by `/api/login`. Keeping the token
 /// out of JavaScript storage protects it from XSS exfiltration; the CLI and
 /// scripts keep using the `X-API-Token` header.
-const COOKIE_NAME: &str = "kuro_token";
+const COOKIE_NAME: &str = "noctambulo_token";
 
 const COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 30;
 

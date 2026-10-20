@@ -14,7 +14,7 @@ export function ExportView() {
   const toast = useToast();
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [modelDir, setModelDir] = useState(activeModel);
-  const [name, setName] = useState("kuro-neko");
+  const [name, setName] = useState("noctambulo");
   const [approx, setApprox] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<string | null>(null);
@@ -69,7 +69,7 @@ export function ExportView() {
     try {
       const res = await api.exportModel({
         modelDir: selectedDir,
-        modelName: name || "kuro-neko",
+        modelName: name || "noctambulo",
         approx,
       });
       setOpId(res.opId);

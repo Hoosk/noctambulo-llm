@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_safetensors_read_f32_and_f16() {
-        let dir = std::env::temp_dir().join(format!("kuro_st_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noctambulo_st_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tiny.safetensors");
         write_safetensors(
@@ -676,7 +676,7 @@ mod tests {
     #[test]
     fn test_import_hf_roundtrip_matches_native_forward() {
         let device = NdArrayDevice::Cpu;
-        let dir = std::env::temp_dir().join(format!("kuro_hf_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noctambulo_hf_{}", std::process::id()));
         let src = dir.join("src");
         let out = dir.join("out");
         std::fs::create_dir_all(&src).unwrap();
@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn test_import_hf_rejects_untied_and_qknorm() {
         let device = NdArrayDevice::Cpu;
-        let dir = std::env::temp_dir().join(format!("kuro_hf_bad_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noctambulo_hf_bad_{}", std::process::id()));
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
         let tokenizer_path = tiny_tokenizer(&src);

@@ -1,6 +1,8 @@
-# 🧠 Kuro-Neko — Model Architecture
+# 🧠 Noctámbulo — Model Architecture
 
-This document provides a detailed technical specification of the neural network architecture implemented in **Kuro-Neko**.
+> Part of the [Noctámbulo documentation](README.md) · Architecture.
+
+This document provides a detailed technical specification of the neural network architecture implemented in **Noctámbulo**.
 
 The architecture is inspired by the **Qwen2.5 / Qwen3** model family, built as a high-performance Causal Transformer (*Decoder-Only*) optimized for massively parallel training and inference on GPU using the **Burn 0.21** and **WGPU** frameworks.
 
@@ -34,7 +36,7 @@ graph TD
 
 ### 1. Embedded Word Tying and Gaussian Normal Initialization $\mathcal{N}(0, 0.02)$
 
-Kuro-Neko implements **Tied Word Embeddings** (`tie_word_embeddings = true`).
+Noctámbulo implements **Tied Word Embeddings** (`tie_word_embeddings = true`).
 
 - **Weight Sharing**: The embedding input matrix `embed_tokens` with shape $[V, D]$ is transposed and reused directly as the final projection matrix to compute the logits over the vocabulary:
   $$\text{logits} = X \times W_{\text{embed}}^T$$
@@ -58,7 +60,7 @@ Positional information is not added to the input embeddings; instead, it is inco
 
 ### 3. Grouped Query Attention (GQA)
 
-To balance representation quality with the VRAM efficiency of the **KV Cache**, Kuro-Neko supports **Grouped Query Attention (GQA)**:
+To balance representation quality with the VRAM efficiency of the **KV Cache**, Noctámbulo supports **Grouped Query Attention (GQA)**:
 
 - **Head Ratio**: $H$ heads are defined for Query and $H_{\text{kv}}$ heads for Key and Value, where $H$ must be divisible by $H_{\text{kv}}$.
 - **KV Repetition**: Each $KV$ head is expanded and shared across $N_{\text{rep}} = H / H_{\text{kv}}$ $Q$ heads via the `repeat_kv` function:
@@ -108,7 +110,7 @@ Both the pre-attention normalizations (*Pre-Attention Norm*) and the pre-MLP nor
 
 ### 6. Attention Softcapping (Optional, Gemma 4 Style)
 
-To stabilize the magnitude of attention scores during the training of deep models, Kuro-Neko supports the optional application of **Attention Softcapping**:
+To stabilize the magnitude of attention scores during the training of deep models, Noctámbulo supports the optional application of **Attention Softcapping**:
 
 - **Formula**:
   $$\text{scores} = \text{softcap} \times \tanh\left( \frac{Q K^T}{\sqrt{d_k} \times \text{softcap}} \right)$$

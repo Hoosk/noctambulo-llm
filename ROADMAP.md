@@ -1,4 +1,4 @@
-# 🗺️ Kuro-Neko Roadmap
+# 🗺️ Noctámbulo Roadmap
 
 Last updated: 2026-10-15 (Third-party model support landed: HF safetensors converter, relaxed GGUF import with the non-square layout fix, fine-tuning from a model directory, and the web/API surface; quantized GGUF dequantization remains as backlog).
 
@@ -48,7 +48,7 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 2. ✅ **Model CRUD**: list/use/remove plus rename, delete and per-file download (`/api/models/files`, `/api/models/file`, `/api/models/rename`, `DELETE /api/models/:name`); mutations are refused while training runs and are restricted to direct children of the models root.
 3. ✅ **Real progress** for long operations: HF downloads (byte-level), weighted combine (chars) and GGUF export (tensors) run as background ops with an SSE event stream (`/api/ops/stream`), a snapshot endpoint and cooperative cancellation.
 4. ✅ **Live telemetry**: `/api/telemetry` reports process CPU/RSS/threads/uptime, system memory and GPU memory counters when the OS exposes them (nvidia-smi or DRM sysfs); the Devices view polls it every 2 s and states clearly when VRAM counters are unavailable.
-5. ✅ **Run history**: every job is persisted to `.kuro/runs.jsonl` with its config, final loss/PPL and train/val curves; the Train view overlays up to 3 selected runs.
+5. ✅ **Run history**: every job is persisted to `.noctambulo/runs.jsonl` with its config, final loss/PPL and train/val curves; the Train view overlays up to 3 selected runs.
 6. ✅ **Datasets**: weighted mixing rejects `.bin` sources with an explicit error (shared by CLI and web); the combine card disables itself, lists the offending files and shows each source's normalized share with an "Equalize weights" shortcut.
 7. ✅ **Polish**: worker logs stream over SSE (the 1 s polling is gone, backfill via a monotonic cursor on `/api/train/status`), val-loss curve persisted alongside the training loss and drawn as a dashed series; Tailwind built locally (no CDN).
 

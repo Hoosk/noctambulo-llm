@@ -61,7 +61,7 @@ function TokenGate() {
         <div className="flex items-center gap-4 mb-8">
           <CatLogo className="w-12 h-12" />
           <div className="min-w-0">
-            <h1 className="text-lg font-semibold text-white tracking-tight">Kuro-Neko</h1>
+            <h1 className="text-lg font-semibold text-white tracking-tight">Noctámbulo</h1>
             <p className="text-xs text-slate-500">Training console</p>
           </div>
         </div>
@@ -238,7 +238,7 @@ function Shell() {
           <CatLogo className="w-10 h-10" />
           <div className="min-w-0">
             <h1 className="text-base font-semibold text-white tracking-tight leading-tight">
-              Kuro-Neko
+              Noctámbulo
             </h1>
             <p className="text-[11px] text-slate-500">Training console</p>
           </div>
@@ -297,7 +297,7 @@ function Shell() {
             <Icon name="menu" className="w-5 h-5" />
           </button>
           <CatLogo className="w-7 h-7" />
-          <h1 className="text-base font-semibold text-white tracking-tight">Kuro-Neko</h1>
+          <h1 className="text-base font-semibold text-white tracking-tight">Noctámbulo</h1>
           <span className="ml-auto">
             <ConnBadge />
           </span>

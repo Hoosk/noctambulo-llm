@@ -1,6 +1,8 @@
 # 📥 Importing Third-Party Models
 
-Kuro-Neko can run models downloaded from elsewhere, provided they match the engine's
+> Part of the [Noctámbulo documentation](../README.md) · Models.
+
+Noctámbulo can run models downloaded from elsewhere, provided they match the engine's
 decoder layout (SwiGLU, RMSNorm, GQA, RoPE, tied word embeddings). Two paths exist:
 
 - `import-hf` — converts a Hugging Face repo or a local directory with

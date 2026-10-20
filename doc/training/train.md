@@ -1,8 +1,10 @@
-# 🏋️ Kuro-Neko — Training (`train`)
+# 🏋️ Noctámbulo — Training (`train`)
 
-The `train` subcommand is the core of the **Kuro-Neko** engine. It allows training from scratch an autoregressive Causal Transformer language model (Qwen2.5 / Qwen3 architecture) fully accelerated by GPU through the **WGPU** backend of the **Burn 0.21** framework.
+> Part of the [Noctámbulo documentation](../README.md) · Training.
 
-During training, Kuro-Neko processes datasets in plain text format (coming from the **Hugging Face Hub** or a local file), encodes the text with the BPE tokenizer in parallel streaming (*streaming*), builds sliding windows of context sequences (`n-ctx`) and runs the AdamW optimization loop on the GPU.
+The `train` subcommand is the core of the **Noctámbulo** engine. It allows training from scratch an autoregressive Causal Transformer language model (Qwen2.5 / Qwen3 architecture) fully accelerated by GPU through the **WGPU** backend of the **Burn 0.21** framework.
+
+During training, Noctámbulo processes datasets in plain text format (coming from the **Hugging Face Hub** or a local file), encodes the text with the BPE tokenizer in parallel streaming (*streaming*), builds sliding windows of context sequences (`n-ctx`) and runs the AdamW optimization loop on the GPU.
 
 ---
 
@@ -46,7 +48,7 @@ The `train` subcommand accepts **23 CLI** configuration parameters:
 
 ### 1. Cosine Learning Rate Schedule with Warmup
 
-Kuro-Neko implements a cosine decay scheme for the learning rate (*Cosine Annealing Learning Rate Schedule*) complemented by an initial linear warmup phase (*Warmup*):
+Noctámbulo implements a cosine decay scheme for the learning rate (*Cosine Annealing Learning Rate Schedule*) complemented by an initial linear warmup phase (*Warmup*):
 
 - **Warmup Steps**: Computed automatically as:
   $$\text{warmup\_steps} = \begin{cases} 0 & \text{if } \text{total\_steps} \le 10 \\ \min(1000, \lfloor \frac{\text{total\_steps}}{10} \rfloor) & \text{otherwise} \end{cases}$$
@@ -119,7 +121,7 @@ This guarantees that accumulating $N$ micro-batches of size $B$ is **mathematica
 
 ### 7. Persistent Training State and Resumption
 
-At the end of each epoch (and when training is stopped) Kuro-Neko saves, alongside the weights:
+At the end of each epoch (and when training is stopped) Noctámbulo saves, alongside the weights:
 
 - `train_state.json`: `global_step`, `total_steps`, `epochs_done`, `best_val_loss` and the internal shuffler state.
 - `optimizer_state.bin`: the AdamW record (first- and second-order moments) serialized with `Optimizer::to_record`.

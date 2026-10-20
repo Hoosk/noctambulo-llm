@@ -45,7 +45,7 @@ web/dist/
 .agents/
 
 # Estado del servidor web
-.kuro/
+.noctambulo/
 /logs/
 
 # OS y módulos del sistema
