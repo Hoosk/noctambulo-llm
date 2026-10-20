@@ -98,7 +98,7 @@ Start it before bed. Check the loss curve over coffee.
 
 ## Quickstart
 
-Requirements: Rust 1.85+ (edition 2024), a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
+Requirements: Rust 1.87+ (edition 2024), a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
 console.
 
 ```bash

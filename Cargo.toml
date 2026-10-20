@@ -2,7 +2,7 @@
 name = "noctambulo-llm"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 
 [features]
 # Optional CUDA backend for the CLI (train/eval/generate/export). Build with
@@ -10,7 +10,7 @@ rust-version = "1.85"
 cuda = ["burn/cuda"]
 
 [dependencies]
-# Deep Learning (última versión disponible en crates.io)
+# Deep Learning (Burn 0.22 is a dispatch-API migration; see ROADMAP.md)
 # Autotune stays enabled: without it the fallback f16 kernels are wrong on
 # WGPU (f16 training collapses to loss 0). Autotune's only known defect is the
 # M=1 GEMV kernel (wrong for output width >= 32); the model avoids it by
