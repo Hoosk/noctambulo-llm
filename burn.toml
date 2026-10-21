@@ -1,10 +1,7 @@
-# Burn 0.21 Performance Configuration
-
-[fusion]
-enabled = true
-
-[autotune]
-mode = "fastest"
-
-[wgpu]
-autotune = true
+# Burn runtime configuration (0.22).
+#
+# Fusion and autotune are disabled at compile time in Cargo.toml
+# (`default-features = false`) because Burn 0.22's fusion graph cache returns
+# stale/wrong matmul results in this engine (reproduced against a manual f64
+# reference; Flex and no-fusion WGPU are exact). Keep them off until the
+# upstream fix; see ROADMAP.md.

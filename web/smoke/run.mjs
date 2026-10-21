@@ -376,7 +376,7 @@ try {
       const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
       [...row.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Files').click();
     })()`);
-    await waitFor(`document.body.innerText.includes('model_weights.bin')`, 30_000, "files panel");
+    await waitFor(`document.body.innerText.includes('model_weights.bpk')`, 30_000, "files panel");
     const filesOk = await evaluate(`(() => {
       const row = [...document.querySelectorAll('main li')].find((li) => li.textContent.includes(${JSON.stringify(SCRATCH)}));
       return row.querySelectorAll('a[download]').length;

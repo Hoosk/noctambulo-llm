@@ -2,13 +2,12 @@ use crate::config::ModelConfig;
 use crate::data::LlmTokenizer;
 use crate::generate::{generate, XorshiftRng};
 use crate::model::Llm;
+use crate::storage;
 use crate::tui;
 use burn::grad_clipping::GradientClippingConfig;
-use burn::module::{AutodiffModule, Module};
-use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer};
-use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::module::Module;
+use burn::optim::{AdamWConfig, GradientsAccumulator, GradientsParams, ModuleOptimizer, OptimizerRecord};
+use burn::tensor::{Int, Tensor, TensorData, Device};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,11 +38,11 @@ impl Default for LossOptions {
 
 /// Cross-entropy with optional label smoothing and z-loss. Kept generic so the
 /// math can be unit-tested on the CPU backend.
-fn compute_loss<B: Backend>(
-    logits_flat: Tensor<B, 2>,
-    targets_flat: Tensor<B, 2, Int>,
+fn compute_loss(
+    logits_flat: Tensor<2>,
+    targets_flat: Tensor<2, Int>,
     opts: LossOptions,
-) -> Tensor<B, 1> {
+) -> Tensor<1> {
     let log_probs = burn::tensor::activation::log_softmax(logits_flat.clone(), 1);
     let nll = log_probs.clone().gather(1, targets_flat).mean().neg();
     let mut loss = if opts.label_smoothing > 0.0 {
@@ -65,8 +64,8 @@ fn compute_loss<B: Backend>(
 
 /// JSON sidecar file holding scheduler position, RNG and best validation loss.
 pub const TRAIN_STATE_FILE: &str = "train_state.json";
-/// Base name (the recorder appends `.bin`) of the serialized optimizer state.
-pub const OPTIMIZER_STATE_FILE: &str = "optimizer_state";
+/// File name of the serialized optimizer state (burnpack).
+pub const OPTIMIZER_STATE_FILE: &str = "optimizer_state.bpk";
 
 /// Persistent training state so `--resume` continues the LR schedule, the
 /// shuffler RNG and the AdamW moments instead of restarting them.
@@ -101,49 +100,40 @@ fn load_train_state(resume_path: Option<&Path>) -> Option<TrainState> {
 
 /// Persist the scheduler/RNG state plus the optimizer moments next to each
 /// other so `--resume` can restore the full training state, not just weights.
-fn persist_train_state<B, M, O>(
-    optim: &O,
+fn persist_train_state(
+    optim: &ModuleOptimizer,
     state: &TrainState,
     dir: &Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    B: AutodiffBackend,
-    M: AutodiffModule<B>,
-    O: Optimizer<M, B>,
-{
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     std::fs::create_dir_all(dir)?;
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    recorder
-        .record(optim.to_record(), dir.join(OPTIMIZER_STATE_FILE))
+    optim
+        .save(dir.join(OPTIMIZER_STATE_FILE))
         .map_err(|e| format!("Failed to save optimizer state: {e:?}"))?;
     std::fs::write(dir.join(TRAIN_STATE_FILE), serde_json::to_string_pretty(state)?)?;
     Ok(())
 }
 
-/// Reload the AdamW moments from `optimizer_state.bin` when present. Returns
-/// the optimizer and whether a record was actually applied.
-fn load_optimizer_record<B, M, O>(optim: O, dir: &Path, device: &B::Device) -> (O, bool)
-where
-    B: AutodiffBackend,
-    M: AutodiffModule<B>,
-    O: Optimizer<M, B>,
-{
+/// Reload the AdamW moments from `optimizer_state.bpk` when present. Missing
+/// state is fine (weights-only resume); a corrupt or incompatible record is an
+/// error so resume never silently restarts Adam from zero.
+fn load_optimizer_record(
+    optim: ModuleOptimizer,
+    dir: &Path,
+) -> Result<(ModuleOptimizer, bool), String> {
     let path = dir.join(OPTIMIZER_STATE_FILE);
-    if !path.with_extension("bin").is_file() {
-        return (optim, false);
+    if !path.is_file() {
+        return Ok((optim, false));
     }
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    match recorder.load::<O::Record>(path, device) {
-        Ok(record) => (optim.load_record(record), true),
-        Err(_) => (optim, false),
-    }
+    let record = OptimizerRecord::load(&path)
+        .map_err(|e| format!("failed to load optimizer state '{}': {e:?}", path.display()))?;
+    Ok((optim.load_record(record), true))
 }
 
 /// Save the model weights + full training state when training is interrupted
 /// (user stop or Ctrl+C) so no work is lost.
-fn save_interrupted_checkpoint<B: AutodiffBackend>(
-    model: &Llm<B>,
-    optim: &impl Optimizer<Llm<B>, B>,
+fn save_interrupted_checkpoint(
+    model: &Llm,
+    optim: &ModuleOptimizer,
     train_state: &TrainState,
     output_dir: &str,
     tx: &Sender<TrainingEvent>,
@@ -152,11 +142,9 @@ fn save_interrupted_checkpoint<B: AutodiffBackend>(
         emit_log(tx, format!("Warning: failed to save interrupted checkpoint: {e}"));
         return;
     }
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let path = Path::new(output_dir).join("checkpoint_interrupted");
-    match recorder.record(model.clone().into_record(), path.clone()) {
+    let saved = Path::new(output_dir).join("checkpoint_interrupted.bpk");
+    match storage::save_module(model, &saved) {
         Ok(()) => {
-            let saved = path.with_extension("bin");
             emit_log(tx, format!("Training interrupted: checkpoint saved to {saved:?}"));
             let _ = tx.send(TrainingEvent::Checkpoint {
                 path: saved.to_string_lossy().to_string(),
@@ -168,7 +156,7 @@ fn save_interrupted_checkpoint<B: AutodiffBackend>(
                 emit_log(tx, format!("Warning: failed to save training state: {e}"));
             }
         }
-        Err(e) => emit_log(tx, format!("Warning: failed to save interrupted checkpoint: {e:?}")),
+        Err(e) => emit_log(tx, format!("Warning: failed to save interrupted checkpoint: {e}")),
     }
 }
 
@@ -235,14 +223,13 @@ impl TextDataset {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (mut tokens, mut total_bytes) =
             tokenizer.encode_file_streaming_with_progress(path, max_tokens, progress, cancel)?;
-        if let Some(limit) = max_tokens {
-            if limit > 0 && tokens.len() > limit {
+        if let Some(limit) = max_tokens
+            && limit > 0 && tokens.len() > limit {
                 tui::print_warning(&format!("Limiting training dataset to {} tokens.", tui::format_number(limit)));
                 // Keep the byte count in proportion to the kept tokens.
                 total_bytes = (total_bytes as f64 * (limit as f64 / tokens.len() as f64)) as u64;
                 tokens.truncate(limit);
             }
-        }
         let step = custom_step.unwrap_or(n_ctx);
         let step = std::cmp::max(1, step);
         Ok(Self { tokens, n_ctx, step, total_bytes })
@@ -258,12 +245,11 @@ impl TextDataset {
     ) -> Self {
         let mut tokens = tokenizer.encode(text).unwrap_or_default();
         let mut total_bytes = text.len() as u64;
-        if let Some(limit) = max_tokens {
-            if limit > 0 && tokens.len() > limit {
+        if let Some(limit) = max_tokens
+            && limit > 0 && tokens.len() > limit {
                 total_bytes = (total_bytes as f64 * (limit as f64 / tokens.len() as f64)) as u64;
                 tokens.truncate(limit);
             }
-        }
         let step = custom_step.unwrap_or(n_ctx);
         let step = std::cmp::max(1, step);
         Self { tokens, n_ctx, step, total_bytes }
@@ -278,12 +264,12 @@ impl TextDataset {
         }
     }
 
-    pub fn get_batch<B: burn::tensor::backend::Backend>(
+    pub fn get_batch(
         &self,
         indices: &[usize],
         n_ctx: usize,
-        device: &B::Device,
-    ) -> (Tensor<B, 2, Int>, Tensor<B, 2, Int>) {
+        device: &Device,
+    ) -> (Tensor<2, Int>, Tensor<2, Int>) {
         let batch_size = indices.len();
         let chunk_size = n_ctx + 1;
 
@@ -308,8 +294,8 @@ impl TextDataset {
         let inputs_data = TensorData::new(inputs_flat, [batch_size, n_ctx]);
         let targets_data = TensorData::new(targets_flat, [batch_size, n_ctx]);
 
-        let inputs = Tensor::<B, 2, Int>::from_data(inputs_data, device);
-        let targets = Tensor::<B, 2, Int>::from_data(targets_data, device);
+        let inputs = Tensor::<2, Int>::from_data(inputs_data, device);
+        let targets = Tensor::<2, Int>::from_data(targets_data, device);
 
         (inputs, targets)
     }
@@ -432,7 +418,7 @@ pub fn compute_scheduled_n_ctx(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn train<B: AutodiffBackend>(
+pub fn train(
     dataset_path: Option<&Path>,
     raw_text: Option<&str>,
     model_config: ModelConfig,
@@ -447,7 +433,7 @@ pub fn train<B: AutodiffBackend>(
     seq_warmup_steps: usize,
     save_dir: Option<&Path>,
     resume_path: Option<&Path>,
-    device: &B::Device,
+    device: &Device,
     output_dir: &str,
     early_stop_patience: usize,
     loss_opts: LossOptions,
@@ -498,7 +484,7 @@ pub fn train<B: AutodiffBackend>(
         }
     });
 
-    let result = train_with_events::<B>(
+    let result = train_with_events(
         dataset_path, raw_text, model_config, tokenizer, epochs, batch_size, lr,
         custom_step, max_tokens, val_split, grad_accum_steps, seq_warmup_steps,
         save_dir, resume_path, device, output_dir, early_stop_patience,
@@ -511,7 +497,7 @@ pub fn train<B: AutodiffBackend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn train_with_events<B: AutodiffBackend>(
+pub fn train_with_events(
     dataset_path: Option<&Path>,
     raw_text: Option<&str>,
     model_config: ModelConfig,
@@ -526,7 +512,7 @@ pub fn train_with_events<B: AutodiffBackend>(
     seq_warmup_steps: usize,
     save_dir: Option<&Path>,
     resume_path: Option<&Path>,
-    device: &B::Device,
+    device: &Device,
     output_dir: &str,
     early_stop_patience: usize,
     loss_opts: LossOptions,
@@ -580,13 +566,13 @@ pub fn train_with_events<B: AutodiffBackend>(
         (full_dataset, TextDataset { tokens: vec![], n_ctx: model_config.n_ctx, step: custom_step.unwrap_or(model_config.n_ctx), total_bytes: 0 })
     };
 
-    tui::print_info("Initializing model architecture on WGPU device...");
-    let mut model = model_config.init_model::<B>(device);
+    tui::print_info("Initializing model architecture on the compute device...");
+    let mut model = model_config.init_model(device).train();
     if model.embed_tokens.weight.val().dtype() == burn::tensor::DType::F16 {
         return Err(
-            "f16 training is not supported: Burn 0.21's AdamW moment estimates \
-             underflow in f16 (the first update explodes and the model stops \
-             learning). Train with --dtype f32 (default)."
+            "f16 training is not supported: AdamW moment estimates underflow in \
+             f16 (the first update explodes and the model stops learning). \
+             Train with --dtype f32 (default)."
                 .into(),
         );
     }
@@ -594,19 +580,15 @@ pub fn train_with_events<B: AutodiffBackend>(
     let resume_state = load_train_state(resume_path);
 
     if let Some(res_path) = resume_path {
-        let rec_file = if res_path.is_file() {
-            res_path.with_extension("")
+        let rec_file = if res_path.is_dir() {
+            storage::model_weights_path(res_path)
         } else {
-            // A model directory (imported/native) stores its record as
-            // `model_weights.bin`; the recorder appends the `.bin` extension.
-            res_path.join("model_weights")
+            res_path.to_path_buf()
         };
         emit_log(tx, format!("Resuming model weights from {:?}...", rec_file));
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let record = recorder
-            .load(rec_file.clone(), device)
-            .map_err(|e| format!("Failed to load checkpoint from {:?}: {:?}", res_path, e))?;
-        model = model.load_record(record).align_compute_dtype();
+        model = storage::load_module(model, &rec_file)
+            .map_err(|e| format!("Failed to load checkpoint from {res_path:?}: {e}"))?
+            .train();
         emit_log(tx, "Successfully loaded checkpoint weights!");
     }
 
@@ -621,7 +603,7 @@ pub fn train_with_events<B: AutodiffBackend>(
     // Restore AdamW moments + scheduler position when a sidecar state exists.
     if resume_state.is_some() {
         let dir = resume_artifacts_dir(resume_path.expect("resume_state implies a resume path"));
-        let (restored, loaded) = load_optimizer_record::<B, Llm<B>, _>(optim, &dir, device);
+        let (restored, loaded) = load_optimizer_record(optim, &dir)?;
         optim = restored;
         if loaded {
             emit_log(tx, "Successfully loaded optimizer state (AdamW moments)!");
@@ -654,8 +636,8 @@ pub fn train_with_events<B: AutodiffBackend>(
 
     // Chinchilla-style budget check: ~20 tokens per parameter saturates a model
     // of this size; warning early avoids a silently undertrained run.
-    if let Some(limit) = max_tokens {
-        if limit > 0 {
+    if let Some(limit) = max_tokens
+        && limit > 0 {
             let params = model_config.param_count();
             let recommended = params.saturating_mul(20);
             if limit < recommended {
@@ -669,7 +651,6 @@ pub fn train_with_events<B: AutodiffBackend>(
                 ));
             }
         }
-    }
 
     tui::print_training_header(
         &model_config,
@@ -706,9 +687,9 @@ pub fn train_with_events<B: AutodiffBackend>(
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
         // Initialized from the first loss so the accumulator keeps the loss
-        // dtype: `Tensor::zeros` would create f32 data even on an f16 backend
-        // (Burn 0.21), and adding it to an f16 loss corrupts the result.
-        let mut accum_loss_tensor: Option<Tensor<B, 1>> = None;
+        // dtype; a zero-initialized f32 tensor added to an f16 loss would
+        // corrupt the result.
+        let mut accum_loss_tensor: Option<Tensor<1>> = None;
         let mut accum_count = 0usize;
         let mut total_epoch_loss = 0.0f32;
         let mut total_batches = 0usize;
@@ -720,7 +701,7 @@ pub fn train_with_events<B: AutodiffBackend>(
         let mut sample_indices: Vec<usize> = (0..train_dataset.len()).collect();
         shuffle_indices(&mut sample_indices, &mut shuffle_rng);
 
-        let mut grad_accumulator = GradientsAccumulator::<Llm<B>>::new();
+        let mut grad_accumulator = GradientsAccumulator::<Llm>::new();
         let mut window_start = 0usize;
 
         for batch_idx in 0..num_batches {
@@ -775,7 +756,7 @@ pub fn train_with_events<B: AutodiffBackend>(
             let end = std::cmp::min(start + effective_batch_size, train_dataset.len());
             let indices: Vec<usize> = sample_indices[start..end].to_vec();
 
-            let (inputs, targets) = train_dataset.get_batch::<B>(&indices, current_n_ctx, device);
+            let (inputs, targets) = train_dataset.get_batch(&indices, current_n_ctx, device);
             let logits = model.forward(inputs);
             let [b, t, v] = logits.dims();
 
@@ -809,7 +790,7 @@ pub fn train_with_events<B: AutodiffBackend>(
             if is_log_step {
                 let interval_loss = accum_loss_tensor
                     .as_ref()
-                    .map(|acc| acc.clone().into_data().convert::<f32>().to_vec::<f32>())
+                    .map(|acc| acc.clone().into_data().convert::<f32>().try_to_vec::<f32>())
                     .and_then(|r| r.ok())
                     .unwrap_or_default()
                     .first()
@@ -919,14 +900,13 @@ pub fn train_with_events<B: AutodiffBackend>(
                     epochs_without_improvement = 0;
                     best_val_loss = Some(val_loss);
                     if let Some(s_dir) = save_dir {
-                        let best_path = s_dir.join("checkpoint_best");
-                        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-                        if let Err(e) = recorder.record(model.clone().into_record(), best_path.clone()) {
+                        let best_path = s_dir.join("checkpoint_best.bpk");
+                        if let Err(e) = storage::save_module(&model, &best_path) {
                             emit_log(tx, format!("Warning: Failed to save best checkpoint at {:?}: {:?}", best_path, e));
                         } else {
-                            emit_log(tx, format!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path.with_extension("bin")));
+                            emit_log(tx, format!("   ★ New best val_loss={:.4} → {:?}", val_loss, best_path));
                             let _ = tx.send(TrainingEvent::Checkpoint {
-                                path: best_path.with_extension("bin").to_string_lossy().to_string(),
+                                path: best_path.to_string_lossy().to_string(),
                                 kind: "best".into(),
                                 epoch,
                                 batch: 0,
@@ -941,14 +921,13 @@ pub fn train_with_events<B: AutodiffBackend>(
 
         if let Some(s_dir) = save_dir {
             std::fs::create_dir_all(s_dir)?;
-            let ckpt_path = s_dir.join(format!("checkpoint_epoch_{}", epoch));
-            let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-            if let Err(e) = recorder.record(model.clone().into_record(), ckpt_path.clone()) {
+            let ckpt_path = s_dir.join(format!("checkpoint_epoch_{epoch}.bpk"));
+            if let Err(e) = storage::save_module(&model, &ckpt_path) {
                 emit_log(tx, format!("Warning: Failed to save checkpoint at {:?}: {:?}", ckpt_path, e));
             } else {
-                emit_log(tx, format!("Saved checkpoint: {:?}", ckpt_path.with_extension("bin")));
+                emit_log(tx, format!("Saved checkpoint: {:?}", ckpt_path));
                 let _ = tx.send(TrainingEvent::Checkpoint {
-                    path: ckpt_path.with_extension("bin").to_string_lossy().to_string(),
+                    path: ckpt_path.to_string_lossy().to_string(),
                     kind: "epoch".into(),
                     epoch,
                     batch: 0,
@@ -961,7 +940,7 @@ pub fn train_with_events<B: AutodiffBackend>(
             emit_log(tx, format!("Warning: failed to save training state: {e}"));
         }
 
-        let preview = generate::<B::InnerBackend>(
+        let preview = generate(
             &model.valid(),
             tokenizer,
             "Once upon a time",
@@ -1013,11 +992,9 @@ pub fn train_with_events<B: AutodiffBackend>(
     let config_json = serde_json::to_string_pretty(&model_config)?;
     std::fs::write(&config_path, config_json)?;
 
-    let weights_path = Path::new(output_dir).join("model_weights");
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    recorder
-        .record(model.into_record(), weights_path.clone())
-        .map_err(|e| format!("Failed to save model record: {:?}", e))?;
+    let weights_path = storage::model_weights_path(Path::new(output_dir));
+    storage::save_module(&model, &weights_path)
+        .map_err(|e| format!("Failed to save model record: {e}"))?;
 
     train_state.global_step = global_step;
     train_state.best_val_loss = best_val_loss;
@@ -1029,19 +1006,19 @@ pub fn train_with_events<B: AutodiffBackend>(
     let _ = tx.send(TrainingEvent::Done {
         final_loss: last_avg_loss,
         total_time_secs: training_start.elapsed().as_secs_f64(),
-        weights_path: weights_path.with_extension("bin").to_string_lossy().to_string(),
+        weights_path: weights_path.to_string_lossy().to_string(),
         config_path: config_path.to_string_lossy().to_string(),
     });
 
     Ok(())
 }
 
-pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
-    model: &crate::model::Llm<B>,
+pub fn evaluate_dataset(
+    model: &crate::model::Llm,
     dataset: &TextDataset,
     batch_size: usize,
     max_batches: usize,
-    device: &B::Device,
+    device: &Device,
 ) -> (f32, f32, Option<f32>) {
     if dataset.len() == 0 {
         return (0.0, 1.0, None);
@@ -1059,7 +1036,7 @@ pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
         let end = std::cmp::min(start + batch_size, dataset.len());
         let indices: Vec<usize> = (start..end).collect();
 
-        let (inputs, targets) = dataset.get_batch::<B>(&indices, model.n_ctx, device);
+        let (inputs, targets) = dataset.get_batch(&indices, model.n_ctx, device);
         let logits = model.forward(inputs);
         let [b, t, v] = logits.dims();
 
@@ -1072,7 +1049,7 @@ pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
         let loss_val = loss
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap_or_default()
             .first()
             .copied()
@@ -1095,7 +1072,7 @@ pub fn evaluate_dataset<B: burn::tensor::backend::Backend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_eval<B: burn::tensor::backend::Backend>(
+pub fn run_eval(
     model_dir: &Path,
     dataset_path: &Path,
     tokenizer: &LlmTokenizer,
@@ -1103,7 +1080,7 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     eval_batch_size: usize,
     eval_batches: usize,
     max_tokens: usize,
-    device: &B::Device,
+    device: &Device,
     rope_override: Option<(crate::config::RopeScalingKind, f32)>,
     dense: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1133,18 +1110,24 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     }
 
     println!("Loading model config from {:?}...", config_path);
-    let model: crate::model::Llm<B> = config.init_model(device);
+    let model: crate::model::Llm = config.init_model(device);
 
-    let weights_path = model_dir.join("model_weights.bin");
+    let weights_path = crate::storage::model_weights_path(model_dir);
     let model = if weights_path.exists() {
         println!("Loading model weights from {:?}...", weights_path);
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let record = recorder
-            .load(model_dir.join("model_weights"), device)
-            .map_err(|e| format!("Failed to load model record: {:?}", e))?;
-        model.load_record(record).align_compute_dtype()
+        storage::load_module(model, &storage::model_weights_path(model_dir))
+            .map_err(|e| format!("Failed to load model record: {e}"))?
+            .valid()
+    } else if let Some(legacy) = crate::storage::legacy_weights_path(model_dir) {
+        return Err(format!(
+            "'{}' is a Burn 0.21 bincode checkpoint; this build uses burnpack. Re-import the \
+             model (import-hf/import) or retrain it (legacy file: '{}')",
+            model_dir.display(),
+            legacy.display()
+        )
+        .into());
     } else {
-        println!("Warning: model_weights.bin not found in {:?}. Evaluating initialized model.", model_dir);
+        println!("Warning: model_weights.bpk not found in {:?}. Evaluating initialized model.", model_dir);
         model
     };
 
@@ -1157,7 +1140,7 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
     );
 
     let start_time = Instant::now();
-    let (loss, ppl, bpb) = evaluate_dataset::<B>(&model, &dataset, eval_batch_size, eval_batches, device);
+    let (loss, ppl, bpb) = evaluate_dataset(&model, &dataset, eval_batch_size, eval_batches, device);
     let elapsed = start_time.elapsed().as_secs_f64();
 
     println!("\n╔══════════════════════════════════════════════════════════════╗");
@@ -1178,14 +1161,10 @@ pub fn run_eval<B: burn::tensor::backend::Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::Autodiff;
-    use burn::tensor::backend::Backend;
-    use burn_ndarray::{NdArray, NdArrayDevice};
-    use crate::model::Llm;
+                use crate::model::Llm;
+use crate::storage;
     use std::path::PathBuf;
 
-    /// CPU-only, deterministic autodiff backend for end-to-end training tests.
-    type TestBackend = Autodiff<NdArray<f32, i32>>;
 
     #[test]
     fn test_train_val_split() {
@@ -1253,13 +1232,13 @@ mod tests {
 
     #[test]
     fn test_streaming_generation_matches_full_generation() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = test_dir("stream_gen");
         let (tokenizer, _corpus) = tiny_tokenizer_and_corpus(&dir);
         let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let model: Llm<TestBackend> = config.init_model(&device);
+        let model: Llm = config.init_model(&device);
 
-        let full = crate::generate::generate::<NdArray<f32, i32>>(
+        let full = crate::generate::generate(
             &model.valid(),
             &tokenizer,
             "once",
@@ -1277,7 +1256,7 @@ mod tests {
         .unwrap();
 
         let mut streamed = String::new();
-        let also_full = crate::generate::generate_streaming::<NdArray<f32, i32>>(
+        let also_full = crate::generate::generate_streaming(
             &model.valid(),
             &tokenizer,
             "once",
@@ -1319,9 +1298,9 @@ mod tests {
 
     #[test]
     fn test_eval_reports_bpb_and_batch_limit() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let config = ModelConfig::new(64, 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let model: Llm<NdArray<f32, i32>> = config.init_model(&device);
+        let model: Llm = config.init_model(&device);
 
         let tokens: Vec<u32> = (0..160).map(|i| (i % 64) as u32).collect();
         let dataset = TextDataset { tokens, n_ctx: 8, step: 8, total_bytes: 1600 };
@@ -1387,43 +1366,41 @@ mod tests {
     /// Replaces every float parameter with a deterministic pattern so tests
     /// that compare numerical trajectories (gradient accumulation, resume)
     /// do not flake on random initialization.
-    fn deterministic_fill<B: Backend>(model: Llm<B>) -> Llm<B> {
-        use burn::module::{ModuleMapper, Param};
+    fn deterministic_fill(model: Llm) -> Llm {
+        use burn::module::ModuleMapper;
+        use burn::module::Param;
         struct Fill;
-        impl<B: Backend> ModuleMapper<B> for Fill {
+        impl ModuleMapper for Fill {
             fn map_float<const D: usize>(
                 &mut self,
-                param: Param<Tensor<B, D>>,
-            ) -> Param<Tensor<B, D>> {
-                let (_, tensor, _) = param.consume();
-                let dims = tensor.dims();
-                let n: usize = dims.iter().product();
-                let data: Vec<f32> = (0..n)
-                    .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.001)
-                    .collect();
-                Param::from_tensor(Tensor::<B, D>::from_data(
-                    TensorData::new(data, dims),
-                    &tensor.device(),
-                ))
+                param: Param<Tensor<D>>,
+            ) -> Param<Tensor<D>> {
+                param.map(|tensor| {
+                    let dims = tensor.dims();
+                    let n: usize = dims.iter().product();
+                    let data: Vec<f32> = (0..n)
+                        .map(|i| (((i * 37) % 101) as f32 - 50.0) * 0.001)
+                        .collect();
+                    Tensor::<D>::from_data(TensorData::new(data, dims), &tensor.device())
+                })
             }
         }
         model.map(&mut Fill)
     }
 
-    fn save_initial_weights<B: Backend>(
+    fn save_initial_weights(
         dir: &Path,
         config: &ModelConfig,
-        device: &B::Device,
+        device: &Device,
     ) -> PathBuf {
-        let model: Llm<B> = deterministic_fill(config.init_model(device));
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let path = dir.join("init");
-        recorder.record(model.into_record(), path.clone()).unwrap();
-        path.with_extension("bin")
+        let model: Llm = deterministic_fill(config.init_model(device));
+        let path = storage::model_weights_path(dir);
+        storage::save_module(&model, &path).unwrap();
+        path
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_train_once<B: AutodiffBackend>(
+    fn run_train_once(
         config: &ModelConfig,
         tokenizer: &LlmTokenizer,
         corpus: &str,
@@ -1434,11 +1411,12 @@ mod tests {
         resume: &Path,
         save_dir: Option<&Path>,
         output_dir: &Path,
-        device: &B::Device,
+        device: &Device,
     ) -> Vec<(usize, f64)> {
         let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
         let cancel = Arc::new(AtomicBool::new(false));
-        train_with_events::<B>(
+        let train_device = device.clone().autodiff();
+        train_with_events(
             None,
             Some(corpus),
             config.clone(),
@@ -1453,7 +1431,7 @@ mod tests {
             0,
             save_dir,
             Some(resume),
-            device,
+            &train_device,
             output_dir.to_str().unwrap(),
             0,
             LossOptions::default(),
@@ -1472,7 +1450,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_train_losses<B: AutodiffBackend>(
+    fn run_train_losses(
         config: &ModelConfig,
         tokenizer: &LlmTokenizer,
         corpus: &str,
@@ -1481,11 +1459,12 @@ mod tests {
         max_tokens: usize,
         resume: &Path,
         output_dir: &Path,
-        device: &B::Device,
+        device: &Device,
     ) -> Vec<(usize, f32)> {
         let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
         let cancel = Arc::new(AtomicBool::new(false));
-        train_with_events::<B>(
+        let train_device = device.clone().autodiff();
+        train_with_events(
             None,
             Some(corpus),
             config.clone(),
@@ -1500,7 +1479,7 @@ mod tests {
             0,
             None,
             Some(resume),
-            device,
+            &train_device,
             output_dir.to_str().unwrap(),
             0,
             LossOptions::default(),
@@ -1518,16 +1497,16 @@ mod tests {
             .collect()
     }
 
-    fn load_flat_weights<B: Backend>(dir: &Path, config: &ModelConfig, device: &B::Device) -> Vec<f32> {
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let record = recorder
-            .load(dir.join("model_weights"), device)
-            .expect("failed to load trained weights");
-        let model: Llm<B> = config.init_model(device).load_record(record);
+    fn load_flat_weights(dir: &Path, config: &ModelConfig, device: &Device) -> Vec<f32> {
+        let model: Llm = storage::load_module(
+            config.init_model(device),
+            &storage::model_weights_path(dir),
+        )
+        .expect("failed to load trained weights");
         let mut out = Vec::new();
-        out.extend(model.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap());
-        out.extend(model.blocks[0].attn.q_proj.weight.val().into_data().to_vec::<f32>().unwrap());
-        out.extend(model.blocks[0].mlp.down_proj.weight.val().into_data().to_vec::<f32>().unwrap());
+        out.extend(model.embed_tokens.weight.val().into_data().try_to_vec::<f32>().unwrap());
+        out.extend(model.blocks[0].attn.q_proj.weight.val().into_data().try_to_vec::<f32>().unwrap());
+        out.extend(model.blocks[0].mlp.down_proj.weight.val().into_data().try_to_vec::<f32>().unwrap());
         out
     }
 
@@ -1538,16 +1517,16 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    fn flat_autodiff_weights(model: &Llm<TestBackend>) -> Vec<f32> {
+    fn flat_autodiff_weights(model: &Llm) -> Vec<f32> {
         let model = model.valid();
         let mut out = Vec::new();
-        out.extend(model.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap());
-        out.extend(model.blocks[0].attn.q_proj.weight.val().into_data().to_vec::<f32>().unwrap());
-        out.extend(model.blocks[0].mlp.down_proj.weight.val().into_data().to_vec::<f32>().unwrap());
+        out.extend(model.embed_tokens.weight.val().into_data().try_to_vec::<f32>().unwrap());
+        out.extend(model.blocks[0].attn.q_proj.weight.val().into_data().try_to_vec::<f32>().unwrap());
+        out.extend(model.blocks[0].mlp.down_proj.weight.val().into_data().try_to_vec::<f32>().unwrap());
         out
     }
 
-    fn fixed_grads(model: &Llm<TestBackend>, input: &Tensor<TestBackend, 2, Int>) -> GradientsParams {
+    fn fixed_grads(model: &Llm, input: &Tensor<2, Int>) -> GradientsParams {
         let logits = model.forward(input.clone());
         let loss = logits.mean();
         GradientsParams::from_grads(loss.backward(), model)
@@ -1558,25 +1537,25 @@ mod tests {
     /// steps with only the last micro-batch gradients, so this test fails.
     #[test]
     fn test_grad_accum_equivalence() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = test_dir("grad_accum");
         let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
         let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let init = save_initial_weights::<NdArray<f32, i32>>(&dir, &config, &device);
+        let init = save_initial_weights(&dir, &config, &device);
 
         // 20 tokens at n_ctx=8 -> exactly 2 sequences.
         let out_ref = dir.join("out_ref");
-        run_train_once::<TestBackend>(
+        run_train_once(
             &config, &tokenizer, &corpus, 1, 2, 1, 20, &init, None, &out_ref, &device,
         );
 
         let out_accum = dir.join("out_accum");
-        run_train_once::<TestBackend>(
+        run_train_once(
             &config, &tokenizer, &corpus, 1, 1, 2, 20, &init, None, &out_accum, &device,
         );
 
-        let w_ref = load_flat_weights::<NdArray<f32, i32>>(&out_ref, &config, &device);
-        let w_accum = load_flat_weights::<NdArray<f32, i32>>(&out_accum, &config, &device);
+        let w_ref = load_flat_weights(&out_ref, &config, &device);
+        let w_accum = load_flat_weights(&out_accum, &config, &device);
         let diff = max_abs_diff(&w_ref, &w_accum);
         eprintln!("[GRAD_ACCUM] max_abs_diff(batch=2 vs batch=1+accum=2) = {diff:.6e}");
         // End-to-end check: AdamW normalizes each element, so float reduction
@@ -1594,15 +1573,15 @@ mod tests {
     /// must be identical to the full-batch gradient (linearity + 1/N scaling).
     #[test]
     fn test_accumulated_gradients_match_full_batch() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex().autodiff();
         let config = ModelConfig::new(64, 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let model = config.init_model::<TestBackend>(&device);
+        let model = config.init_model(&device).train();
 
-        let seq_a = Tensor::<TestBackend, 2, Int>::from_data(
+        let seq_a = Tensor::<2, Int>::from_data(
             TensorData::new(vec![1i32, 2, 3, 4, 5, 6, 7, 8], [1, 8]),
             &device,
         );
-        let seq_b = Tensor::<TestBackend, 2, Int>::from_data(
+        let seq_b = Tensor::<2, Int>::from_data(
             TensorData::new(vec![8i32, 7, 6, 5, 4, 3, 2, 1], [1, 8]),
             &device,
         );
@@ -1613,7 +1592,7 @@ mod tests {
         let full_grads = GradientsParams::from_grads(full_loss.backward(), &model);
 
         // Accumulated: two micro-batches, each scaled by 1/N.
-        let mut accumulator = GradientsAccumulator::<Llm<TestBackend>>::new();
+        let mut accumulator = GradientsAccumulator::<Llm>::new();
         for seq in [seq_a, seq_b] {
             let loss = model.forward(seq).mean() / 2.0;
             let grads = GradientsParams::from_grads(loss.backward(), &model);
@@ -1623,16 +1602,16 @@ mod tests {
 
         let param_id = model.embed_tokens.weight.id;
         let full = full_grads
-            .get::<NdArray<f32, i32>, 2>(param_id)
+            .get::<2>(param_id)
             .expect("full-batch embedding gradient")
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let accumulated = accum_grads
-            .get::<NdArray<f32, i32>, 2>(param_id)
+            .get::<2>(param_id)
             .expect("accumulated embedding gradient")
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let diff = max_abs_diff(&full, &accumulated);
@@ -1650,14 +1629,14 @@ mod tests {
     /// the LR at the equivalent step of an uninterrupted 2-epoch run.
     #[test]
     fn test_resume_restores_lr_schedule() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = test_dir("resume_lr");
         let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
         let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let init = save_initial_weights::<NdArray<f32, i32>>(&dir, &config, &device);
+        let init = save_initial_weights(&dir, &config, &device);
 
         // 72 tokens -> 8 sequences -> 8 batches per epoch (batch_size=1).
-        let continuous = run_train_once::<TestBackend>(
+        let continuous = run_train_once(
             &config, &tokenizer, &corpus, 2, 1, 1, 72, &init, None, &dir.join("continuous"), &device,
         );
         let lr_continuous_step_9 = continuous
@@ -1667,13 +1646,13 @@ mod tests {
             .expect("continuous run must emit progress for step 9");
 
         let ck_dir = dir.join("ck");
-        run_train_once::<TestBackend>(
+        run_train_once(
             &config, &tokenizer, &corpus, 1, 1, 1, 72, &init, Some(&ck_dir), &dir.join("split_a"), &device,
         );
-        let ckpt = ck_dir.join("checkpoint_epoch_1.bin");
+        let ckpt = ck_dir.join("checkpoint_epoch_1.bpk");
         assert!(ckpt.is_file(), "epoch checkpoint was not written to {ckpt:?}");
 
-        let resumed = run_train_once::<TestBackend>(
+        let resumed = run_train_once(
             &config, &tokenizer, &corpus, 1, 1, 1, 72, &ckpt, None, &dir.join("split_b"), &device,
         );
         let (first_step, lr_resumed) = *resumed.first().expect("resumed run must emit progress");
@@ -1688,22 +1667,44 @@ mod tests {
         );
     }
 
+    /// A warm start may point at a model directory: the loader resolves
+    /// `model_weights.bpk` and tolerates the absence of training sidecars.
+    #[test]
+    fn test_resume_from_model_directory() {
+        let device = Device::flex();
+        let dir = test_dir("resume_dir");
+        let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
+        let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        let init = save_initial_weights(&dir, &config, &device);
+        assert!(init.is_file(), "expected {init:?}");
+
+        let out = dir.join("out");
+        let events = run_train_once(
+            &config, &tokenizer, &corpus, 1, 1, 1, 72, &dir, None, &out, &device,
+        );
+        assert!(!events.is_empty(), "warm start from a model directory must train");
+        assert!(
+            out.join("model_weights.bpk").is_file(),
+            "training must save the final weights"
+        );
+    }
+
     /// Finding #2 (optimizer): dropping the AdamW moments on resume changes the
     /// next update, while `Optimizer::to_record`/`load_record` reproduces it.
     #[test]
     fn test_adamw_state_survives_record_roundtrip() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex().autodiff();
         let config = ModelConfig::new(64, 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let input = Tensor::<TestBackend, 2, Int>::from_data(
+        let input = Tensor::<2, Int>::from_data(
             TensorData::new(vec![1i32; 8], [1, 8]),
             &device,
         );
 
         // Step 1: shared baseline weights + optimizer state.
-        let mut model = config.init_model::<TestBackend>(&device);
+        let mut model = config.init_model(&device).train();
         let mut optim = AdamWConfig::new()
             .with_weight_decay(0.1f32)
-            .init::<TestBackend, Llm<TestBackend>>();
+            .init();
         let grads = fixed_grads(&model, &input);
         model = optim.step(1e-2, model, grads);
         // Snapshot the optimizer state right after the first step (what a
@@ -1719,7 +1720,7 @@ mod tests {
         let mut model_naive = model.clone();
         let mut optim_naive = AdamWConfig::new()
             .with_weight_decay(0.1f32)
-            .init::<TestBackend, Llm<TestBackend>>();
+            .init();
         let grads_naive = fixed_grads(&model_naive, &input);
         model_naive = optim_naive.step(1e-2, model_naive, grads_naive);
 
@@ -1727,7 +1728,7 @@ mod tests {
         let mut model_proper = model.clone();
         let mut optim_proper = AdamWConfig::new()
             .with_weight_decay(0.1f32)
-            .init::<TestBackend, Llm<TestBackend>>()
+            .init()
             .load_record(record);
         let grads_proper = fixed_grads(&model_proper, &input);
         model_proper = optim_proper.step(1e-2, model_proper, grads_proper);
@@ -1754,23 +1755,72 @@ mod tests {
         );
     }
 
+    /// The optimizer sidecar on disk must reproduce the in-memory record, and a
+    /// corrupt sidecar must fail loudly instead of silently resetting Adam.
+    #[test]
+    fn test_optimizer_state_bpk_roundtrip() {
+        let device = Device::flex().autodiff();
+        let config = ModelConfig::new(64, 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        let input = Tensor::<2, Int>::from_data(
+            TensorData::new(vec![1i32; 8], [1, 8]),
+            &device,
+        );
+        let mut model = config.init_model(&device).train();
+        let mut optim = AdamWConfig::new().with_weight_decay(0.1f32).init();
+        let grads = fixed_grads(&model, &input);
+        model = optim.step(1e-2, model, grads);
+
+        let dir = test_dir("optim_bpk");
+        std::fs::create_dir_all(&dir).unwrap();
+        persist_train_state(&optim, &TrainState::default(), &dir).unwrap();
+
+        let mut model_ref = model.clone();
+        let grads_ref = fixed_grads(&model_ref, &input);
+        model_ref = optim.step(1e-2, model_ref, grads_ref);
+
+        let (mut restored, loaded) = load_optimizer_record(
+            AdamWConfig::new().with_weight_decay(0.1f32).init(),
+            &dir,
+        )
+        .expect("optimizer sidecar must load");
+        assert!(loaded, "the sidecar must be reported as applied");
+        let mut model_resumed = model.clone();
+        let grads_resumed = fixed_grads(&model_resumed, &input);
+        model_resumed = restored.step(1e-2, model_resumed, grads_resumed);
+
+        let diff = max_abs_diff(
+            &flat_autodiff_weights(&model_ref),
+            &flat_autodiff_weights(&model_resumed),
+        );
+        assert!(
+            diff < 1e-6,
+            "on-disk optimizer state must reproduce the next update (diff={diff:.6e})"
+        );
+
+        std::fs::write(dir.join(OPTIMIZER_STATE_FILE), b"not a burnpack").unwrap();
+        assert!(
+            load_optimizer_record(AdamWConfig::new().init(), &dir).is_err(),
+            "a corrupt optimizer sidecar must be an error, not a silent reset"
+        );
+    }
+
     /// Finding #3: stopping training (user stop / Ctrl+C) must persist an
     /// interrupted checkpoint plus the full training state.
     #[test]
     fn test_cancel_saves_interrupted_checkpoint() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = test_dir("cancel_save");
         let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
         let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let init = save_initial_weights::<NdArray<f32, i32>>(&dir, &config, &device);
+        let init = save_initial_weights(&dir, &config, &device);
         let out = dir.join("out");
 
         let (tx, rx) = std::sync::mpsc::channel::<TrainingEvent>();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_thread = cancel.clone();
         let worker = std::thread::spawn(move || {
-            let device = NdArrayDevice::Cpu;
-            train_with_events::<TestBackend>(
+            let device = Device::flex().autodiff();
+            train_with_events(
                 None, Some(&corpus), config, &tokenizer, 4, 1, 0.1, None, Some(72), 0.0, 1, 0,
                 None, Some(&init), &device, out.to_str().unwrap(), 0, LossOptions::default(),
                 &tx, &cancel, None,
@@ -1788,12 +1838,12 @@ mod tests {
         worker.join().expect("worker thread panicked");
 
         assert!(
-            dir.join("out/checkpoint_interrupted.bin").is_file(),
+            dir.join("out/checkpoint_interrupted.bpk").is_file(),
             "interrupted checkpoint missing"
         );
         assert!(dir.join("out/train_state.json").is_file(), "train_state.json missing");
         assert!(
-            dir.join("out/optimizer_state.bin").is_file(),
+            dir.join("out/optimizer_state.bpk").is_file(),
             "optimizer_state.bin missing"
         );
     }
@@ -1806,14 +1856,14 @@ mod tests {
     /// overfit.
     #[test]
     fn test_training_learns_with_default_weight_decay() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = test_dir("overfit");
         let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
         let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
-        let init = save_initial_weights::<NdArray<f32, i32>>(&dir, &config, &device);
+        let init = save_initial_weights(&dir, &config, &device);
         let out = dir.join("out");
 
-        let losses = run_train_losses::<TestBackend>(
+        let losses = run_train_losses(
             &config, &tokenizer, &corpus, 8, 4, 0, &init, &out, &device,
         );
         assert!(!losses.is_empty(), "no progress events emitted");
@@ -1844,7 +1894,7 @@ mod tests {
 
     #[test]
     fn test_training_learns_with_eviction_mask() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = test_dir("evict_overfit");
         let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
         let mut config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
@@ -1856,10 +1906,10 @@ mod tests {
             .eviction_geometry()
             .unwrap()
             .expect("valid eviction geometry");
-        let init = save_initial_weights::<NdArray<f32, i32>>(&dir, &config, &device);
+        let init = save_initial_weights(&dir, &config, &device);
         let out = dir.join("out");
 
-        let losses = run_train_losses::<TestBackend>(
+        let losses = run_train_losses(
             &config, &tokenizer, &corpus, 8, 4, 0, &init, &out, &device,
         );
         assert!(!losses.is_empty(), "no progress events emitted");
@@ -1887,21 +1937,20 @@ mod tests {
 
     #[test]
     fn test_compute_loss_label_smoothing_and_z_loss() {
-        use burn_ndarray::{NdArray, NdArrayDevice};
-        let device = NdArrayDevice::Cpu;
+                let device = Device::flex();
 
         let opts = |ls: f32, z: f32| LossOptions {
             weight_decay: 0.0,
             label_smoothing: ls,
             z_loss: z,
         };
-        let scalar = |loss: Tensor<NdArray<f32, i32>, 1>| loss.into_data().to_vec::<f32>().unwrap()[0];
+        let scalar = |loss: Tensor<1>| loss.into_data().try_to_vec::<f32>().unwrap()[0];
 
-        let logits = Tensor::<NdArray<f32, i32>, 2>::from_data(
+        let logits = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32, 2.0, 0.0, 0.0], [1, 4]),
             &device,
         );
-        let target = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+        let target = Tensor::<2, Int>::from_data(
             TensorData::new(vec![1i32], [1, 1]),
             &device,
         );
@@ -1912,11 +1961,11 @@ mod tests {
         assert!((plain - nll).abs() < 1e-5, "plain={plain} nll={nll}");
 
         // Uniform logits: NLL = ln(4) and smoothing keeps it unchanged.
-        let uniform = Tensor::<NdArray<f32, i32>, 2>::from_data(
+        let uniform = Tensor::<2>::from_data(
             TensorData::new(vec![0.0f32; 4], [1, 4]),
             &device,
         );
-        let t0 = Tensor::<NdArray<f32, i32>, 2, Int>::from_data(
+        let t0 = Tensor::<2, Int>::from_data(
             TensorData::new(vec![0i32], [1, 1]),
             &device,
         );

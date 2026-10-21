@@ -219,7 +219,7 @@ fn run_generate(
     tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String, String> {
     let config_path = model_dir.join("config.json");
-    let weights_path = model_dir.join("model_weights");
+    let weights_path = crate::storage::model_weights_path(&model_dir);
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
     let mut config: crate::config::ModelConfig =
@@ -259,44 +259,27 @@ fn run_generate(
     let tokenizer = crate::data::resolve_tokenizer(Some(model_dir.as_path()))
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
-    match (s.dtype, s.cache_dtype) {
-        // An f16 cache needs a backend that really stores f16 (the fused
-        // backend's f16 casts are no-ops).
-        (crate::config::DType::F32, crate::model::KvCacheDtype::F16) => {
-            run_generate_backend::<crate::backend::WgpuHalf<f32>>(
-                config, weights_path, tokenizer, s, eviction, stream, tx,
-            )
-        }
-        (crate::config::DType::F32, _) => run_generate_backend::<burn::backend::Wgpu>(
-            config, weights_path, tokenizer, s, eviction, stream, tx,
-        ),
-        (crate::config::DType::F16, _) => {
-            run_generate_backend::<crate::backend::WgpuHalf<burn::tensor::f16>>(
-                config, weights_path, tokenizer, s, eviction, stream, tx,
-            )
-        }
-    }
+    let device = crate::backend::default_device();
+    run_generate_backend(config, weights_path, tokenizer, s, eviction, device, stream, tx)
 }
 
-fn run_generate_backend<B: burn::tensor::backend::Backend>(
+#[allow(clippy::too_many_arguments)]
+fn run_generate_backend(
     config: crate::config::ModelConfig,
     weights_path: std::path::PathBuf,
     tokenizer: crate::data::LlmTokenizer,
     s: Sampling,
     eviction: Option<crate::generate::EvictionOptions>,
+    device: burn::tensor::Device,
     stream: bool,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
 ) -> Result<String, String> {
-    use burn::module::Module;
-    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-
-    let device = B::Device::default();
-    let model: crate::model::Llm<B> = config.init_model(&device);
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let record = recorder
-        .load(weights_path, &device)
-        .map_err(|e| format!("failed to load weights: {e:?}"))?;
-    let model = model.load_record(record).align_compute_dtype();
+    let model: crate::model::Llm = config.init_model(&device);
+    let mut model = crate::storage::load_module(model, &weights_path)
+        .map_err(|e| format!("failed to load weights: {e}"))?;
+    if s.dtype == crate::config::DType::F16 {
+        model = model.cast_compute_dtype(burn::tensor::FloatDType::F16);
+    }
 
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

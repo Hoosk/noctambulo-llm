@@ -195,16 +195,14 @@ pub(super) async fn train(
 
     // Only relative, traversal-free paths are accepted for checkpoints and
     // output directories, resolved against the server working directory.
-    if let Some(save_dir) = &req.save_dir {
-        if !is_safe_rel_path(save_dir) {
+    if let Some(save_dir) = &req.save_dir
+        && !is_safe_rel_path(save_dir) {
             return Err(ApiError::bad_request("invalid save_dir"));
         }
-    }
-    if let Some(resume) = &req.resume {
-        if !is_safe_rel_path(resume) {
+    if let Some(resume) = &req.resume
+        && !is_safe_rel_path(resume) {
             return Err(ApiError::bad_request("invalid resume path"));
         }
-    }
     if !is_safe_rel_path(&req.output_dir) {
         return Err(ApiError::bad_request("invalid output_dir"));
     }

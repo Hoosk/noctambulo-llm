@@ -16,6 +16,7 @@ heaptrack.*
 /exported/
 /checkpoints*/
 *.bin
+*.bpk
 
 # Tokenizers y artefactos de entrenamiento
 /custom_tokenizer*.json

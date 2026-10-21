@@ -1,6 +1,5 @@
 use crate::config::ModelConfig;
 use crate::model::Llm;
-use burn::tensor::backend::Backend;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
@@ -117,21 +116,17 @@ pub(crate) fn permute_rope_bias(bias: &[f32], n_heads: usize, head_size: usize) 
 fn load_vocab_tokens(tokenizer_path: &str, vocab_size: usize) -> Vec<String> {
     let mut tokens = vec![String::new(); vocab_size];
 
-    if Path::new(tokenizer_path).exists() {
-        if let Ok(file_content) = std::fs::read_to_string(tokenizer_path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&file_content) {
-                if let Some(vocab_obj) = v.get("model").and_then(|m| m.get("vocab")).and_then(|v| v.as_object()) {
+    if Path::new(tokenizer_path).exists()
+        && let Ok(file_content) = std::fs::read_to_string(tokenizer_path)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&file_content)
+                && let Some(vocab_obj) = v.get("model").and_then(|m| m.get("vocab")).and_then(|v| v.as_object()) {
                     for (token, id_val) in vocab_obj {
-                        if let Some(id) = id_val.as_u64() {
-                            if (id as usize) < vocab_size {
+                        if let Some(id) = id_val.as_u64()
+                            && (id as usize) < vocab_size {
                                 tokens[id as usize] = token.clone();
                             }
-                        }
                     }
                 }
-            }
-        }
-    }
 
     for (i, token) in tokens.iter_mut().enumerate() {
         if token.is_empty() {
@@ -150,25 +145,21 @@ fn load_vocab_token_types(vocab_size: usize) -> Vec<i32> {
 
 fn load_vocab_merges(tokenizer_path: &str) -> Vec<String> {
     let mut merges = Vec::new();
-    if Path::new(tokenizer_path).exists() {
-        if let Ok(content) = std::fs::read_to_string(tokenizer_path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(merges_arr) = v.get("model").and_then(|m| m.get("merges")).and_then(|m| m.as_array()) {
+    if Path::new(tokenizer_path).exists()
+        && let Ok(content) = std::fs::read_to_string(tokenizer_path)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(merges_arr) = v.get("model").and_then(|m| m.get("merges")).and_then(|m| m.as_array()) {
                     for m_val in merges_arr {
                         if let Some(pair) = m_val.as_array() {
-                            if pair.len() == 2 {
-                                if let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
+                            if pair.len() == 2
+                                && let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
                                     merges.push(format!("{} {}", a, b));
                                 }
-                            }
                         } else if let Some(m_str) = m_val.as_str() {
                             merges.push(m_str.to_string());
                         }
                     }
                 }
-            }
-        }
-    }
     merges
 }
 
@@ -182,8 +173,8 @@ pub struct NamedTensor {
 type GgufKvWriter<'a> = Box<dyn Fn(&mut BufWriter<File>) -> std::io::Result<u64> + 'a>;
 
 /// CLI entry point: exports with no progress reporting and no cancellation.
-pub fn export_to_gguf_cli<B: Backend>(
-    model: &Llm<B>,
+pub fn export_to_gguf_cli(
+    model: &Llm,
     config: &ModelConfig,
     tokenizer_path: &str,
     model_name: &str,
@@ -209,8 +200,8 @@ pub fn export_to_gguf_cli<B: Backend>(
 /// the shared K/V weights under every layer (a standard-attention
 /// approximation, not the exact grouped computation).
 #[allow(clippy::too_many_arguments)]
-pub fn export_to_gguf<B: Backend>(
-    model: &Llm<B>,
+pub fn export_to_gguf(
+    model: &Llm,
     config: &ModelConfig,
     tokenizer_path: &str,
     model_name: &str,
@@ -244,7 +235,7 @@ pub fn export_to_gguf<B: Backend>(
         .weight
         .val()
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .map_err(|e| format!("Failed to extract embed_tokens weight: {:?}", e))?;
 
     named_tensors.push(NamedTensor {
@@ -261,7 +252,7 @@ pub fn export_to_gguf<B: Backend>(
         let prefix = format!("blk.{}", i);
 
         // Input RmsNorm
-        let gamma = block.input_layernorm.weight.val().into_data().to_vec::<f32>()
+        let gamma = block.input_layernorm.weight.val().into_data().try_to_vec::<f32>()
             .map_err(|e| format!("Failed to extract input_layernorm weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_norm.weight", prefix),
@@ -276,7 +267,7 @@ pub fn export_to_gguf<B: Backend>(
         let kv_dim = n_kv_head * head_dim;
         let group_idx = i / config.kv_share_group.max(1);
 
-        let q = block.attn.q_proj.weight.val().into_data().to_vec::<f32>()
+        let q = block.attn.q_proj.weight.val().into_data().try_to_vec::<f32>()
             .map_err(|e| format!("Failed to extract q_proj weight: {:?}", e))?;
         let q_trans = transpose_2d(&q, config.n_embd, config.n_embd);
         let q_permuted = permute_rope_weight(&q_trans, config.n_head, head_dim, config.n_embd);
@@ -287,7 +278,7 @@ pub fn export_to_gguf<B: Backend>(
         });
 
         if let Some(ref q_b_param) = block.attn.q_proj.bias {
-            let q_b = q_b_param.val().into_data().to_vec::<f32>()
+            let q_b = q_b_param.val().into_data().try_to_vec::<f32>()
                 .map_err(|e| format!("Failed to extract q_proj bias: {:?}", e))?;
             let q_b_permuted = permute_rope_bias(&q_b, config.n_head, head_dim);
             named_tensors.push(NamedTensor {
@@ -301,36 +292,36 @@ pub fn export_to_gguf<B: Backend>(
         // W_eff = kv_down · k_up (Burn Linear layout [in, out]). No
         // approximation needed because this MLA variant has no decoupled RoPE.
         let (k, k_bias, v, v_bias) = if let Some(mla) = model.mla.get(group_idx) {
-            let fold = |up: &burn::nn::Linear<B>| -> Result<Vec<f32>, String> {
+            let fold = |up: &burn::nn::Linear| -> Result<Vec<f32>, String> {
                 mla.kv_down
                     .weight
                     .val()
                     .matmul(up.weight.val())
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .map_err(|e| format!("Failed to fold MLA weights: {:?}", e))
             };
             (fold(&mla.k_up)?, None, fold(&mla.v_up)?, None)
         } else {
             let kv_group = &model.kv[group_idx];
-            let k = kv_group.k_proj.weight.val().into_data().to_vec::<f32>()
+            let k = kv_group.k_proj.weight.val().into_data().try_to_vec::<f32>()
                 .map_err(|e| format!("Failed to extract k_proj weight: {:?}", e))?;
             let k_bias = match kv_group.k_proj.bias.as_ref() {
                 Some(b) => Some(
                     b.val()
                         .into_data()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .map_err(|e| format!("Failed to extract k_proj bias: {:?}", e))?,
                 ),
                 None => None,
             };
-            let v = kv_group.v_proj.weight.val().into_data().to_vec::<f32>()
+            let v = kv_group.v_proj.weight.val().into_data().try_to_vec::<f32>()
                 .map_err(|e| format!("Failed to extract v_proj weight: {:?}", e))?;
             let v_bias = match kv_group.v_proj.bias.as_ref() {
                 Some(b) => Some(
                     b.val()
                         .into_data()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .map_err(|e| format!("Failed to extract v_proj bias: {:?}", e))?,
                 ),
                 None => None,
@@ -369,7 +360,7 @@ pub fn export_to_gguf<B: Backend>(
             });
         }
 
-        let out = block.attn.out_proj.weight.val().into_data().to_vec::<f32>()
+        let out = block.attn.out_proj.weight.val().into_data().try_to_vec::<f32>()
             .map_err(|e| format!("Failed to extract out_proj weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.attn_output.weight", prefix),
@@ -378,7 +369,7 @@ pub fn export_to_gguf<B: Backend>(
         });
 
         // Post-Attention RmsNorm
-        let gamma_post = block.post_attention_layernorm.weight.val().into_data().to_vec::<f32>()
+        let gamma_post = block.post_attention_layernorm.weight.val().into_data().try_to_vec::<f32>()
             .map_err(|e| format!("Failed to extract post_attention_layernorm weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_norm.weight", prefix),
@@ -387,7 +378,7 @@ pub fn export_to_gguf<B: Backend>(
         });
 
         // SwiGLU MLP Projections (Gate, Up, Down)
-        let gate = block.mlp.gate_proj.weight.val().into_data().to_vec::<f32>()
+        let gate = block.mlp.gate_proj.weight.val().into_data().try_to_vec::<f32>()
             .map_err(|e| format!("Failed to extract gate_proj weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_gate.weight", prefix),
@@ -395,7 +386,7 @@ pub fn export_to_gguf<B: Backend>(
             data: transpose_2d(&gate, config.n_embd, hidden_dim),
         });
 
-        let up = block.mlp.up_proj.weight.val().into_data().to_vec::<f32>()
+        let up = block.mlp.up_proj.weight.val().into_data().try_to_vec::<f32>()
             .map_err(|e| format!("Failed to extract up_proj weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_up.weight", prefix),
@@ -403,7 +394,7 @@ pub fn export_to_gguf<B: Backend>(
             data: transpose_2d(&up, config.n_embd, hidden_dim),
         });
 
-        let down = block.mlp.down_proj.weight.val().into_data().to_vec::<f32>()
+        let down = block.mlp.down_proj.weight.val().into_data().try_to_vec::<f32>()
             .map_err(|e| format!("Failed to extract down_proj weight: {:?}", e))?;
         named_tensors.push(NamedTensor {
             name: format!("{}.ffn_down.weight", prefix),
@@ -418,7 +409,7 @@ pub fn export_to_gguf<B: Backend>(
     }
 
     // 3. Final Norm & Tied Output Head
-    let norm = model.norm.weight.val().into_data().to_vec::<f32>()
+    let norm = model.norm.weight.val().into_data().try_to_vec::<f32>()
         .map_err(|e| format!("Failed to extract final norm weight: {:?}", e))?;
     named_tensors.push(NamedTensor {
         name: "output_norm.weight".to_string(),

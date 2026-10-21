@@ -1,5 +1,5 @@
 //! Import a GGUF file produced by `export.rs` back into the native format
-//! (config.json + model_weights.bin + custom_tokenizer.json).
+//! (config.json + model_weights.bpk + custom_tokenizer.json).
 //!
 //! This recovers models that only survive as GGUF exports: the exporter maps
 //! the Burn module layout onto llama.cpp's `llama` architecture (transposing
@@ -10,11 +10,10 @@
 
 use crate::config::{ModelConfig, RopeScalingKind};
 use crate::export::{transpose_2d, unpermute_rope_bias, unpermute_rope_weight};
-use crate::model::{backend_is_f16, Llm};
-use burn::module::{Module, Param};
-use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
+use crate::model::Llm;
+use crate::storage;
+use burn::module::{Param, ParamId};
+use burn::tensor::{Device, Tensor, TensorData};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -368,25 +367,15 @@ fn expect_dims(t: &GgufTensor, expected: &[usize], name: &str) -> Result<(), Str
     Ok(())
 }
 
-pub(crate) fn param1<B: Backend>(data: Vec<f32>, device: &B::Device) -> Param<Tensor<B, 1>> {
+pub(crate) fn param1(data: Vec<f32>, device: &Device) -> Param<Tensor<1>> {
     let len = data.len();
-    let tensor = Tensor::<B, 1>::from_data(TensorData::new(data, [len]), device);
-    let tensor = if backend_is_f16::<B>() {
-        tensor.cast(burn::tensor::FloatDType::F16)
-    } else {
-        tensor
-    };
-    Param::from_tensor(tensor)
+    let tensor = Tensor::<1>::from_data(TensorData::new(data, [len]), device);
+    Param::initialized(ParamId::new(), tensor)
 }
 
-pub(crate) fn param2<B: Backend>(data: Vec<f32>, dims: [usize; 2], device: &B::Device) -> Param<Tensor<B, 2>> {
-    let tensor = Tensor::<B, 2>::from_data(TensorData::new(data, dims), device);
-    let tensor = if backend_is_f16::<B>() {
-        tensor.cast(burn::tensor::FloatDType::F16)
-    } else {
-        tensor
-    };
-    Param::from_tensor(tensor)
+pub(crate) fn param2(data: Vec<f32>, dims: [usize; 2], device: &Device) -> Param<Tensor<2>> {
+    let tensor = Tensor::<2>::from_data(TensorData::new(data, dims), device);
+    Param::initialized(ParamId::new(), tensor)
 }
 
 /// Rebuild the custom BPE tokenizer JSON from GGUF `tokens`/`merges`.
@@ -468,18 +457,20 @@ fn tokenizer_json(tokens: &[String], merges: &[String], token_types: Option<&[i3
     })
 }
 
-/// Import a GGUF export into `output_dir` (config.json + model_weights.bin +
+/// Import a GGUF export into `output_dir` (config.json + model_weights.bpk +
 /// custom_tokenizer.json). Refuses to overwrite an existing model unless
 /// `force` is set. Returns the imported config.
-pub fn import_gguf<B: Backend>(
+pub fn import_gguf(
     gguf_path: &Path,
     output_dir: &Path,
     force: bool,
-    device: &B::Device,
+    device: &Device,
     tokenizer_override: Option<&Path>,
 ) -> Result<ModelConfig, String> {
-    let weights_path = output_dir.join("model_weights.bin");
-    if weights_path.exists() && !force {
+    if !force
+        && (crate::storage::model_weights_path(output_dir).exists()
+            || crate::storage::legacy_weights_path(output_dir).is_some())
+    {
         return Err(format!(
             "'{}' already contains a model (pass --force to overwrite)",
             output_dir.display()
@@ -539,14 +530,13 @@ pub fn import_gguf<B: Backend>(
         ));
     }
     let head_dim = n_embd / n_head;
-    if let Some(key_length) = meta_u64(&gguf.metadata, &key("attention.key_length")) {
-        if key_length as usize != head_dim {
+    if let Some(key_length) = meta_u64(&gguf.metadata, &key("attention.key_length"))
+        && key_length as usize != head_dim {
             return Err(format!(
                 "GGUF attention.key_length {key_length} differs from n_embd/n_head ({head_dim}); \
                  explicit head dimensions are not supported"
             ));
         }
-    }
     let kv_dim = n_kv_head * head_dim;
 
     let mut config = ModelConfig::new(vocab_size, n_embd, n_head, Some(n_kv_head), n_layer, n_ctx, 0.1, 0.0);
@@ -572,7 +562,7 @@ pub fn import_gguf<B: Backend>(
         output_dir.display()
     );
 
-    let mut model: Llm<B> = config.init_model(device);
+    let mut model: Llm = config.init_model(device);
 
     // Tied input embedding. `output.weight` duplicates it in the export, so it
     // is only used to sanity-check the file.
@@ -704,10 +694,7 @@ pub fn import_gguf<B: Backend>(
     std::fs::write(output_dir.join("config.json"), config_json)
         .map_err(|e| format!("failed to write config.json: {e}"))?;
 
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    recorder
-        .record(model.into_record(), output_dir.join("model_weights"))
-        .map_err(|e| format!("failed to write model_weights.bin: {e:?}"))?;
+    storage::save_module(&model, &storage::model_weights_path(output_dir))?;
 
     let tokenizer_path = output_dir.join("custom_tokenizer.json");
     if let Some(source) = tokenizer_override {
@@ -734,7 +721,7 @@ pub fn import_gguf<B: Backend>(
         .map_err(|e| format!("rebuilt tokenizer is invalid: {e}"))?;
 
     println!(
-        "Imported '{}' -> '{}' (config.json, model_weights.bin, custom_tokenizer.json)",
+        "Imported '{}' -> '{}' (config.json, model_weights.bpk, custom_tokenizer.json)",
         gguf_path.display(),
         output_dir.display()
     );
@@ -822,9 +809,7 @@ mod tests {
 mod roundtrip_tests {
     use super::*;
     use crate::export::permute_rope_weight;
-    use burn::backend::wgpu::WgpuDevice;
-    use burn::backend::Wgpu;
-
+        
     fn write_tokenizer(path: &Path, vocab: usize) {
         let mut map = serde_json::Map::new();
         for i in 0..vocab {
@@ -854,9 +839,9 @@ mod roundtrip_tests {
         let tok_path = dir.join("tok.json");
         write_tokenizer(&tok_path, 32);
 
-        let device = WgpuDevice::default();
+        let device = Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
         let config = ModelConfig::new(32, 16, 2, Some(1), 1, 8, 0.0, 0.0);
-        let model: Llm<Wgpu> = config.init_model(&device);
+        let model: Llm = config.init_model(&device);
         let gguf = dir.join("rt.gguf");
         crate::export::export_to_gguf(
             &model,
@@ -880,7 +865,7 @@ mod roundtrip_tests {
         let n_kv_head = config.get_n_kv_head();
         let head_dim = config.n_embd / config.n_head;
         let kv_dim = n_kv_head * head_dim;
-        let k_burn = model.kv[0].k_proj.weight.val().into_data().to_vec::<f32>().unwrap();
+        let k_burn = model.kv[0].k_proj.weight.val().into_data().try_to_vec::<f32>().unwrap();
         let expected = transpose_2d(&k_burn, config.n_embd, kv_dim);
         let expected = permute_rope_weight(&expected, n_kv_head, head_dim, config.n_embd);
         let k_tensor = parsed.tensors.get("blk.0.attn_k.weight").expect("k tensor");
@@ -890,14 +875,16 @@ mod roundtrip_tests {
         }
 
         let out = dir.join("imported");
-        import_gguf::<Wgpu>(&gguf, &out, true, &device, None).unwrap();
+        import_gguf(&gguf, &out, true, &device, None).unwrap();
 
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let record = recorder.load(out.join("model_weights"), &device).unwrap();
-        let imported: Llm<Wgpu> = config.init_model(&device).load_record(record);
+        let imported: Llm = storage::load_module(
+            config.init_model(&device),
+            &storage::model_weights_path(&out),
+        )
+        .unwrap();
 
-        let before = model.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap();
-        let after = imported.embed_tokens.weight.val().into_data().to_vec::<f32>().unwrap();
+        let before = model.embed_tokens.weight.val().into_data().try_to_vec::<f32>().unwrap();
+        let after = imported.embed_tokens.weight.val().into_data().try_to_vec::<f32>().unwrap();
         assert_eq!(before.len(), after.len());
         for (a, b) in before.iter().zip(after.iter()) {
             assert!((a - b).abs() < 1e-6, "embed mismatch {a} vs {b}");
@@ -912,14 +899,14 @@ mod roundtrip_tests {
                 ("gate", model.blocks[i].mlp.gate_proj.weight.val(), imported.blocks[i].mlp.gate_proj.weight.val()),
                 ("down", model.blocks[i].mlp.down_proj.weight.val(), imported.blocks[i].mlp.down_proj.weight.val()),
             ] {
-                let av = a.into_data().to_vec::<f32>().unwrap();
-                let bv = b.into_data().to_vec::<f32>().unwrap();
+                let av = a.into_data().try_to_vec::<f32>().unwrap();
+                let bv = b.into_data().try_to_vec::<f32>().unwrap();
                 for (x, y) in av.iter().zip(bv.iter()) {
                     assert!((x - y).abs() < 1e-6, "{name} mismatch {x} vs {y}");
                 }
             }
-            let qb = model.blocks[i].attn.q_proj.bias.as_ref().unwrap().val().into_data().to_vec::<f32>().unwrap();
-            let qb2 = imported.blocks[i].attn.q_proj.bias.as_ref().unwrap().val().into_data().to_vec::<f32>().unwrap();
+            let qb = model.blocks[i].attn.q_proj.bias.as_ref().unwrap().val().into_data().try_to_vec::<f32>().unwrap();
+            let qb2 = imported.blocks[i].attn.q_proj.bias.as_ref().unwrap().val().into_data().try_to_vec::<f32>().unwrap();
             for (x, y) in qb.iter().zip(qb2.iter()) {
                 assert!((x - y).abs() < 1e-6, "q bias mismatch {x} vs {y}");
             }

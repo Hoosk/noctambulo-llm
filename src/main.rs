@@ -7,6 +7,7 @@ mod hf_import;
 mod import;
 mod model;
 mod serve;
+mod storage;
 mod train;
 mod tui;
 
@@ -21,11 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use train::{run_eval, train};
 
-use backend::{MainBackend, MainHalf};
-use burn::backend::Autodiff;
-use burn::module::Module;
-use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::Backend;
+use burn::tensor::{Device, FloatDType};
 
 const DEFAULT_CORPUS: &str = "\
 Rust is a multi-paradigm, general-purpose programming language. \
@@ -207,7 +204,7 @@ struct PrepareDatasetArgs {
 
 #[derive(Args)]
 struct EvalArgs {
-    /// Model output directory containing config.json and model_weights.bin
+    /// Model output directory containing config.json and model_weights.bpk
     #[arg(long, default_value = "model_output")]
     model_dir: String,
     /// HF dataset repo ID(s)
@@ -259,9 +256,9 @@ struct TrainArgs {
     /// Explicit --n-embd/--n-head/--n-kv-head/--n-layer/--n-ctx override it.
     #[arg(long)]
     preset: Option<String>,
-    /// Compute precision. Only f32 is trainable: Burn 0.21's AdamW moment
-    /// estimates underflow in f16 (the first update explodes and the model
-    /// stops learning), so f16 is rejected with a clear error. bf16 is also
+    /// Compute precision. Only f32 is trainable: AdamW moment estimates
+    /// underflow in f16 (the first update explodes and the model stops
+    /// learning), so f16 is rejected with a clear error. bf16 is also
     /// rejected by the WGPU backend. Records are always stored as f32.
     #[arg(long, default_value = "f32")]
     dtype: String,
@@ -361,7 +358,7 @@ struct TrainArgs {
 
 #[derive(Args)]
 struct GenerateArgs {
-    /// Directory containing the model (config.json + model_weights.bin)
+    /// Directory containing the model (config.json + model_weights.bpk)
     #[arg(long, default_value = "model_output")]
     model_dir: String,
     /// Prompt text for completion
@@ -381,14 +378,13 @@ struct GenerateArgs {
     /// Repetition penalty (1.6 prevents token loops in trained SLMs)
     #[arg(long, default_value_t = 1.6)]
     rep_penalty: f32,
-    /// Compute precision: f32 (default) or f16 (non-fused backend; faster on
-    /// supported GPUs, but half-precision logits can flip tokens on weakly
-    /// trained models)
+    /// Compute precision: f32 (default) or f16 (faster on supported GPUs, but
+    /// half-precision logits can flip tokens on weakly trained models)
     #[arg(long, default_value = "f32")]
     dtype: String,
-    /// KV cache precision: f32 (default), f16 (halves memory; automatically
-    /// uses the non-fused backend so the cast really stores f16) or the
-    /// quantized int8 / q4 formats (packed integers + per-block scales)
+    /// KV cache precision: f32 (default), f16 (halves memory; the backend must
+    /// report f16 support) or the quantized int8 / q4 formats (packed integers
+    /// + per-block scales)
     #[arg(long, default_value = "f32")]
     kv_cache_dtype: String,
     /// Maximum new tokens to generate
@@ -474,24 +470,25 @@ struct ImportHfArgs {
 }
 
 /// Load a checkpoint and run greedy/sampled generation on any backend, so the
-/// CLI can dispatch f32 (fused WGPU) and f16 (non-fused half) identically.
+/// CLI dispatches f32 and f16 compute identically.
 #[allow(clippy::too_many_arguments)]
-fn run_generate<B: Backend>(
+fn run_generate(
     model_config: &ModelConfig,
     tokenizer: &LlmTokenizer,
     weights_path: &Path,
-    device: &B::Device,
+    device: &Device,
     args: &GenerateArgs,
     cache_dtype: crate::model::KvCacheDtype,
+    compute_dtype: DType,
     eviction: Option<crate::generate::EvictionOptions>,
     seed: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let model: Llm<B> = model_config.init_model(device);
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let record = recorder
-        .load(weights_path.to_path_buf(), device)
-        .map_err(|e| format!("Failed to load weights: {:?}", e))?;
-    let model = model.load_record(record).align_compute_dtype();
+    let model: Llm = model_config.init_model(device);
+    let mut model = storage::load_module(model, weights_path)
+        .map_err(|e| format!("Failed to load weights: {e}"))?;
+    if compute_dtype == DType::F16 {
+        model = model.cast_compute_dtype(FloatDType::F16);
+    }
 
     let result = generate(
         &model,
@@ -811,44 +808,42 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let save_dir_buf = args.save_dir.as_ref().map(PathBuf::from);
             let cancel = sigint_cancel_flag();
 
-            // The trainer is generic over the backend; dispatch on --dtype.
-            macro_rules! run_training {
-                ($backend:ty) => {
-                    train::<$backend>(
-                        dataset_path_buf.as_deref(),
-                        raw_text.as_deref(),
-                        model_config,
-                        &tokenizer,
-                        args.epochs,
-                        args.batch_size,
-                        args.lr,
-                        args.step,
-                        max_tokens,
-                        args.val_split,
-                        args.grad_accum,
-                        args.seq_warmup_steps,
-                        save_dir_buf.as_deref(),
-                        resume_path_buf.as_deref(),
-                        &device,
-                        output_dir,
-                        args.early_stop_patience,
-                        train::LossOptions {
-                            weight_decay: args.weight_decay,
-                            label_smoothing: args.label_smoothing,
-                            z_loss: args.z_loss,
-                        },
-                        Some(cancel),
-                    )
-                };
-            }
-
             let dtype = DType::parse(&args.dtype)?;
             tui::print_info(&format!("Compute precision: {}", dtype.as_str()));
             tui::print_info(&format!("Backend: {}", backend::backend_label()));
-            match dtype {
-                DType::F32 => run_training!(Autodiff<MainBackend>)?,
-                DType::F16 => run_training!(Autodiff<MainHalf>)?,
-            };
+            if dtype == DType::F16 {
+                return Err(
+                    "f16 training is not supported (AdamW moment estimates underflow); \
+                     train with --dtype f32"
+                        .into(),
+                );
+            }
+            let train_device = backend::training_device();
+            train(
+                dataset_path_buf.as_deref(),
+                raw_text.as_deref(),
+                model_config,
+                &tokenizer,
+                args.epochs,
+                args.batch_size,
+                args.lr,
+                args.step,
+                max_tokens,
+                args.val_split,
+                args.grad_accum,
+                args.seq_warmup_steps,
+                save_dir_buf.as_deref(),
+                resume_path_buf.as_deref(),
+                &train_device,
+                output_dir,
+                args.early_stop_patience,
+                train::LossOptions {
+                    weight_decay: args.weight_decay,
+                    label_smoothing: args.label_smoothing,
+                    z_loss: args.z_loss,
+                },
+                Some(cancel),
+            )?;
         }
         Commands::Eval(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();
@@ -886,7 +881,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 None
             };
 
-            run_eval::<MainBackend>(
+            run_eval(
                 Path::new(&args.model_dir),
                 &dataset_path,
                 &tokenizer,
@@ -901,7 +896,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Commands::Generate(args) => {
             let config_path = Path::new(&args.model_dir).join("config.json");
-            let weights_path = Path::new(&args.model_dir).join("model_weights");
+            let weights_path = storage::model_weights_path(Path::new(&args.model_dir));
 
             if !config_path.exists() {
                 println!("Error: Model files not found in '{}'. Run 'cargo run train' first.", args.model_dir);
@@ -961,51 +956,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             let cache_dtype = crate::model::KvCacheDtype::parse(&args.kv_cache_dtype)?;
-            match (dtype, cache_dtype) {
-                // An f16 cache needs a backend that really stores f16: the
-                // fused WGPU backend silently keeps f32 values (its f16 casts
-                // are no-ops), so route it through the non-fused backend.
-                (DType::F32, crate::model::KvCacheDtype::F16) => {
-                    run_generate::<crate::backend::WgpuHalf<f32>>(
-                        &model_config,
-                        &tokenizer,
-                        &weights_path,
-                        &device,
-                        &args,
-                        cache_dtype,
-                        eviction,
-                        seed,
-                    )?;
-                }
-                (DType::F32, _) => {
-                    run_generate::<MainBackend>(
-                        &model_config,
-                        &tokenizer,
-                        &weights_path,
-                        &device,
-                        &args,
-                        cache_dtype,
-                        eviction,
-                        seed,
-                    )?;
-                }
-                (DType::F16, _) => {
-                    run_generate::<MainHalf>(
-                        &model_config,
-                        &tokenizer,
-                        &weights_path,
-                        &device,
-                        &args,
-                        cache_dtype,
-                        eviction,
-                        seed,
-                    )?;
-                }
-            }
+            run_generate(
+                &model_config,
+                &tokenizer,
+                &weights_path,
+                &device,
+                &args,
+                cache_dtype,
+                dtype,
+                eviction,
+                seed,
+            )?;
         }
         Commands::Export(args) => {
             let config_path = Path::new(output_dir).join("config.json");
-            let weights_path = Path::new(output_dir).join("model_weights");
 
             if !config_path.exists() {
                 println!("Error: Model files not found in '{}'. Run 'cargo run train' first.", output_dir);
@@ -1016,12 +980,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let model_config: ModelConfig = serde_json::from_str(&config_str)?;
             model_config.check_arch_version(&config_path.display().to_string())?;
 
-            let model: Llm<MainBackend> = model_config.init_model(&device);
-            let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-            let record = recorder
-                .load(weights_path, &device)
-                .map_err(|e| format!("Failed to load weights: {:?}", e))?;
-            let model = model.load_record(record).align_compute_dtype();
+            let model: Llm = model_config.init_model(&device);
+            let model = storage::load_module(model, &storage::model_weights_path(Path::new(output_dir)))?;
 
             let tokenizer_path = data::resolve_tokenizer_path(Some(Path::new(output_dir)))
                 .unwrap_or_else(|| std::path::PathBuf::from(custom_tokenizer_file));
@@ -1042,7 +1002,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "imported_model".to_string())
             });
-            import::import_gguf::<backend::CpuBackend>(
+            import::import_gguf(
                 gguf_path,
                 Path::new(&output_dir),
                 args.force,
@@ -1074,7 +1034,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!("  {phase}: {done}/{total} {unit}");
                 }
             };
-            hf_import::import_hf::<backend::CpuBackend>(
+            hf_import::import_hf(
                 &source,
                 Path::new(&output_dir),
                 args.force,
