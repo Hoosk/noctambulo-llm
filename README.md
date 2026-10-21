@@ -2,7 +2,7 @@
 
 **Train it overnight. Wake up to a model.**
 
-[![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
 [![Burn](https://img.shields.io/badge/Burn-0.21-blue)](https://burn.dev/)
 [![GPU](https://img.shields.io/badge/GPU-WGPU%20%7C%20CUDA-6f42c1)](https://wgpu.rs/)
 [![Tests](https://img.shields.io/badge/tests-109%20passing-brightgreen)](#verification)
@@ -98,7 +98,7 @@ Start it before bed. Check the loss curve over coffee.
 
 ## Quickstart
 
-Requirements: Rust 1.80+, a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
+Requirements: Rust 1.92+ (edition 2024), a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
 console.
 
 ```bash

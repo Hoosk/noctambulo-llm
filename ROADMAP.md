@@ -74,6 +74,11 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 - ✅ **Web/API**: `POST /api/models/import-hf` runs as a cancellable background op with phase progress; `ModelInfo` reports `ffn_hidden`, `rope_base`, `rms_norm_eps` and `import_source`, shown in the Models view together with a new “Import from Hugging Face” card.
 - ⏳ **Backlog — quantized GGUF dequantization** (Q4_0/Q8_0/K-quants) at import time; today only f32/f16 GGUF tensors are converted (the error suggests `import-hf` or an f16 GGUF).
 
+## Dependency Upgrades
+
+- ✅ **Rust edition 2024** (MSRV 1.92), `axum 0.8` / `tower 0.5` / `tower-http 0.7` (new `{param}` route syntax), `arrow`/`parquet` 60, and compatible patch/minor updates. Verified by the full suite (109 tests) and `cargo clippy --all-targets`.
+- ⏳ **Burn 0.22 / wgpu 30 migration**: Burn 0.22 replaced backend-generic modules with runtime-dispatched tensors (`Tensor<D>`), removed the bincode record system in favor of `burn-store` (burnpack/SafeTensors) and changed optimizer persistence (`ModuleOptimizer`). This is a port of the engine, not a version bump; it also changes the on-disk checkpoint format (`model_weights.bin` → `.bpk`). Schedule it as its own migration with the test suite as the safety net, and plan a checkpoint re-import/retrain path.
+
 ## Suggested Order
 
 Phases 0–6 of the KV cache modernization plus host-RAM spill/replay are complete, and third-party model support (HF safetensors converter, relaxed GGUF import, fine-tuning from a model directory, web/API surface) has landed. Remaining backlog: quantized GGUF dequantization. Separate known gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. Re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above) before measuring quality.
