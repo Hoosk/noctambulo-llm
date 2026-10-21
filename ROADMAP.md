@@ -76,7 +76,7 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 
 ## Dependency Upgrades
 
-- ✅ **Rust edition 2024** (MSRV 1.85), `axum 0.8` / `tower 0.5` / `tower-http 0.7` (new `{param}` route syntax), `arrow`/`parquet` 60, and compatible patch/minor updates. Verified by the full suite (109 tests) and `cargo clippy --all-targets`.
+- ✅ **Rust edition 2024** (MSRV 1.92), `axum 0.8` / `tower 0.5` / `tower-http 0.7` (new `{param}` route syntax), `arrow`/`parquet` 60, and compatible patch/minor updates. Verified by the full suite (109 tests) and `cargo clippy --all-targets`.
 - ⏳ **Burn 0.22 / wgpu 30 migration**: Burn 0.22 replaced backend-generic modules with runtime-dispatched tensors (`Tensor<D>`), removed the bincode record system in favor of `burn-store` (burnpack/SafeTensors) and changed optimizer persistence (`ModuleOptimizer`). This is a port of the engine, not a version bump; it also changes the on-disk checkpoint format (`model_weights.bin` → `.bpk`). Schedule it as its own migration with the test suite as the safety net, and plan a checkpoint re-import/retrain path.
 
 ## Suggested Order
