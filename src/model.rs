@@ -3346,7 +3346,6 @@ mod backend_parity_tests {
     }
 
     #[test]
-    #[ignore = "Burn 0.22 WGPU matmul is wrong on Intel Arc (Flex CPU is correct); see issue #1"]
     fn test_wgpu_forward_matches_flex_tiny() {
         let mut config = ModelConfig::new(1000, 128, 4, Some(2), 2, 64, 0.0, 0.0);
         config.ffn_hidden = Some(512);
@@ -3355,7 +3354,6 @@ mod backend_parity_tests {
     }
 
     #[test]
-    #[ignore = "Burn 0.22 WGPU matmul is wrong on Intel Arc (Flex CPU is correct); see issue #1"]
     fn test_wgpu_forward_matches_flex_medium() {
         let mut config = ModelConfig::new(1000, 256, 4, Some(2), 2, 64, 0.0, 0.0);
         config.ffn_hidden = Some(1024);
@@ -3364,7 +3362,6 @@ mod backend_parity_tests {
     }
 
     #[test]
-    #[ignore = "Burn 0.22 WGPU matmul is wrong on Intel Arc (Flex CPU is correct); see issue #1"]
     fn test_wgpu_forward_matches_flex_qwen_like() {
         let mut config = ModelConfig::new(1000, 896, 14, Some(2), 2, 64, 0.0, 0.0);
         config.ffn_hidden = Some(4864);

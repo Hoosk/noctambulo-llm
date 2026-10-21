@@ -161,7 +161,7 @@ limitations.
 ## Verification
 
 ```bash
-cargo test                  # 108 tests
+cargo test                  # 111 tests
 cargo clippy --all-targets  # clean
 cd web && npm run lint && npm run build
 ```
@@ -173,16 +173,16 @@ conversion roundtrip, API paths and web build.
 
 ### Measured on the development machine
 
-Internal smoke benchmarks from the Burn 0.21 baseline (useful as a sanity check, not as marketing numbers; re-run after the 0.22 migration):
+Internal smoke benchmarks on Burn 0.22 with fusion/autotune disabled (useful as a sanity check, not as marketing numbers):
 
 | Workload | Result |
 | --- | --- |
-| Tiny 2-layer model, dense decode | 73–78 tok/s |
-| Same model, H2O eviction (budget 64) | 65–68 tok/s (~10% overhead) |
+| Tiny 2-layer model, dense decode | ~69 tok/s |
+| Same model, H2O eviction (budget 64) | ~53 tok/s (~25% overhead) |
 | Same model, spill/replay with budget growth | 36–43 tok/s |
-| Qwen2.5-0.5B-Instruct, f32 on WGPU (integrated GPU) | ~1 tok/s |
-| Qwen2.5-0.5B safetensors → native conversion | ~2m45s (download + CPU convert) |
-| Compatible f16 GGUF import | 12–45s |
+| Qwen2.5-0.5B-Instruct, f32 on WGPU (Intel Arc, no fusion) | ~0.7 tok/s |
+| Qwen2.5-0.5B safetensors → native conversion | ~13s cached (~2m45s cold download) |
+| Compatible f16 GGUF import | ~15s |
 
 ## Project layout
 
@@ -212,7 +212,7 @@ doc/             architecture, training/, inference/, models/
 
 ## Known limits
 
-- **Burn 0.22 WGPU (branch)**: on Intel Arc the upstream matmul kernels return wrong values; use `NOCTAMBULO_CPU=1` (Flex, slow) until the upstream fix. The supported master branch stays on Burn 0.21.
+- **Fusion/autotune disabled**: Burn 0.22's fusion graph cache returned wrong matmul results in this engine (reproduced against a manual reference; Flex and no-fusion WGPU are exact). `Cargo.toml` uses `default-features = false` to keep them off; re-enable once upstream fixes the fusion cache. `NOCTAMBULO_CPU=1` forces Flex for debugging.
 
 - Training and records are **f32 only** (the trainer rejects f16); f16 inference and f16/int8/q4 KV caches are supported.
 - GGUF import accepts f32/f16 tensors; quantized GGUF dequantization is on the roadmap.

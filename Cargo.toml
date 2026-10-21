@@ -10,12 +10,12 @@ rust-version = "1.92"
 cuda = ["burn/cuda"]
 
 [dependencies]
-# Deep Learning (Burn 0.22 dispatch tensors; models use the burnpack store)
-# Autotune stays enabled: without it the fallback f16 kernels are wrong on
-# WGPU (f16 training collapses to loss 0). Autotune's only known defect is the
-# M=1 GEMV kernel (wrong for output width >= 32); the model avoids it by
-# padding single-token forwards to M=2 before every matmul.
-burn = { version = "0.22", features = ["wgpu", "flex", "train", "autodiff", "fusion", "store"] }
+# Deep Learning (Burn 0.22 dispatch tensors; models use the burnpack store).
+# Default features are disabled: they pull burn-wgpu's fusion/autotune, and
+# Burn 0.22's fusion graph cache returned wrong matmul results in this engine
+# (reproduced against a manual f64 reference; Flex and no-fusion WGPU are
+# exact). Re-enable default features once the upstream fusion cache is fixed.
+burn = { version = "0.22", default-features = false, features = ["std", "wgpu", "flex", "train", "autodiff", "store"] }
 
 
 # Tokenización y acceso a Hugging Face
