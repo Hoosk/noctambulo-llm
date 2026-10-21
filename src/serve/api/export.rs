@@ -69,12 +69,8 @@ fn run_export(
     progress: &dyn Fn(&str, u64, u64, &str),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<String, String> {
-    use burn::backend::Wgpu;
-    use burn::module::Module;
-    use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-
     let config_path = model_dir.join("config.json");
-    let weights_path = model_dir.join("model_weights");
+    let weights_path = crate::storage::model_weights_path(&model_dir);
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| format!("config.json not found in {}: {e}", model_dir.display()))?;
     let config: crate::config::ModelConfig =
@@ -83,13 +79,10 @@ fn run_export(
         .check_arch_version(&config_path.display().to_string())
         .map_err(|e| format!("incompatible checkpoint: {e}"))?;
 
-    let device = burn::backend::wgpu::WgpuDevice::DefaultDevice;
-    let model: crate::model::Llm<Wgpu> = config.init_model(&device);
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    let record = recorder
-        .load(weights_path.clone(), &device)
-        .map_err(|e| format!("failed to load weights: {e:?}"))?;
-    let model = model.load_record(record).align_compute_dtype();
+    let device = crate::backend::default_device();
+    let model: crate::model::Llm = config.init_model(&device);
+    let model = crate::storage::load_module(model, &weights_path)
+        .map_err(|e| format!("failed to load weights: {e}"))?;
 
     let tokenizer_path = crate::data::resolve_tokenizer_path(Some(model_dir.as_path()))
         .unwrap_or_else(|| std::path::PathBuf::from("custom_tokenizer.json"));

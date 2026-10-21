@@ -4,7 +4,7 @@
 
 This document provides a detailed technical specification of the neural network architecture implemented in **Noctámbulo**.
 
-The architecture is inspired by the **Qwen2.5 / Qwen3** model family, built as a high-performance Causal Transformer (*Decoder-Only*) optimized for massively parallel training and inference on GPU using the **Burn 0.21** and **WGPU** frameworks.
+The architecture is inspired by the **Qwen2.5 / Qwen3** model family, built as a high-performance Causal Transformer (*Decoder-Only*) optimized for massively parallel training and inference on GPU using the **Burn 0.22** and **WGPU** frameworks.
 
 ---
 

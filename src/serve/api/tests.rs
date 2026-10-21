@@ -193,7 +193,7 @@ async fn test_model_files_rename_delete_routes() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("model_output")).unwrap();
     std::fs::write(dir.join("model_output/config.json"), "{}").unwrap();
-    std::fs::write(dir.join("model_output/model_weights.bin"), b"weights").unwrap();
+    std::fs::write(dir.join("model_output/model_weights.bpk"), b"weights").unwrap();
     std::fs::create_dir_all(dir.join("not_a_model")).unwrap();
     std::fs::write(dir.join("not_a_model/notes.txt"), "hi").unwrap();
 
@@ -210,7 +210,7 @@ async fn test_model_files_rename_delete_routes() {
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let names: Vec<&str> = json["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"config.json") && names.contains(&"model_weights.bin"));
+    assert!(names.contains(&"config.json") && names.contains(&"model_weights.bpk"));
 
     let req = axum::http::Request::builder()
         .uri("/api/models/file?dir=model_output&file=config.json")

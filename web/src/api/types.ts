@@ -180,6 +180,7 @@ export interface ModelInfo {
   default: boolean;
   arch_version: number;
   compatible: boolean;
+  legacy_weights: boolean;
   steps: number | null;
   best_val_loss: number | null;
 }
