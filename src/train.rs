@@ -113,17 +113,20 @@ fn persist_train_state(
     Ok(())
 }
 
-/// Reload the AdamW moments from `optimizer_state.bin` when present. Returns
-/// the optimizer and whether a record was actually applied.
-fn load_optimizer_record(optim: ModuleOptimizer, dir: &Path) -> (ModuleOptimizer, bool) {
+/// Reload the AdamW moments from `optimizer_state.bpk` when present. Missing
+/// state is fine (weights-only resume); a corrupt or incompatible record is an
+/// error so resume never silently restarts Adam from zero.
+fn load_optimizer_record(
+    optim: ModuleOptimizer,
+    dir: &Path,
+) -> Result<(ModuleOptimizer, bool), String> {
     let path = dir.join(OPTIMIZER_STATE_FILE);
     if !path.is_file() {
-        return (optim, false);
+        return Ok((optim, false));
     }
-    match OptimizerRecord::load(&path) {
-        Ok(record) => (optim.load_record(record), true),
-        Err(_) => (optim, false),
-    }
+    let record = OptimizerRecord::load(&path)
+        .map_err(|e| format!("failed to load optimizer state '{}': {e:?}", path.display()))?;
+    Ok((optim.load_record(record), true))
 }
 
 /// Save the model weights + full training state when training is interrupted
@@ -220,14 +223,13 @@ impl TextDataset {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (mut tokens, mut total_bytes) =
             tokenizer.encode_file_streaming_with_progress(path, max_tokens, progress, cancel)?;
-        if let Some(limit) = max_tokens {
-            if limit > 0 && tokens.len() > limit {
+        if let Some(limit) = max_tokens
+            && limit > 0 && tokens.len() > limit {
                 tui::print_warning(&format!("Limiting training dataset to {} tokens.", tui::format_number(limit)));
                 // Keep the byte count in proportion to the kept tokens.
                 total_bytes = (total_bytes as f64 * (limit as f64 / tokens.len() as f64)) as u64;
                 tokens.truncate(limit);
             }
-        }
         let step = custom_step.unwrap_or(n_ctx);
         let step = std::cmp::max(1, step);
         Ok(Self { tokens, n_ctx, step, total_bytes })
@@ -243,12 +245,11 @@ impl TextDataset {
     ) -> Self {
         let mut tokens = tokenizer.encode(text).unwrap_or_default();
         let mut total_bytes = text.len() as u64;
-        if let Some(limit) = max_tokens {
-            if limit > 0 && tokens.len() > limit {
+        if let Some(limit) = max_tokens
+            && limit > 0 && tokens.len() > limit {
                 total_bytes = (total_bytes as f64 * (limit as f64 / tokens.len() as f64)) as u64;
                 tokens.truncate(limit);
             }
-        }
         let step = custom_step.unwrap_or(n_ctx);
         let step = std::cmp::max(1, step);
         Self { tokens, n_ctx, step, total_bytes }
@@ -565,13 +566,13 @@ pub fn train_with_events(
         (full_dataset, TextDataset { tokens: vec![], n_ctx: model_config.n_ctx, step: custom_step.unwrap_or(model_config.n_ctx), total_bytes: 0 })
     };
 
-    tui::print_info("Initializing model architecture on WGPU device...");
+    tui::print_info("Initializing model architecture on the compute device...");
     let mut model = model_config.init_model(device).train();
     if model.embed_tokens.weight.val().dtype() == burn::tensor::DType::F16 {
         return Err(
-            "f16 training is not supported: Burn 0.21's AdamW moment estimates \
-             underflow in f16 (the first update explodes and the model stops \
-             learning). Train with --dtype f32 (default)."
+            "f16 training is not supported: AdamW moment estimates underflow in \
+             f16 (the first update explodes and the model stops learning). \
+             Train with --dtype f32 (default)."
                 .into(),
         );
     }
@@ -602,7 +603,7 @@ pub fn train_with_events(
     // Restore AdamW moments + scheduler position when a sidecar state exists.
     if resume_state.is_some() {
         let dir = resume_artifacts_dir(resume_path.expect("resume_state implies a resume path"));
-        let (restored, loaded) = load_optimizer_record(optim, &dir);
+        let (restored, loaded) = load_optimizer_record(optim, &dir)?;
         optim = restored;
         if loaded {
             emit_log(tx, "Successfully loaded optimizer state (AdamW moments)!");
@@ -635,8 +636,8 @@ pub fn train_with_events(
 
     // Chinchilla-style budget check: ~20 tokens per parameter saturates a model
     // of this size; warning early avoids a silently undertrained run.
-    if let Some(limit) = max_tokens {
-        if limit > 0 {
+    if let Some(limit) = max_tokens
+        && limit > 0 {
             let params = model_config.param_count();
             let recommended = params.saturating_mul(20);
             if limit < recommended {
@@ -650,7 +651,6 @@ pub fn train_with_events(
                 ));
             }
         }
-    }
 
     tui::print_training_header(
         &model_config,
@@ -687,8 +687,8 @@ pub fn train_with_events(
     for epoch in 1..=epochs {
         let epoch_start = Instant::now();
         // Initialized from the first loss so the accumulator keeps the loss
-        // dtype: `Tensor::zeros` would create f32 data even on an f16 backend
-        // (Burn 0.21), and adding it to an f16 loss corrupts the result.
+        // dtype; a zero-initialized f32 tensor added to an f16 loss would
+        // corrupt the result.
         let mut accum_loss_tensor: Option<Tensor<1>> = None;
         let mut accum_count = 0usize;
         let mut total_epoch_loss = 0.0f32;
@@ -1118,6 +1118,14 @@ pub fn run_eval(
         storage::load_module(model, &storage::model_weights_path(model_dir))
             .map_err(|e| format!("Failed to load model record: {e}"))?
             .valid()
+    } else if let Some(legacy) = crate::storage::legacy_weights_path(model_dir) {
+        return Err(format!(
+            "'{}' is a Burn 0.21 bincode checkpoint; this build uses burnpack. Re-import the \
+             model (import-hf/import) or retrain it (legacy file: '{}')",
+            model_dir.display(),
+            legacy.display()
+        )
+        .into());
     } else {
         println!("Warning: model_weights.bpk not found in {:?}. Evaluating initialized model.", model_dir);
         model
@@ -1659,6 +1667,28 @@ use crate::storage;
         );
     }
 
+    /// A warm start may point at a model directory: the loader resolves
+    /// `model_weights.bpk` and tolerates the absence of training sidecars.
+    #[test]
+    fn test_resume_from_model_directory() {
+        let device = Device::flex();
+        let dir = test_dir("resume_dir");
+        let (tokenizer, corpus) = tiny_tokenizer_and_corpus(&dir);
+        let config = ModelConfig::new(tokenizer.vocab_size(), 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        let init = save_initial_weights(&dir, &config, &device);
+        assert!(init.is_file(), "expected {init:?}");
+
+        let out = dir.join("out");
+        let events = run_train_once(
+            &config, &tokenizer, &corpus, 1, 1, 1, 72, &dir, None, &out, &device,
+        );
+        assert!(!events.is_empty(), "warm start from a model directory must train");
+        assert!(
+            out.join("model_weights.bpk").is_file(),
+            "training must save the final weights"
+        );
+    }
+
     /// Finding #2 (optimizer): dropping the AdamW moments on resume changes the
     /// next update, while `Optimizer::to_record`/`load_record` reproduces it.
     #[test]
@@ -1722,6 +1752,55 @@ use crate::storage;
             diff_proper < 1e-6,
             "restoring Optimizer::to_record/load_record must reproduce the next update \
              exactly (diff={diff_proper:.6e})"
+        );
+    }
+
+    /// The optimizer sidecar on disk must reproduce the in-memory record, and a
+    /// corrupt sidecar must fail loudly instead of silently resetting Adam.
+    #[test]
+    fn test_optimizer_state_bpk_roundtrip() {
+        let device = Device::flex().autodiff();
+        let config = ModelConfig::new(64, 32, 2, Some(2), 1, 8, 0.0, 0.0);
+        let input = Tensor::<2, Int>::from_data(
+            TensorData::new(vec![1i32; 8], [1, 8]),
+            &device,
+        );
+        let mut model = config.init_model(&device).train();
+        let mut optim = AdamWConfig::new().with_weight_decay(0.1f32).init();
+        let grads = fixed_grads(&model, &input);
+        model = optim.step(1e-2, model, grads);
+
+        let dir = test_dir("optim_bpk");
+        std::fs::create_dir_all(&dir).unwrap();
+        persist_train_state(&optim, &TrainState::default(), &dir).unwrap();
+
+        let mut model_ref = model.clone();
+        let grads_ref = fixed_grads(&model_ref, &input);
+        model_ref = optim.step(1e-2, model_ref, grads_ref);
+
+        let (mut restored, loaded) = load_optimizer_record(
+            AdamWConfig::new().with_weight_decay(0.1f32).init(),
+            &dir,
+        )
+        .expect("optimizer sidecar must load");
+        assert!(loaded, "the sidecar must be reported as applied");
+        let mut model_resumed = model.clone();
+        let grads_resumed = fixed_grads(&model_resumed, &input);
+        model_resumed = restored.step(1e-2, model_resumed, grads_resumed);
+
+        let diff = max_abs_diff(
+            &flat_autodiff_weights(&model_ref),
+            &flat_autodiff_weights(&model_resumed),
+        );
+        assert!(
+            diff < 1e-6,
+            "on-disk optimizer state must reproduce the next update (diff={diff:.6e})"
+        );
+
+        std::fs::write(dir.join(OPTIMIZER_STATE_FILE), b"not a burnpack").unwrap();
+        assert!(
+            load_optimizer_record(AdamWConfig::new().init(), &dir).is_err(),
+            "a corrupt optimizer sidecar must be an error, not a silent reset"
         );
     }
 

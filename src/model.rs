@@ -16,9 +16,8 @@ impl ModuleMapper for CastFloatDtype {
 /// KV cache storage format. `Int8` and `Q4` keep the cache quantized with
 /// symmetric per-row (per token, all heads) block quantization: one f32 scale
 /// per `QUANT_BLOCK` elements and packed integer data (4 int8 or 8 int4 per
-/// i32 word). Burn 0.21's native `QFloat` cannot be written with
-/// `slice_assign`, so the ring buffer stores the packed words directly and
-/// dequantizes on read.
+/// i32 word). Burn's native `QFloat` cannot be written with `slice_assign`,
+/// so the ring buffer stores the packed words directly and dequantizes on read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvCacheDtype {
     F32,
@@ -143,7 +142,7 @@ fn quantize_rows(
 
     // Pack the signed quantized values into bytes with `(q << shift) & mask`
     // instead of shifting the unsigned offset value: the shifted intermediate
-    // always fits in i32 (unlike `offset << 24`), which burn-ndarray's checked
+    // always fits in i32 (unlike `offset << 24`), which the CPU backend's checked
     // i64 -> i32 conversion requires. The resulting bit pattern is identical to
     // two's-complement `(q + offset)` bytes.
     let mut packed: Option<Tensor<2, Int>> = None;
@@ -2735,8 +2734,8 @@ mod tests {
             }
         }
 
-        // burn-ndarray has no f16 storage, so the f16 cache path is covered by
-        // the WGPU tests; f32/int8/q4 exercise every eviction writer branch.
+        // The f16 cache path is covered by the WGPU tests; f32/int8/q4
+        // exercise every eviction writer branch on the CPU backend.
         for dtype in [KvCacheDtype::F32, KvCacheDtype::Int8, KvCacheDtype::Q4] {
             run(dtype);
         }

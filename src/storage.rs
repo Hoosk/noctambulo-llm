@@ -80,5 +80,14 @@ pub fn load_module<M: ModuleSnapshot>(mut module: M, path: &Path) -> Result<M, S
             result.missing[0].0
         ));
     }
+    if !result.unused.is_empty() {
+        return Err(format!(
+            "weights at '{}' contain {} tensor(s) not present in this architecture, e.g. '{}'; \
+             the checkpoint does not match this configuration",
+            path.display(),
+            result.unused.len(),
+            result.unused[0]
+        ));
+    }
     Ok(module)
 }

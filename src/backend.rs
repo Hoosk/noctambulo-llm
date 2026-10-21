@@ -8,20 +8,19 @@
 use burn::tensor::{Device, DeviceKind};
 
 /// Default compute device for the CLI: CUDA with the `cuda` feature, else WGPU.
-#[cfg(feature = "cuda")]
+/// `NOCTAMBULO_CPU=1` forces Flex regardless of the compiled features.
 pub fn default_device() -> Device {
-    Device::cuda(0)
-}
-
-/// Default compute device for the CLI: CUDA with the `cuda` feature, else WGPU.
-#[cfg(not(feature = "cuda"))]
-pub fn default_device() -> Device {
-    // Debug escape hatch: force the pure-Rust CPU backend to isolate GPU
-    // kernel issues (`NOCTAMBULO_CPU=1`).
     if std::env::var_os("NOCTAMBULO_CPU").is_some() {
         return Device::flex();
     }
-    Device::wgpu(DeviceKind::DefaultDevice)
+    #[cfg(feature = "cuda")]
+    {
+        Device::cuda(0)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Device::wgpu(DeviceKind::DefaultDevice)
+    }
 }
 
 /// Default device with autodiff enabled (training).
@@ -36,7 +35,9 @@ pub fn cpu_device() -> Device {
 
 /// Human-readable backend name for logs.
 pub fn backend_label() -> &'static str {
-    if cfg!(feature = "cuda") {
+    if std::env::var_os("NOCTAMBULO_CPU").is_some() {
+        "Flex (CPU)"
+    } else if cfg!(feature = "cuda") {
         "CUDA"
     } else {
         "WGPU"
@@ -47,6 +48,10 @@ pub fn backend_label() -> &'static str {
 /// [`Device`]. Unknown selectors fall back to the default device so a stale
 /// frontend can never crash the worker.
 pub fn wgpu_device_from_selector(selector: &str) -> Device {
+    // Same debug escape hatch as the CLI, so web training can run without a GPU.
+    if std::env::var_os("NOCTAMBULO_CPU").is_some() {
+        return Device::flex();
+    }
     let s = selector.trim();
     let kind = if s.eq_ignore_ascii_case("cpu") {
         DeviceKind::Cpu

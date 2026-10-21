@@ -273,11 +273,10 @@ impl LlmTokenizer {
                     }
                 }
 
-                if let Some(limit) = max_tokens {
-                    if limit > 0 && all_tokens.len() >= limit {
+                if let Some(limit) = max_tokens
+                    && limit > 0 && all_tokens.len() >= limit {
                         break;
                     }
-                }
 
                 if last_update.elapsed().as_millis() >= 100 || bytes_read >= total_bytes {
                     last_update = Instant::now();
@@ -716,12 +715,11 @@ pub fn encode_parquet_streaming(
             docs += 1;
             if batch.len() >= 1024 {
                 encode_doc_batch(tokenizer, &mut batch, &mut tokens, eos_id);
-                if let Some(l) = limit {
-                    if tokens.len() >= l {
+                if let Some(l) = limit
+                    && tokens.len() >= l {
                         limit_hit = true;
                         break;
                     }
-                }
             }
         }
 
@@ -1104,11 +1102,10 @@ pub fn tokenizer_vocab_hash(tokenizer: &LlmTokenizer) -> u64 {
 
 pub fn is_binary_file<P: AsRef<Path>>(path: P) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let path = path.as_ref();
-    if let Some(ext) = path.extension() {
-        if ext == "bin" {
+    if let Some(ext) = path.extension()
+        && ext == "bin" {
             return Ok(true);
         }
-    }
     let mut file = match File::open(path) {
         Ok(f) => f,
         Err(_) => return Ok(false),

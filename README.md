@@ -3,9 +3,9 @@
 **Train it overnight. Wake up to a model.**
 
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
-[![Burn](https://img.shields.io/badge/Burn-0.21-blue)](https://burn.dev/)
+[![Burn](https://img.shields.io/badge/Burn-0.22-blue)](https://burn.dev/)
 [![GPU](https://img.shields.io/badge/GPU-WGPU%20%7C%20CUDA-6f42c1)](https://wgpu.rs/)
-[![Tests](https://img.shields.io/badge/tests-109%20passing-brightgreen)](#verification)
+[![Tests](https://img.shields.io/badge/tests-113%20passing-brightgreen)](#verification)
 [![GGUF](https://img.shields.io/badge/export-GGUF%20v3-9cf)](doc/models/export.md)
 [![Web](https://img.shields.io/badge/console-React%2019%20%2B%20Axum-0ea5e9)](#web-console)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -98,7 +98,7 @@ Start it before bed. Check the loss curve over coffee.
 
 ## Quickstart
 
-Requirements: Rust 1.92+ (edition 2024), a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
+Requirements: Rust 1.95+ (edition 2024), a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
 console.
 
 ```bash
@@ -161,7 +161,7 @@ limitations.
 ## Verification
 
 ```bash
-cargo test                  # 111 tests
+cargo test                  # 113 tests
 cargo clippy --all-targets  # clean
 cd web && npm run lint && npm run build
 ```

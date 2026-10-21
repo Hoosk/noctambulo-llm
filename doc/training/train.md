@@ -38,7 +38,7 @@ The `train` subcommand accepts **23 CLI** configuration parameters:
 | `--val-split <float>` | `f32` | `0.1` | Fraction of the corpus reserved for validation (computation of Loss and Perplexity per epoch). `0.0` disables validation. |
 | `--grad-accum <n>` | `usize` | `1` | Gradient accumulation steps per AdamW update. The accumulated gradient is the **mean** of the micro-batches (equivalent to a larger batch). |
 | `--save-dir <path>` | `Option<String>` | `None` | Directory where `checkpoint_epoch_N.bpk` and `checkpoint_best.bpk` are saved at the end of each epoch. |
-| `--resume <path>` | `Option<String>` | `None` | Checkpoint `.bin` (or its directory) from which to resume. Restores weights, AdamW moments, schedule position and shuffler state. `--epochs` then means **additional epochs**. |
+| `--resume <path>` | `Option<String>` | `None` | Checkpoint `.bpk` (or its directory) from which to resume. Restores weights, AdamW moments, schedule position and shuffler state. `--epochs` then means **additional epochs**. |
 | `--seq-warmup-steps <n>` | `usize` | `0` | Initial *Progressive Sequence Scaling* steps: the context grows from `n_ctx/4` to `n_ctx` during warmup. `0` disables it. |
 | `--early-stop-patience <n>` | `usize` | `0` | Stops training after `n` consecutive epochs without improving `val_loss`. `0` disables it. |
 
@@ -128,7 +128,7 @@ At the end of each epoch (and when training is stopped) Noctámbulo saves, along
 
 When resuming with `--resume <checkpoint>`, the weights **and** both sidecars are restored, so the cosine schedule continues from the saved step, the AdamW moments are not lost and the sequence order continues where it left off. `--epochs` in a resume indicates **additional** epochs.
 
-If `train_state.json` does not exist (older checkpoints), the resume is backward compatible: only the weights are loaded and a warning is issued that the AdamW state starts from zero.
+If `train_state.json` does not exist (for example a model directory used as a warm start), only the weights are loaded and the AdamW state starts from zero. Burn 0.21 `.bin` checkpoints are not loadable: re-import the model (GGUF/HF) or retrain it.
 
 ### 8. Safe Stop (Stop / Ctrl+C)
 
