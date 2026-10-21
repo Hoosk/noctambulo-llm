@@ -228,11 +228,9 @@ impl RunsStore {
             .create(true)
             .append(true)
             .open(&self.path)
-        {
-            if let Ok(json) = serde_json::to_string(record) {
+            && let Ok(json) = serde_json::to_string(record) {
                 let _ = writeln!(f, "{json}");
             }
-        }
     }
 }
 

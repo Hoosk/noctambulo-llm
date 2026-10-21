@@ -530,14 +530,13 @@ pub fn import_gguf(
         ));
     }
     let head_dim = n_embd / n_head;
-    if let Some(key_length) = meta_u64(&gguf.metadata, &key("attention.key_length")) {
-        if key_length as usize != head_dim {
+    if let Some(key_length) = meta_u64(&gguf.metadata, &key("attention.key_length"))
+        && key_length as usize != head_dim {
             return Err(format!(
                 "GGUF attention.key_length {key_length} differs from n_embd/n_head ({head_dim}); \
                  explicit head dimensions are not supported"
             ));
         }
-    }
     let kv_dim = n_kv_head * head_dim;
 
     let mut config = ModelConfig::new(vocab_size, n_embd, n_head, Some(n_kv_head), n_layer, n_ctx, 0.1, 0.0);

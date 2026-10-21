@@ -252,11 +252,10 @@ pub(super) async fn model_files(
     }
     let shared = Path::new("custom_tokenizer.json");
     let has_local_tokenizer = files.iter().any(|f| f.name == "custom_tokenizer.json");
-    if !has_local_tokenizer {
-        if let Some(info) = file_info(shared, true) {
+    if !has_local_tokenizer
+        && let Some(info) = file_info(shared, true) {
             files.push(info);
         }
-    }
     files.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Json(ModelFilesResponse {

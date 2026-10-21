@@ -341,7 +341,9 @@ pub fn import_hf(
     progress: &mut dyn FnMut(&str, u64, u64, &str),
 ) -> Result<ModelConfig, String> {
     let weights_path = storage::model_weights_path(output_dir);
-    if weights_path.exists() && !force {
+    if !force
+        && (weights_path.exists() || storage::legacy_weights_path(output_dir).is_some())
+    {
         return Err(format!(
             "'{}' already contains a model (pass --force to overwrite)",
             output_dir.display()
@@ -367,11 +369,10 @@ pub fn import_hf(
              MistralForCausalLM)"
         ));
     }
-    if let Some(act) = &hf.hidden_act {
-        if act != "silu" {
+    if let Some(act) = &hf.hidden_act
+        && act != "silu" {
             return Err(format!("unsupported hidden activation '{act}' (only silu/SwiGLU)"));
         }
-    }
     if hf.tie_word_embeddings == Some(false) {
         return Err(
             "untied word embeddings are not supported (tie_word_embeddings must be true); the \
@@ -439,12 +440,11 @@ pub fn import_hf(
     config.rms_norm_eps = hf.rms_norm_eps.unwrap_or(1e-6);
     config.rope_base = hf.rope_theta.unwrap_or(10000.0);
     config.import_source = Some("hf".into());
-    if let Some(scaling) = &hf.rope_scaling {
-        if !scaling.is_null() {
+    if let Some(scaling) = &hf.rope_scaling
+        && !scaling.is_null() {
             let (kind, factor) = rope_scaling_from_hf(scaling)?;
             config.set_rope_scaling(kind, factor);
         }
-    }
 
     println!(
         "Converting '{}' ({} layers, n_embd {}, hidden {}, vocab {}) -> '{}'",

@@ -116,21 +116,17 @@ pub(crate) fn permute_rope_bias(bias: &[f32], n_heads: usize, head_size: usize) 
 fn load_vocab_tokens(tokenizer_path: &str, vocab_size: usize) -> Vec<String> {
     let mut tokens = vec![String::new(); vocab_size];
 
-    if Path::new(tokenizer_path).exists() {
-        if let Ok(file_content) = std::fs::read_to_string(tokenizer_path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&file_content) {
-                if let Some(vocab_obj) = v.get("model").and_then(|m| m.get("vocab")).and_then(|v| v.as_object()) {
+    if Path::new(tokenizer_path).exists()
+        && let Ok(file_content) = std::fs::read_to_string(tokenizer_path)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&file_content)
+                && let Some(vocab_obj) = v.get("model").and_then(|m| m.get("vocab")).and_then(|v| v.as_object()) {
                     for (token, id_val) in vocab_obj {
-                        if let Some(id) = id_val.as_u64() {
-                            if (id as usize) < vocab_size {
+                        if let Some(id) = id_val.as_u64()
+                            && (id as usize) < vocab_size {
                                 tokens[id as usize] = token.clone();
                             }
-                        }
                     }
                 }
-            }
-        }
-    }
 
     for (i, token) in tokens.iter_mut().enumerate() {
         if token.is_empty() {
@@ -149,25 +145,21 @@ fn load_vocab_token_types(vocab_size: usize) -> Vec<i32> {
 
 fn load_vocab_merges(tokenizer_path: &str) -> Vec<String> {
     let mut merges = Vec::new();
-    if Path::new(tokenizer_path).exists() {
-        if let Ok(content) = std::fs::read_to_string(tokenizer_path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(merges_arr) = v.get("model").and_then(|m| m.get("merges")).and_then(|m| m.as_array()) {
+    if Path::new(tokenizer_path).exists()
+        && let Ok(content) = std::fs::read_to_string(tokenizer_path)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(merges_arr) = v.get("model").and_then(|m| m.get("merges")).and_then(|m| m.as_array()) {
                     for m_val in merges_arr {
                         if let Some(pair) = m_val.as_array() {
-                            if pair.len() == 2 {
-                                if let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
+                            if pair.len() == 2
+                                && let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str()) {
                                     merges.push(format!("{} {}", a, b));
                                 }
-                            }
                         } else if let Some(m_str) = m_val.as_str() {
                             merges.push(m_str.to_string());
                         }
                     }
                 }
-            }
-        }
-    }
     merges
 }
 

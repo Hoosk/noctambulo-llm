@@ -256,9 +256,9 @@ struct TrainArgs {
     /// Explicit --n-embd/--n-head/--n-kv-head/--n-layer/--n-ctx override it.
     #[arg(long)]
     preset: Option<String>,
-    /// Compute precision. Only f32 is trainable: Burn 0.21's AdamW moment
-    /// estimates underflow in f16 (the first update explodes and the model
-    /// stops learning), so f16 is rejected with a clear error. bf16 is also
+    /// Compute precision. Only f32 is trainable: AdamW moment estimates
+    /// underflow in f16 (the first update explodes and the model stops
+    /// learning), so f16 is rejected with a clear error. bf16 is also
     /// rejected by the WGPU backend. Records are always stored as f32.
     #[arg(long, default_value = "f32")]
     dtype: String,
@@ -378,14 +378,13 @@ struct GenerateArgs {
     /// Repetition penalty (1.6 prevents token loops in trained SLMs)
     #[arg(long, default_value_t = 1.6)]
     rep_penalty: f32,
-    /// Compute precision: f32 (default) or f16 (non-fused backend; faster on
-    /// supported GPUs, but half-precision logits can flip tokens on weakly
-    /// trained models)
+    /// Compute precision: f32 (default) or f16 (faster on supported GPUs, but
+    /// half-precision logits can flip tokens on weakly trained models)
     #[arg(long, default_value = "f32")]
     dtype: String,
-    /// KV cache precision: f32 (default), f16 (halves memory; automatically
-    /// uses the non-fused backend so the cast really stores f16) or the
-    /// quantized int8 / q4 formats (packed integers + per-block scales)
+    /// KV cache precision: f32 (default), f16 (halves memory; the backend must
+    /// report f16 support) or the quantized int8 / q4 formats (packed integers
+    /// + per-block scales)
     #[arg(long, default_value = "f32")]
     kv_cache_dtype: String,
     /// Maximum new tokens to generate
@@ -471,7 +470,7 @@ struct ImportHfArgs {
 }
 
 /// Load a checkpoint and run greedy/sampled generation on any backend, so the
-/// CLI can dispatch f32 (fused WGPU) and f16 (non-fused half) identically.
+/// CLI dispatches f32 and f16 compute identically.
 #[allow(clippy::too_many_arguments)]
 fn run_generate(
     model_config: &ModelConfig,

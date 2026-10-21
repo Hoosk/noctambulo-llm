@@ -407,18 +407,16 @@ pub fn generate_streaming(
     );
     tokens.push(sampled_token);
 
-    if let Some(chunk) = decode_stream.step(sampled_token)? {
-        if !on_token(&chunk) {
+    if let Some(chunk) = decode_stream.step(sampled_token)?
+        && !on_token(&chunk) {
             return tokenizer.decode(&tokens);
         }
-    }
 
-    if let Some(eos_id) = eos_token_id {
-        if sampled_token == eos_id {
+    if let Some(eos_id) = eos_token_id
+        && sampled_token == eos_id {
             let decoded_text = tokenizer.decode(&tokens)?;
             return Ok(decoded_text);
         }
-    }
 
     let gen_start = Instant::now();
 
@@ -464,17 +462,15 @@ pub fn generate_streaming(
         );
         tokens.push(sampled_token);
 
-        if let Some(chunk) = decode_stream.step(sampled_token)? {
-            if !on_token(&chunk) {
+        if let Some(chunk) = decode_stream.step(sampled_token)?
+            && !on_token(&chunk) {
                 break;
             }
-        }
 
-        if let Some(eos_id) = eos_token_id {
-            if sampled_token == eos_id && (tokens.len() - initial_prompt_len) >= 3 {
+        if let Some(eos_id) = eos_token_id
+            && sampled_token == eos_id && (tokens.len() - initial_prompt_len) >= 3 {
                 break;
             }
-        }
     }
 
     let elapsed = gen_start.elapsed().as_secs_f64();
@@ -482,8 +478,8 @@ pub fn generate_streaming(
     let speed = if elapsed > 0.0 { generated_count as f64 / elapsed } else { 0.0 };
 
     let decoded_text = tokenizer.decode(&tokens)?;
-    if let Some(opts) = &eviction {
-        if opts.spill || opts.grow_rows > 0 {
+    if let Some(opts) = &eviction
+        && (opts.spill || opts.grow_rows > 0) {
             let spilled: usize = caches.iter().map(|c| c.spilled_total).sum();
             let replayed: usize = caches.iter().map(|c| c.replayed_total).sum();
             let pending: usize = caches
@@ -507,7 +503,6 @@ pub fn generate_streaming(
                 capacity
             );
         }
-    }
     println!(
         "\n[Generation Complete: {} tokens generated in {:.2}s ({:.1} tokens/sec)]",
         generated_count, elapsed, speed
