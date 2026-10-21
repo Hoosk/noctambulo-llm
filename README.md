@@ -3,15 +3,15 @@
 **Train it overnight. Wake up to a model.**
 
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
-[![Burn](https://img.shields.io/badge/Burn-0.21-blue)](https://burn.dev/)
+[![Burn](https://img.shields.io/badge/Burn-0.22-blue)](https://burn.dev/)
 [![GPU](https://img.shields.io/badge/GPU-WGPU%20%7C%20CUDA-6f42c1)](https://wgpu.rs/)
-[![Tests](https://img.shields.io/badge/tests-109%20passing-brightgreen)](#verification)
+[![Tests](https://img.shields.io/badge/tests-113%20passing-brightgreen)](#verification)
 [![GGUF](https://img.shields.io/badge/export-GGUF%20v3-9cf)](doc/models/export.md)
 [![Web](https://img.shields.io/badge/console-React%2019%20%2B%20Axum-0ea5e9)](#web-console)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Noctámbulo (`noctambulo-llm`) is an end-to-end LLM engine written in **Rust** on top of
-**Burn 0.21** and **WGPU**: byte-level BPE tokenizer, dataset pipeline, training,
+**Burn 0.22** and **WGPU**: byte-level BPE tokenizer, dataset pipeline, training,
 evaluation, inference, GGUF import/export, third-party model conversion and a React web
 console. One CLI, one binary, no Python runtime.
 
@@ -98,7 +98,7 @@ Start it before bed. Check the loss curve over coffee.
 
 ## Quickstart
 
-Requirements: Rust 1.92+ (edition 2024), a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
+Requirements: Rust 1.95+ (edition 2024), a Vulkan/Metal/DX12 GPU (WGPU), and Node.js 20+ only for the web
 console.
 
 ```bash
@@ -127,7 +127,7 @@ cargo run --release -- stats
 cargo run --release -- export --model-name noctambulo
 ```
 
-The finished model lives in `model_output/` (`config.json`, `model_weights.bin`,
+The finished model lives in `model_output/` (`config.json`, `model_weights.bpk`,
 `custom_tokenizer.json`).
 
 ### Web console
@@ -161,7 +161,7 @@ limitations.
 ## Verification
 
 ```bash
-cargo test                  # 109 tests
+cargo test                  # 113 tests
 cargo clippy --all-targets  # clean
 cd web && npm run lint && npm run build
 ```
@@ -173,16 +173,16 @@ conversion roundtrip, API paths and web build.
 
 ### Measured on the development machine
 
-Internal smoke benchmarks — useful as a sanity check, not as marketing numbers:
+Internal smoke benchmarks on Burn 0.22 with fusion/autotune disabled (useful as a sanity check, not as marketing numbers):
 
 | Workload | Result |
 | --- | --- |
-| Tiny 2-layer model, dense decode | 73–78 tok/s |
-| Same model, H2O eviction (budget 64) | 65–68 tok/s (~10% overhead) |
+| Tiny 2-layer model, dense decode | ~69 tok/s |
+| Same model, H2O eviction (budget 64) | ~53 tok/s (~25% overhead) |
 | Same model, spill/replay with budget growth | 36–43 tok/s |
-| Qwen2.5-0.5B-Instruct, f32 on WGPU (integrated GPU) | ~1 tok/s |
-| Qwen2.5-0.5B safetensors → native conversion | ~2m45s (download + CPU convert) |
-| Compatible f16 GGUF import | 12–45s |
+| Qwen2.5-0.5B-Instruct, f32 on WGPU (Intel Arc, no fusion) | ~0.7 tok/s |
+| Qwen2.5-0.5B safetensors → native conversion | ~13s cached (~2m45s cold download) |
+| Compatible f16 GGUF import | ~15s |
 
 ## Project layout
 
@@ -212,7 +212,9 @@ doc/             architecture, training/, inference/, models/
 
 ## Known limits
 
-- Training and records are **f32 only** (Burn 0.21's f16 optimizer states underflow).
+- **Fusion/autotune disabled**: Burn 0.22's fusion graph cache returned wrong matmul results in this engine (reproduced against a manual reference; Flex and no-fusion WGPU are exact). `Cargo.toml` uses `default-features = false` to keep them off; re-enable once upstream fixes the fusion cache. `NOCTAMBULO_CPU=1` forces Flex for debugging.
+
+- Training and records are **f32 only** (the trainer rejects f16); f16 inference and f16/int8/q4 KV caches are supported.
 - GGUF import accepts f32/f16 tensors; quantized GGUF dequantization is on the roadmap.
 - QK-norm architectures (Qwen3) and SentencePiece tokenizers are not supported yet.
 - The CUDA backend is compile-checked; validate it on your NVIDIA host before relying on it.

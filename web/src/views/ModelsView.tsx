@@ -89,6 +89,7 @@ function ModelRow({
           <span className="font-mono text-sm text-white">{model.name}</span>
           {model.default ? <Badge tone="violet">default</Badge> : null}
           {model.import_source ? <Badge tone="sky">{model.import_source}</Badge> : null}
+          {model.legacy_weights ? <Badge tone="amber">legacy .bin</Badge> : null}
           {model.compatible ? null : <Badge tone="rose">incompatible</Badge>}
           {model.steps != null && model.steps <= 2 ? <Badge tone="amber">demo</Badge> : null}
           {isActive ? (
@@ -117,14 +118,19 @@ function ModelRow({
         </div>
       </div>
       <div className="flex gap-2 shrink-0 flex-wrap">
-        <Button variant="success" className="px-3 py-1.5 text-xs" disabled={isActive} onClick={onUse}>
+        <Button
+          variant="success"
+          className="px-3 py-1.5 text-xs"
+          disabled={isActive || !model.compatible}
+          onClick={onUse}
+        >
           {isActive ? "Active ✓" : "Use"}
         </Button>
         <Button
           variant="primary"
           icon={exporting ? "loader" : "upload"}
           className={`px-3 py-1.5 text-xs ${exporting ? "[&_svg]:animate-spin" : ""}`}
-          disabled={exporting}
+          disabled={exporting || !model.compatible}
           onClick={onExport}
         >
           {exporting ? "Exporting…" : "Export GGUF"}

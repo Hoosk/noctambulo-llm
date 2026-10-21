@@ -2,7 +2,7 @@
 
 Welcome to the official documentation of **Noctámbulo** (`noctambulo-llm`), a training and
 inference engine for Large Language Models (LLM) with a **Qwen-style** architecture written
-entirely in **Rust** and GPU-accelerated through **Burn 0.21** and **WGPU**.
+entirely in **Rust** and GPU-accelerated through **Burn 0.22** and **WGPU**.
 
 This documentation covers the architecture, the full CLI workflow, sampling and KV cache
 internals, tokenizer training, GGUF export/import and third-party model conversion.

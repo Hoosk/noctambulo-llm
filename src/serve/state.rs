@@ -216,11 +216,10 @@ impl ServerState {
             loss_points: self.loss_points_snapshot(),
             val_points: self.val_points_snapshot(),
         };
-        if let Ok(bytes) = serde_json::to_vec(&state) {
-            if std::fs::create_dir_all(".noctambulo").is_ok() && std::fs::write(STATE_TMP, bytes).is_ok() {
+        if let Ok(bytes) = serde_json::to_vec(&state)
+            && std::fs::create_dir_all(".noctambulo").is_ok() && std::fs::write(STATE_TMP, bytes).is_ok() {
                 let _ = std::fs::rename(STATE_TMP, STATE_FILE);
             }
-        }
     }
 
     /// Load `.noctambulo/state.json` if present. A restarted server is never running;

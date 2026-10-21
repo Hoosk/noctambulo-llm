@@ -68,8 +68,8 @@ impl EvictionOptions {
 /// Advances the budget-growth schedule: adds `grow_rows` rows to every cache
 /// budget each `grow_interval` processed tokens (spill replay fills the slots).
 /// Returns the number of replayed rows.
-fn advance_growth<B: Backend>(
-    caches: &mut [KvCache<B>],
+fn advance_growth(
+    caches: &mut [KvCache],
     grow_rows: usize,
     grow_interval: usize,
     since_growth: &mut usize,
@@ -97,8 +97,7 @@ fn advance_growth<B: Backend>(
     }
     replayed
 }
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{Int, Tensor, TensorData, Device};
 use std::time::Instant;
 
 pub struct XorshiftRng {
@@ -249,8 +248,8 @@ fn sample_logits(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn generate<B: Backend>(
-    model: &Llm<B>,
+pub fn generate(
+    model: &Llm,
     tokenizer: &LlmTokenizer,
     prompt: &str,
     max_new_tokens: usize,
@@ -262,7 +261,7 @@ pub fn generate<B: Backend>(
     seed: u64,
     cache_dtype: KvCacheDtype,
     eviction: Option<EvictionOptions>,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     generate_streaming(
         model, tokenizer, prompt, max_new_tokens, temperature, top_k, top_p, min_p,
@@ -274,8 +273,8 @@ pub fn generate<B: Backend>(
 /// as soon as it is available. Returning `false` from the callback stops the
 /// generation (used by the SSE endpoint when the client disconnects).
 #[allow(clippy::too_many_arguments)]
-pub fn generate_streaming<B: Backend>(
-    model: &Llm<B>,
+pub fn generate_streaming(
+    model: &Llm,
     tokenizer: &LlmTokenizer,
     prompt: &str,
     max_new_tokens: usize,
@@ -287,7 +286,7 @@ pub fn generate_streaming<B: Backend>(
     seed: u64,
     cache_dtype: KvCacheDtype,
     eviction: Option<EvictionOptions>,
-    device: &B::Device,
+    device: &Device,
     mut on_token: impl FnMut(&str) -> bool,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = XorshiftRng::new(seed);
@@ -320,7 +319,7 @@ pub fn generate_streaming<B: Backend>(
     let eos_token_id = tokenizer.end_of_text_id();
     let mut decode_stream = tokenizer.decode_stream(true);
 
-    let mut caches: Vec<KvCache<B>> = model.new_kv_caches(capacity, cache_dtype, device);
+    let mut caches: Vec<KvCache> = model.new_kv_caches(capacity, cache_dtype, device);
     let mut since_growth = 0usize;
     if let Some(opts) = &eviction {
         let geo = opts.geometry;
@@ -353,7 +352,7 @@ pub fn generate_streaming<B: Backend>(
     // always available and no slot is written twice in one call.
     let prompt_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let prompt_len = prompt_i32.len();
-    let mut last_logits: Option<Tensor<B, 3>> = None;
+    let mut last_logits: Option<Tensor<3>> = None;
     let mut pos = 0;
     while pos < prompt_len {
         let step = if caches[0].eviction_enabled() {
@@ -373,7 +372,7 @@ pub fn generate_streaming<B: Backend>(
         let chunk = (prompt_len - pos).min(step);
         let chunk_data = prompt_i32[pos..(pos + chunk)].to_vec();
         let input =
-            Tensor::<B, 2, Int>::from_data(TensorData::new(chunk_data, [1, chunk]), device);
+            Tensor::<2, Int>::from_data(TensorData::new(chunk_data, [1, chunk]), device);
         let logits = model.forward_with_cache(input, pos, &mut caches);
         if let Some(opts) = &eviction {
             advance_growth(
@@ -393,7 +392,7 @@ pub fn generate_streaming<B: Backend>(
     let mut logits_vec: Vec<f32> = last_logits
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .map_err(|e| format!("Failed to convert tensor data: {:?}", e))?;
 
     let sampled_token = sample_logits(
@@ -408,18 +407,16 @@ pub fn generate_streaming<B: Backend>(
     );
     tokens.push(sampled_token);
 
-    if let Some(chunk) = decode_stream.step(sampled_token)? {
-        if !on_token(&chunk) {
+    if let Some(chunk) = decode_stream.step(sampled_token)?
+        && !on_token(&chunk) {
             return tokenizer.decode(&tokens);
         }
-    }
 
-    if let Some(eos_id) = eos_token_id {
-        if sampled_token == eos_id {
+    if let Some(eos_id) = eos_token_id
+        && sampled_token == eos_id {
             let decoded_text = tokenizer.decode(&tokens)?;
             return Ok(decoded_text);
         }
-    }
 
     let gen_start = Instant::now();
 
@@ -434,7 +431,7 @@ pub fn generate_streaming<B: Backend>(
         }
 
         let input_data = TensorData::new(vec![last_token], [1, 1]);
-        let input = Tensor::<B, 2, Int>::from_data(input_data, device);
+        let input = Tensor::<2, Int>::from_data(input_data, device);
 
         let logits = model.forward_with_cache(input, start_pos, &mut caches);
         if let Some(opts) = &eviction {
@@ -450,7 +447,7 @@ pub fn generate_streaming<B: Backend>(
         let mut logits_vec: Vec<f32> = last_logits
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .map_err(|e| format!("Failed to convert tensor data: {:?}", e))?;
 
         let sampled_token = sample_logits(
@@ -465,17 +462,15 @@ pub fn generate_streaming<B: Backend>(
         );
         tokens.push(sampled_token);
 
-        if let Some(chunk) = decode_stream.step(sampled_token)? {
-            if !on_token(&chunk) {
+        if let Some(chunk) = decode_stream.step(sampled_token)?
+            && !on_token(&chunk) {
                 break;
             }
-        }
 
-        if let Some(eos_id) = eos_token_id {
-            if sampled_token == eos_id && (tokens.len() - initial_prompt_len) >= 3 {
+        if let Some(eos_id) = eos_token_id
+            && sampled_token == eos_id && (tokens.len() - initial_prompt_len) >= 3 {
                 break;
             }
-        }
     }
 
     let elapsed = gen_start.elapsed().as_secs_f64();
@@ -483,8 +478,8 @@ pub fn generate_streaming<B: Backend>(
     let speed = if elapsed > 0.0 { generated_count as f64 / elapsed } else { 0.0 };
 
     let decoded_text = tokenizer.decode(&tokens)?;
-    if let Some(opts) = &eviction {
-        if opts.spill || opts.grow_rows > 0 {
+    if let Some(opts) = &eviction
+        && (opts.spill || opts.grow_rows > 0) {
             let spilled: usize = caches.iter().map(|c| c.spilled_total).sum();
             let replayed: usize = caches.iter().map(|c| c.replayed_total).sum();
             let pending: usize = caches
@@ -508,7 +503,6 @@ pub fn generate_streaming<B: Backend>(
                 capacity
             );
         }
-    }
     println!(
         "\n[Generation Complete: {} tokens generated in {:.2}s ({:.1} tokens/sec)]",
         generated_count, elapsed, speed

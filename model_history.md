@@ -1,6 +1,6 @@
 # 📖 History and Development Tutorial: Noctámbulo (noctambulo-llm)
 
-This document objectively records the technical evolution of **Noctámbulo**, from a basic toy model to a state-of-the-art (2026 standard) training and inference engine written entirely in **Rust**, GPU-accelerated with **Burn 0.21** and **WGPU**, and exportable to the native binary format **GGUF v3**.
+This document objectively records the technical evolution of **Noctámbulo**, from a basic toy model to a state-of-the-art (2026 standard) training and inference engine written entirely in **Rust**, GPU-accelerated with **Burn 0.22** and **WGPU**, and exportable to the native binary format **GGUF v3**.
 
 ---
 
