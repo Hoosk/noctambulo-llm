@@ -1,6 +1,6 @@
 //! Convert a Hugging Face model (`config.json` + `tokenizer.json` +
 //! `model.safetensors`) into the native format (`config.json` +
-//! `model_weights.bin` + `custom_tokenizer.json`).
+//! `model_weights.bpk` + `custom_tokenizer.json`).
 //!
 //! Supported families: Llama / Qwen2 / Mistral style decoder-only models with
 //! SwiGLU, RMSNorm, GQA, tied word embeddings and a byte-level BPE tokenizer.
@@ -17,14 +17,13 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use burn::module::Module;
-use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
-use burn::tensor::backend::Backend;
+use burn::tensor::Device;
 use serde::Deserialize;
 
 use crate::config::{ModelConfig, RopeScalingKind};
 use crate::export::transpose_2d;
 use crate::import::{param1, param2};
+use crate::storage;
 use crate::model::Llm;
 
 /// Where the Hugging Face model comes from: a Hub repo id or a local directory
@@ -334,14 +333,14 @@ fn shards_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// Converts a Hugging Face model into the native format. Refuses to overwrite
 /// an existing model unless `force` is set.
-pub fn import_hf<B: Backend>(
+pub fn import_hf(
     source: &HfSource,
     output_dir: &Path,
     force: bool,
-    device: &B::Device,
+    device: &Device,
     progress: &mut dyn FnMut(&str, u64, u64, &str),
 ) -> Result<ModelConfig, String> {
-    let weights_path = output_dir.join("model_weights.bin");
+    let weights_path = storage::model_weights_path(output_dir);
     if weights_path.exists() && !force {
         return Err(format!(
             "'{}' already contains a model (pass --force to overwrite)",
@@ -457,7 +456,7 @@ pub fn import_hf<B: Backend>(
         output_dir.display()
     );
 
-    let mut model: Llm<B> = config.init_model(device);
+    let mut model: Llm = config.init_model(device);
     model.embed_tokens.weight = param2(embed, [vocab_size, hf.hidden_size], device);
 
     let norm = shards.read_f32("model.norm.weight")?;
@@ -566,10 +565,7 @@ pub fn import_hf<B: Backend>(
     .map_err(|e| format!("failed to write config.json: {e}"))?;
 
     progress("writing weights", 0, 1, "step");
-    let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-    recorder
-        .record(model.into_record(), output_dir.join("model_weights"))
-        .map_err(|e| format!("failed to write model_weights.bin: {e:?}"))?;
+    storage::save_module(&model, &storage::model_weights_path(output_dir))?;
 
     let tokenizer_out = output_dir.join("custom_tokenizer.json");
     std::fs::copy(&files.tokenizer, &tokenizer_out)
@@ -578,7 +574,7 @@ pub fn import_hf<B: Backend>(
         .map_err(|e| format!("converted tokenizer is invalid: {e}"))?;
 
     println!(
-        "Converted '{}' -> '{}' (config.json, model_weights.bin, custom_tokenizer.json)",
+        "Converted '{}' -> '{}' (config.json, model_weights.bpk, custom_tokenizer.json)",
         source.label(),
         output_dir.display()
     );
@@ -588,9 +584,7 @@ pub fn import_hf<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn_ndarray::{NdArray, NdArrayDevice};
-
-    type TestBackend = NdArray<f32, i32>;
+    
 
     /// Writes a minimal F32 safetensors file (test helper).
     fn write_safetensors(path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) {
@@ -675,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_import_hf_roundtrip_matches_native_forward() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = std::env::temp_dir().join(format!("noctambulo_hf_{}", std::process::id()));
         let src = dir.join("src");
         let out = dir.join("out");
@@ -688,10 +682,10 @@ mod tests {
         config.ffn_hidden = Some(48);
         config.rms_norm_eps = 1e-5;
         config.rope_base = 500000.0;
-        let model: Llm<TestBackend> = config.init_model(&device);
+        let model: Llm = config.init_model(&device);
 
-        let flat = |t: burn::tensor::Tensor<TestBackend, 2>| {
-            t.into_data().to_vec::<f32>().unwrap()
+        let flat = |t: burn::tensor::Tensor<2>| {
+            t.into_data().try_to_vec::<f32>().unwrap()
         };
         let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
         tensors.push((
@@ -700,7 +694,7 @@ mod tests {
             flat(model.embed_tokens.weight.val()),
         ));
         tensors.push(("model.norm.weight".into(), vec![32], {
-            model.norm.weight.val().into_data().to_vec::<f32>().unwrap()
+            model.norm.weight.val().into_data().try_to_vec::<f32>().unwrap()
         }));
         for (i, block) in model.blocks.iter().enumerate() {
             let prefix = format!("model.layers.{i}");
@@ -713,7 +707,7 @@ mod tests {
             tensors.push((
                 format!("{prefix}.self_attn.q_proj.bias"),
                 vec![32],
-                block.attn.q_proj.bias.as_ref().unwrap().val().into_data().to_vec::<f32>().unwrap(),
+                block.attn.q_proj.bias.as_ref().unwrap().val().into_data().try_to_vec::<f32>().unwrap(),
             ));
             let kv = &model.kv[i];
             let k = flat(kv.k_proj.weight.val());
@@ -725,7 +719,7 @@ mod tests {
             tensors.push((
                 format!("{prefix}.self_attn.k_proj.bias"),
                 vec![16],
-                kv.k_proj.bias.as_ref().unwrap().val().into_data().to_vec::<f32>().unwrap(),
+                kv.k_proj.bias.as_ref().unwrap().val().into_data().try_to_vec::<f32>().unwrap(),
             ));
             let v = flat(kv.v_proj.weight.val());
             tensors.push((
@@ -736,7 +730,7 @@ mod tests {
             tensors.push((
                 format!("{prefix}.self_attn.v_proj.bias"),
                 vec![16],
-                kv.v_proj.bias.as_ref().unwrap().val().into_data().to_vec::<f32>().unwrap(),
+                kv.v_proj.bias.as_ref().unwrap().val().into_data().try_to_vec::<f32>().unwrap(),
             ));
             let o = flat(block.attn.out_proj.weight.val());
             tensors.push((
@@ -765,7 +759,7 @@ mod tests {
             tensors.push((
                 format!("{prefix}.input_layernorm.weight"),
                 vec![32],
-                block.input_layernorm.weight.val().into_data().to_vec::<f32>().unwrap(),
+                block.input_layernorm.weight.val().into_data().try_to_vec::<f32>().unwrap(),
             ));
             tensors.push((
                 format!("{prefix}.post_attention_layernorm.weight"),
@@ -775,7 +769,7 @@ mod tests {
                     .weight
                     .val()
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .unwrap(),
             ));
         }
@@ -804,29 +798,28 @@ mod tests {
 
         let mut noop = |_: &str, _: u64, _: u64, _: &str| {};
         let imported_config =
-            import_hf::<TestBackend>(&HfSource::Dir(src), &out, true, &device, &mut noop).unwrap();
+            import_hf(&HfSource::Dir(src), &out, true, &device, &mut noop).unwrap();
         assert_eq!(imported_config.ffn_hidden, Some(48));
         assert_eq!(imported_config.rope_base, 500000.0);
         assert_eq!(imported_config.rms_norm_eps, 1e-5);
         assert_eq!(imported_config.import_source.as_deref(), Some("hf"));
 
-        let recorder = BinFileRecorder::<FullPrecisionSettings>::new();
-        let record = recorder
-            .load(out.join("model_weights"), &device)
-            .unwrap();
-        let imported: Llm<TestBackend> =
-            imported_config.init_model(&device).load_record(record);
+        let imported: Llm = storage::load_module(
+            imported_config.init_model(&device),
+            &storage::model_weights_path(&out),
+        )
+        .unwrap();
 
-        let input = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Int>::from_data(
+        let input = burn::tensor::Tensor::<2, burn::tensor::Int>::from_data(
             burn::tensor::TensorData::new(vec![1, 2, 3, 4, 5, 6], [1, 6]),
             &device,
         );
         let expected = model
             .forward(input.clone())
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
-        let got = imported.forward(input).into_data().to_vec::<f32>().unwrap();
+        let got = imported.forward(input).into_data().try_to_vec::<f32>().unwrap();
         let diff = expected
             .iter()
             .zip(got.iter())
@@ -841,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_import_hf_rejects_untied_and_qknorm() {
-        let device = NdArrayDevice::Cpu;
+        let device = Device::flex();
         let dir = std::env::temp_dir().join(format!("noctambulo_hf_bad_{}", std::process::id()));
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -870,14 +863,14 @@ mod tests {
         let mut untied = base.clone();
         untied["tie_word_embeddings"] = serde_json::json!(false);
         std::fs::write(src.join("config.json"), untied.to_string()).unwrap();
-        let err = import_hf::<TestBackend>(&HfSource::Dir(src.clone()), &dir.join("o1"), true, &device, &mut noop)
+        let err = import_hf(&HfSource::Dir(src.clone()), &dir.join("o1"), true, &device, &mut noop)
             .unwrap_err();
         assert!(err.contains("untied"), "{err}");
 
         let mut qwen3 = base.clone();
         qwen3["architectures"] = serde_json::json!(["Qwen3ForCausalLM"]);
         std::fs::write(src.join("config.json"), qwen3.to_string()).unwrap();
-        let err = import_hf::<TestBackend>(&HfSource::Dir(src.clone()), &dir.join("o2"), true, &device, &mut noop)
+        let err = import_hf(&HfSource::Dir(src.clone()), &dir.join("o2"), true, &device, &mut noop)
             .unwrap_err();
         assert!(err.contains("unsupported architecture"), "{err}");
 
@@ -893,7 +886,7 @@ mod tests {
             vec![0.0; 8],
         ));
         write_safetensors(&src.join("model.safetensors"), &tensors);
-        let err = import_hf::<TestBackend>(&HfSource::Dir(src), &dir.join("o3"), true, &device, &mut noop)
+        let err = import_hf(&HfSource::Dir(src), &dir.join("o3"), true, &device, &mut noop)
             .unwrap_err();
         assert!(err.contains("QK-norm"), "{err}");
 

@@ -1,49 +1,37 @@
-//! Backend selection.
+//! Backend and device selection.
 //!
-//! Default builds run on WGPU with a non-fused half-precision variant (see
-//! below). Building with `--features cuda` swaps the CLI backend to CUDA while
-//! the web server keeps using WGPU for adapter enumeration.
+//! Burn 0.22 dispatches tensor operations at runtime, so the engine is no
+//! longer generic over a backend: there is a single [`Device`] type and the
+//! enabled Cargo features (`wgpu`, `flex`, `cuda`) select the available
+//! backends.
 
-use burn::backend::wgpu::{CubeBackend, WgpuRuntime};
+use burn::tensor::{Device, DeviceKind};
 
-/// Non-fused WGPU backend generic over the float element type.
-///
-/// burn-fusion 0.21 panics on bf16 streams ("Ordering is bigger than
-/// operations") on at least the Vulkan/Intel stack, and f16 shares the same
-/// code path. Using the plain `CubeBackend` for half dtypes keeps `--dtype
-/// f16/bf16` usable at a small performance cost; f32 keeps the fused `Wgpu`.
-pub type WgpuHalf<F> = CubeBackend<WgpuRuntime, F, i32, u32>;
-
-/// Default compute backend for the CLI: WGPU, or CUDA with the `cuda` feature.
+/// Default compute device for the CLI: CUDA with the `cuda` feature, else WGPU.
 #[cfg(feature = "cuda")]
-pub type MainBackend = burn::backend::Cuda;
-#[cfg(not(feature = "cuda"))]
-pub type MainBackend = burn::backend::Wgpu;
-
-/// Half-precision variant used by `--dtype f16`.
-#[cfg(feature = "cuda")]
-pub type MainHalf = burn::backend::Cuda<burn::tensor::f16>;
-#[cfg(not(feature = "cuda"))]
-pub type MainHalf = WgpuHalf<burn::tensor::f16>;
-
-/// Device type matching [`MainBackend`].
-#[cfg(feature = "cuda")]
-pub type MainDevice = burn::backend::cuda::CudaDevice;
-#[cfg(not(feature = "cuda"))]
-pub type MainDevice = burn::backend::wgpu::WgpuDevice;
-
-/// Default device for the active backend.
-pub fn default_device() -> MainDevice {
-    MainDevice::default()
+pub fn default_device() -> Device {
+    Device::cuda(0)
 }
 
-/// CPU-only backend used by the model converters: building a record needs no
-/// GPU and this keeps large conversions off the VRAM.
-pub type CpuBackend = burn_ndarray::NdArray<f32, i32>;
+/// Default compute device for the CLI: CUDA with the `cuda` feature, else WGPU.
+#[cfg(not(feature = "cuda"))]
+pub fn default_device() -> Device {
+    // Debug escape hatch: force the pure-Rust CPU backend to isolate GPU
+    // kernel issues (`NOCTAMBULO_CPU=1`).
+    if std::env::var_os("NOCTAMBULO_CPU").is_some() {
+        return Device::flex();
+    }
+    Device::wgpu(DeviceKind::DefaultDevice)
+}
 
-/// CPU device for [`CpuBackend`].
-pub fn cpu_device() -> burn_ndarray::NdArrayDevice {
-    burn_ndarray::NdArrayDevice::Cpu
+/// Default device with autodiff enabled (training).
+pub fn training_device() -> Device {
+    default_device().autodiff()
+}
+
+/// CPU-only device: deterministic tests and GPU-free model conversion.
+pub fn cpu_device() -> Device {
+    Device::flex()
 }
 
 /// Human-readable backend name for logs.
@@ -53,4 +41,32 @@ pub fn backend_label() -> &'static str {
     } else {
         "WGPU"
     }
+}
+
+/// Map the web UI device selectors (`DiscreteGpu(0)`, `Cpu`, ...) to a WGPU
+/// [`Device`]. Unknown selectors fall back to the default device so a stale
+/// frontend can never crash the worker.
+pub fn wgpu_device_from_selector(selector: &str) -> Device {
+    let s = selector.trim();
+    let kind = if s.eq_ignore_ascii_case("cpu") {
+        DeviceKind::Cpu
+    } else if let Some(rest) = s.strip_prefix("DiscreteGpu(") {
+        rest.trim_end_matches(')')
+            .parse()
+            .map(DeviceKind::DiscreteGpu)
+            .unwrap_or_default()
+    } else if let Some(rest) = s.strip_prefix("IntegratedGpu(") {
+        rest.trim_end_matches(')')
+            .parse()
+            .map(DeviceKind::IntegratedGpu)
+            .unwrap_or_default()
+    } else if let Some(rest) = s.strip_prefix("VirtualGpu(") {
+        rest.trim_end_matches(')')
+            .parse()
+            .map(DeviceKind::VirtualGpu)
+            .unwrap_or_default()
+    } else {
+        DeviceKind::DefaultDevice
+    };
+    Device::wgpu(kind)
 }

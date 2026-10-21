@@ -2,7 +2,7 @@
 
 > Part of the [Noctámbulo documentation](../README.md) · Training.
 
-The `train` subcommand is the core of the **Noctámbulo** engine. It allows training from scratch an autoregressive Causal Transformer language model (Qwen2.5 / Qwen3 architecture) fully accelerated by GPU through the **WGPU** backend of the **Burn 0.21** framework.
+The `train` subcommand is the core of the **Noctámbulo** engine. It allows training from scratch an autoregressive Causal Transformer language model (Qwen2.5 / Qwen3 architecture) fully accelerated by GPU through the **WGPU** backend of the **Burn 0.22** framework.
 
 During training, Noctámbulo processes datasets in plain text format (coming from the **Hugging Face Hub** or a local file), encodes the text with the BPE tokenizer in parallel streaming (*streaming*), builds sliding windows of context sequences (`n-ctx`) and runs the AdamW optimization loop on the GPU.
 
@@ -18,7 +18,7 @@ The `train` subcommand accepts **23 CLI** configuration parameters:
 | `--file <path>` | `Option<String>` | `None` | Path to a local text file on the filesystem to use as the training corpus. |
 | `--dataset-file <filename>` | `String` | `TinyStories-train.txt` | Name of the target file to download and inspect inside the Hugging Face repository. |
 | `--preset <name>` | `Option<String>` | `None` | Architecture preset (`nano`, `tiny`, `small`, `base`); explicit dimension flags take precedence. |
-| `--dtype <name>` | `String` | `f32` | Compute precision. Only `f32` is trainable: Burn 0.21's AdamW moment estimates underflow in f16 (the first update explodes), so `f16` is rejected with a clear error. `bf16` is also rejected because WGSL does not support it. Checkpoints are saved in f32. |
+| `--dtype <name>` | `String` | `f32` | Compute precision. Only `f32` is trainable in this engine: the trainer rejects `f16` (its optimizer path is f32-only) and `bf16` is rejected because WGSL does not support it. Checkpoints are saved in f32. |
 | `--batch-size <n>` | `usize` | `128` | Number of sequences per training batch (*batch*). A larger size makes better use of the GPU and accelerates convergence, but requires more VRAM. |
 | `--epochs <n>` | `usize` | `3` | Number of complete passes through the processed dataset. |
 | `--max-tokens <n>` | `usize` | `100000000` (100M) | Maximum number of tokens to load from the dataset. A value of `0` disables the limit and loads the full dataset. The reference Chinchilla budget is ~20 tokens per parameter. |
@@ -37,7 +37,7 @@ The `train` subcommand accepts **23 CLI** configuration parameters:
 | `--mla-latent-dim <n>` | `usize` | `0` | Multi-head Latent Attention (`0` = disabled): K/V are compressed through an `n`-wide latent (`kv_down`), and `k_up`/`v_up` expand it back. The cache stores only the latent, so memory per token is `n` floats per group instead of `2·n_kv_head·head_dim`. This variant applies RoPE after expansion (no decoupled RoPE), so the folded weights `kv_down · k_up` are an exact standard K/V projection and GGUF export needs no approximation. |
 | `--val-split <float>` | `f32` | `0.1` | Fraction of the corpus reserved for validation (computation of Loss and Perplexity per epoch). `0.0` disables validation. |
 | `--grad-accum <n>` | `usize` | `1` | Gradient accumulation steps per AdamW update. The accumulated gradient is the **mean** of the micro-batches (equivalent to a larger batch). |
-| `--save-dir <path>` | `Option<String>` | `None` | Directory where `checkpoint_epoch_N.bin` and `checkpoint_best.bin` are saved at the end of each epoch. |
+| `--save-dir <path>` | `Option<String>` | `None` | Directory where `checkpoint_epoch_N.bpk` and `checkpoint_best.bpk` are saved at the end of each epoch. |
 | `--resume <path>` | `Option<String>` | `None` | Checkpoint `.bin` (or its directory) from which to resume. Restores weights, AdamW moments, schedule position and shuffler state. `--epochs` then means **additional epochs**. |
 | `--seq-warmup-steps <n>` | `usize` | `0` | Initial *Progressive Sequence Scaling* steps: the context grows from `n_ctx/4` to `n_ctx` during warmup. `0` disables it. |
 | `--early-stop-patience <n>` | `usize` | `0` | Stops training after `n` consecutive epochs without improving `val_loss`. `0` disables it. |
@@ -124,7 +124,7 @@ This guarantees that accumulating $N$ micro-batches of size $B$ is **mathematica
 At the end of each epoch (and when training is stopped) Noctámbulo saves, alongside the weights:
 
 - `train_state.json`: `global_step`, `total_steps`, `epochs_done`, `best_val_loss` and the internal shuffler state.
-- `optimizer_state.bin`: the AdamW record (first- and second-order moments) serialized with `Optimizer::to_record`.
+- `optimizer_state.bpk`: the AdamW state (per-parameter moments) saved as a burnpack record by `ModuleOptimizer`.
 
 When resuming with `--resume <checkpoint>`, the weights **and** both sidecars are restored, so the cosine schedule continues from the saved step, the AdamW moments are not lost and the sequence order continues where it left off. `--epochs` in a resume indicates **additional** epochs.
 
@@ -132,7 +132,7 @@ If `train_state.json` does not exist (older checkpoints), the resume is backward
 
 ### 8. Safe Stop (Stop / Ctrl+C)
 
-Stopping a training run from the web server or with `Ctrl+C` (CLI) does not discard the work: before exiting, `checkpoint_interrupted.bin` is saved together with `train_state.json` and `optimizer_state.bin`, and the `Checkpoint` event is emitted with `kind = "interrupted"`. The web server also uses `with_graceful_shutdown` and waits up to 30 seconds for the worker to finish persisting.
+Stopping a training run from the web server or with `Ctrl+C` (CLI) does not discard the work: before exiting, `checkpoint_interrupted.bpk` is saved together with `train_state.json` and `optimizer_state.bpk`, and the `Checkpoint` event is emitted with `kind = "interrupted"`. The web server also uses `with_graceful_shutdown` and waits up to 30 seconds for the worker to finish persisting.
 
 ### 9. Token Budget and Early Stopping
 

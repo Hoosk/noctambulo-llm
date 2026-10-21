@@ -11,7 +11,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Noctámbulo (`noctambulo-llm`) is an end-to-end LLM engine written in **Rust** on top of
-**Burn 0.21** and **WGPU**: byte-level BPE tokenizer, dataset pipeline, training,
+**Burn 0.22** and **WGPU**: byte-level BPE tokenizer, dataset pipeline, training,
 evaluation, inference, GGUF import/export, third-party model conversion and a React web
 console. One CLI, one binary, no Python runtime.
 
@@ -127,7 +127,7 @@ cargo run --release -- stats
 cargo run --release -- export --model-name noctambulo
 ```
 
-The finished model lives in `model_output/` (`config.json`, `model_weights.bin`,
+The finished model lives in `model_output/` (`config.json`, `model_weights.bpk`,
 `custom_tokenizer.json`).
 
 ### Web console
@@ -161,7 +161,7 @@ limitations.
 ## Verification
 
 ```bash
-cargo test                  # 109 tests
+cargo test                  # 108 tests
 cargo clippy --all-targets  # clean
 cd web && npm run lint && npm run build
 ```
@@ -173,7 +173,7 @@ conversion roundtrip, API paths and web build.
 
 ### Measured on the development machine
 
-Internal smoke benchmarks — useful as a sanity check, not as marketing numbers:
+Internal smoke benchmarks from the Burn 0.21 baseline (useful as a sanity check, not as marketing numbers; re-run after the 0.22 migration):
 
 | Workload | Result |
 | --- | --- |
@@ -212,7 +212,9 @@ doc/             architecture, training/, inference/, models/
 
 ## Known limits
 
-- Training and records are **f32 only** (Burn 0.21's f16 optimizer states underflow).
+- **Burn 0.22 WGPU (branch)**: on Intel Arc the upstream matmul kernels return wrong values; use `NOCTAMBULO_CPU=1` (Flex, slow) until the upstream fix. The supported master branch stays on Burn 0.21.
+
+- Training and records are **f32 only** (the trainer rejects f16); f16 inference and f16/int8/q4 KV caches are supported.
 - GGUF import accepts f32/f16 tensors; quantized GGUF dequantization is on the roadmap.
 - QK-norm architectures (Qwen3) and SentencePiece tokenizers are not supported yet.
 - The CUDA backend is compile-checked; validate it on your NVIDIA host before relying on it.
