@@ -1,6 +1,6 @@
 # 🗺️ Noctámbulo Roadmap
 
-Last updated: 2026-10-15 (Third-party model support landed: HF safetensors converter, relaxed GGUF import with the non-square layout fix, fine-tuning from a model directory, and the web/API surface; quantized GGUF dequantization remains as backlog).
+Last updated: 2026-10-21 (Burn 0.22 / wgpu 30 migration implemented but blocked by an upstream WGPU matmul correctness bug on Intel Arc; Burn 0.21 remains the supported engine until it is fixed).
 
 ## Current Status
 
@@ -77,7 +77,8 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 ## Dependency Upgrades
 
 - ✅ **Rust edition 2024** (MSRV 1.92), `axum 0.8` / `tower 0.5` / `tower-http 0.7` (new `{param}` route syntax), `arrow`/`parquet` 60, and compatible patch/minor updates. Verified by the full suite (109 tests) and `cargo clippy --all-targets`.
-- ⏳ **Burn 0.22 / wgpu 30 migration**: Burn 0.22 replaced backend-generic modules with runtime-dispatched tensors (`Tensor<D>`), removed the bincode record system in favor of `burn-store` (burnpack/SafeTensors) and changed optimizer persistence (`ModuleOptimizer`). This is a port of the engine, not a version bump; it also changes the on-disk checkpoint format (`model_weights.bin` → `.bpk`). Schedule it as its own migration with the test suite as the safety net, and plan a checkpoint re-import/retrain path.
+- ✅ **Rust edition 2024** (MSRV 1.87), `axum 0.8` / `tower 0.5` / `tower-http 0.7` (new `{param}` route syntax), `arrow`/`parquet` 60, and compatible patch/minor updates. Verified by the full suite and `cargo clippy --all-targets`.
+- ⏳ **Burn 0.22 / wgpu 30 migration (blocked upstream)**: the engine now uses runtime-dispatched tensors (`Tensor<D>`), backend-agnostic modules and a single `Device` (WGPU, CUDA, Flex) instead of the old backend-generic types. Storage moved from `BinFileRecorder` to `burn-store` (`model_weights.bpk`, `optimizer_state.bpk`, `checkpoint_*.bpk`) and training uses `ModuleOptimizer` with per-parameter state. The CPU conversion backend is `Device::flex()` (burn-ndarray is deprecated in 0.22). **Breaking:** Burn 0.21 `.bin` checkpoints cannot be loaded; the web UI marks them as `legacy .bin` and they must be re-imported (GGUF/HF) or retrained. The port is functionally complete (108 tests green, clippy clean) and works end-to-end on the Flex CPU backend, including GGUF/HF imports; however Burn 0.22's WGPU matmul returns wrong values on Intel Arc (reproduced with cross-backend parity tests: batched/2D matmul shapes diverge by up to 0.87 while Flex is correct, and Burn 0.21 was correct). The cross-backend parity tests are `#[ignore]`d until the upstream fix. `NOCTAMBULO_CPU=1` forces Flex as a temporary workaround.
 
 ## Suggested Order
 

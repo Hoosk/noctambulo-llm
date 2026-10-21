@@ -37,7 +37,7 @@ cargo run --release -- import model.gguf --output-dir my-model --tokenizer token
 | Embeddings | tied only (`tie_word_embeddings`) | tied only |
 | QK-norm (Qwen3), SentencePiece, untied `lm_head`, GPTQ/AWQ | rejected with a clear error | rejected |
 
-The converted model is written as `config.json` + `model_weights.bin` +
+The converted model is written as `config.json` + `model_weights.bpk` +
 `custom_tokenizer.json`, tagged with `import_source` (`hf` / `gguf`) and architecture
 version 5, and can be used by `generate`, `eval`, `export` and `train`.
 

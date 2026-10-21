@@ -31,16 +31,25 @@ pub(super) struct ModelInfo {
     default: bool,
     arch_version: u32,
     compatible: bool,
+    /// True for Burn 0.21 `.bin` checkpoints, which this build cannot load.
+    legacy_weights: bool,
     steps: Option<u64>,
     best_val_loss: Option<f64>,
 }
 
 fn model_meta(dir: &Path) -> Option<ModelInfo> {
     let config_path = dir.join("config.json");
-    let weights_path = dir.join("model_weights.bin");
-    if !config_path.is_file() || !weights_path.is_file() {
+    let weights_path = crate::storage::model_weights_path(dir);
+    let legacy_weights = !weights_path.is_file()
+        && crate::storage::legacy_weights_path(dir).is_some();
+    if !config_path.is_file() || (!weights_path.is_file() && !legacy_weights) {
         return None;
     }
+    let weights_path = if weights_path.is_file() {
+        weights_path
+    } else {
+        crate::storage::legacy_weights_path(dir).unwrap()
+    };
     let cfg: crate::config::ModelConfig =
         serde_json::from_str(&std::fs::read_to_string(config_path).ok()?).ok()?;
     let size_mb = weights_path.metadata().ok()?.len() as f64 / (1024.0 * 1024.0);
@@ -73,7 +82,8 @@ fn model_meta(dir: &Path) -> Option<ModelInfo> {
         size_mb,
         default: dir.file_name().unwrap_or_default() == "model_output",
         arch_version: cfg.arch_version,
-        compatible: cfg.is_compatible(),
+        compatible: cfg.is_compatible() && !legacy_weights,
+        legacy_weights,
         steps,
         best_val_loss,
     })
@@ -131,7 +141,7 @@ pub(super) async fn checkpoints(
                 continue;
             }
             let ext = p.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if ext != "bin" {
+            if ext != "bpk" {
                 continue;
             }
             let meta = match p.metadata() {
@@ -196,8 +206,13 @@ fn file_info(path: &Path, shared: bool) -> Option<ModelFileInfo> {
 /// A model must at least carry weights and config, otherwise it is just a
 /// random directory and must not expose files (or be deleted by accident).
 fn ensure_model_dir(dir: &Path) -> Result<(), ApiError> {
-    if !dir.join("config.json").is_file() || !dir.join("model_weights.bin").is_file() {
-        return Err(ApiError::not_found("not a model directory (config.json + model_weights.bin required)"));
+    if !dir.join("config.json").is_file()
+        || (!crate::storage::model_weights_path(dir).is_file()
+            && crate::storage::legacy_weights_path(dir).is_none())
+    {
+        return Err(ApiError::not_found(
+            "not a model directory (config.json + model_weights.bpk required)",
+        ));
     }
     Ok(())
 }
@@ -350,7 +365,7 @@ pub(super) async fn model_import(
     let force = req.force;
     let out_clone = out.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::import::import_gguf::<crate::backend::CpuBackend>(
+        crate::import::import_gguf(
             &gguf,
             &out_clone,
             force,
@@ -509,7 +524,7 @@ pub(super) async fn model_import_hf(
         let result = {
             let mut progress =
                 |phase: &str, done: u64, total: u64, unit: &str| op.progress(phase, done, total, unit);
-            crate::hf_import::import_hf::<crate::backend::CpuBackend>(
+            crate::hf_import::import_hf(
                 &source,
                 &out,
                 force,

@@ -1,6 +1,6 @@
 # 🦙 The Adventure of Making Noctámbulo Work in `llama.cpp` (`how-to-llama.md`)
 
-This document recounts the technical process, the obstacles overcome, and the exact specifications of the **GGUF v3** standard required to get a model trained from scratch in Rust with **Burn 0.21** to run natively in **`llama.cpp`** (`llama-cli`) and **LM Studio** at **200 tokens/second**.
+This document recounts the technical process, the obstacles overcome, and the exact specifications of the **GGUF v3** standard required to get a model trained from scratch in Rust with **Burn 0.22** to run natively in **`llama.cpp`** (`llama-cli`) and **LM Studio** at **200 tokens/second**.
 
 ---
 

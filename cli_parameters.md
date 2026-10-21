@@ -13,7 +13,7 @@ Runs the neural network training pipeline on the GPU using WGPU.
 | `--file` | `Option<String>`| `None` | Path to a local plain-text or binary (`.bin`) file to train on. |
 | `--dataset-file` | `String` | `"TinyStories-train.txt"` | Target file name inside the HF dataset repository. |
 | `--preset` | `Option<String>` | `None` | Architecture preset: `nano` (~2M), `tiny` (~5.5M), `small` (~30M), `base` (~100M). Explicit flags take precedence. |
-| `--dtype` | `String` | `"f32"` | Compute precision. Only `f32` is trainable: Burn 0.21's AdamW moment estimates underflow in f16, so `f16` is rejected with a clear error. `bf16` is not supported by the WGPU/WGSL backend. Records are always stored in f32. |
+| `--dtype` | `String` | `"f32"` | Compute precision. Only `f32` is trainable in this engine: the trainer rejects `f16` (its optimizer path is f32-only) and `bf16` is not supported by the WGPU/WGSL backend. Checkpoints are always stored in f32. |
 | `--batch-size` | `usize` | `128` | Batch size to process on the GPU before the weight update. |
 | `--epochs` | `usize` | `3` | Number of complete passes through the dataset. With `--resume`, **additional** epochs. |
 | `--max-tokens` | `usize` | `100000000` | Maximum number of tokens to load from the corpus. A value of `0` trains on the full file. The Chinchilla reference is ~20 tokens/parameter. |
@@ -68,7 +68,7 @@ Evaluates the cross-entropy loss, perplexity ($PPL$) and bits per byte (BPB) of 
 
 | Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
-| `--model-dir` | `String` | `"model_output"` | Directory containing `config.json` and `model_weights.bin`. |
+| `--model-dir` | `String` | `"model_output"` | Directory containing `config.json` and `model_weights.bpk`. |
 | `--dataset` | `Vec<String>` | `[]` | HF dataset ID(s) to evaluate. |
 | `--file` | `Option<String>`| `None` | Path to the evaluation text or `.bin` file. |
 | `--dataset-file`| `String` | `"TinyStories-train.txt"` | Target file name in HF. |
@@ -102,7 +102,7 @@ Performs autoregressive text inference using the model loaded from `--model-dir`
 | Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
 | `<prompt>` | `String` | *Required* | Initial seed text from which the model will continue the generation. |
-| `--model-dir` | `String` | `"model_output"` | Directory containing `config.json` + `model_weights.bin` (+ optional `custom_tokenizer.json`). |
+| `--model-dir` | `String` | `"model_output"` | Directory containing `config.json` + `model_weights.bpk` (+ optional `custom_tokenizer.json`). |
 | `--temp` | `f32` | `0.9` | Sampling temperature. Controls the randomness of the prediction. |
 | `--top-k` | `usize` | `60` | Top-K sampling. Limits the selection to the $K$ most probable tokens. |
 | `--top-p` | `f32` | `0.9` | Top-P sampling (Nucleus Sampling). Limits the selection to tokens whose cumulative probability reaches $P$. |
@@ -110,8 +110,8 @@ Performs autoregressive text inference using the model loaded from `--model-dir`
 | `--rep-penalty` | `f32` | `1.6` | Repetition penalty. Discourages repeated tokens by dividing their logits. |
 | `--max-tokens` | `usize` | `50` | Maximum number of new tokens to generate. |
 | `--seed` | `Option<u64>` | `None` | Random seed of the Xorshift generator for reproducibility. |
-| `--dtype` | `String` | `"f32"` | Compute precision: `f32` (fused WGPU) or `f16` (non-fused half backend; half-precision logits can flip tokens on weakly trained models). |
-| `--kv-cache-dtype` | `String` | `"f32"` | KV cache precision: `f32`, `f16` (halves memory; automatically runs on the non-fused backend because the fused backend's f16 casts are silent no-ops), `int8` (4 values per i32 word + per-block scales) or `q4` (8 nibbles per i32 word + per-block scales). |
+| `--dtype` | `String` | `"f32"` | Compute precision: `f32` or `f16` (weights are cast to half precision in memory; half-precision logits can flip tokens on weakly trained models). |
+| `--kv-cache-dtype` | `String` | `"f32"` | KV cache precision: `f32`, `f16` (rows stored as half precision), `int8` (4 values per i32 word + per-block scales) or `q4` (8 nibbles per i32 word + per-block scales). |
 | `--rope-scaling` | `String` | `"none"` | RoPE context-extension strategy: `none`, `linear`, `ntk` or `yarn`. |
 | `--rope-factor` | `f32` | `1.0` | Context-extension factor (e.g. `2.0` doubles the usable context). |
 | `--kv-eviction` | `String` | `""` | Eviction override: `h2o`, `none` or empty to keep the checkpoint config. |
@@ -135,7 +135,7 @@ Exports weights to GGUF v3 binary format for external inference.
 ---
 
 ## 📥 7. `import` Subcommand Parameters
-Imports a GGUF file produced by `export` (or a compatible llama-style GGUF with f32/f16 tensors) back into the native format: `config.json`, `model_weights.bin` and a `custom_tokenizer.json` rebuilt from the GGUF vocabulary. Useful to recover models that only survive as GGUF files.
+Imports a GGUF file produced by `export` (or a compatible llama-style GGUF with f32/f16 tensors) back into the native format: `config.json`, `model_weights.bpk` and a `custom_tokenizer.json` rebuilt from the GGUF vocabulary. Useful to recover models that only survive as GGUF files.
 
 | Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
