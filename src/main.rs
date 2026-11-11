@@ -13,7 +13,7 @@ mod tui;
 
 use clap::{Args, Parser, Subcommand};
 use config::{DType, ModelConfig, RopeScalingKind};
-use data::{combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf, extract_parquet_text_column, prepare_binary_dataset, train_custom_tokenizer, LlmTokenizer};
+use data::{combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf, extract_parquet_text_column, prepare_binary_dataset, prepare_binary_dataset_from_sources, train_custom_tokenizer, LlmTokenizer};
 use export::export_to_gguf_cli as export_to_gguf;
 use generate::generate;
 use model::Llm;
@@ -168,8 +168,8 @@ struct DownloadArgs {
     /// Output directory for the downloaded file (default: datasets/)
     #[arg(long, default_value = "datasets")]
     out_dir: String,
-    /// Extract text column to .txt when the file is Parquet (default: true)
-    #[arg(long, default_value_t = true)]
+    /// Extract text column to .txt when the file is Parquet (default: false; .parquet is read directly)
+    #[arg(long, default_value_t = false)]
     extract_text: bool,
 }
 
@@ -608,27 +608,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
 
-            // Parquet is ingested straight to tokens, one file at a time: the
-            // mixers are line-based and would read binary parquet garbage.
-            let has_parquet = sources.iter().any(|s| {
-                s.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("parquet"))
-            });
-            if has_parquet && (!args.weights.is_empty() || sources.len() > 1) {
-                return Err(
-                    "Parquet sources cannot be mixed or combined: prepare each .parquet \
-                     individually (mixing works on line-based .txt or pre-tokenized .bin)"
-                        .into(),
-                );
-            }
-
-            let corpus_path = if sources.is_empty() {
+            let weighted_sources: Vec<(PathBuf, f32)> = if sources.is_empty() {
                 let default_file = Path::new("corpus.txt");
                 if !default_file.exists() {
                     std::fs::write(default_file, DEFAULT_CORPUS)?;
                 }
-                default_file.to_path_buf()
+                vec![(default_file.to_path_buf(), 1.0)]
             } else if !args.weights.is_empty() {
                 if args.weights.len() != sources.len() {
                     return Err(format!(
@@ -638,21 +623,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .into());
                 }
-                if Path::new(&args.output) == Path::new("datasets/weighted_mix.txt") {
-                    return Err(
-                        "--output cannot be datasets/weighted_mix.txt: it is the intermediate \
-                         text mix path and would be overwritten by the binary dataset."
-                            .into(),
-                    );
-                }
-                let weighted: Vec<(PathBuf, f32)> =
-                    sources.iter().cloned().zip(args.weights.iter().copied()).collect();
-                let max_chars = if args.max_chars == 0 { usize::MAX } else { args.max_chars };
-                combine_and_mix_weighted(&weighted, Path::new("datasets/weighted_mix.txt"), max_chars)?
-            } else if sources.len() == 1 {
-                sources[0].clone()
+                sources
+                    .into_iter()
+                    .zip(args.weights.iter().copied())
+                    .collect()
             } else {
-                combine_and_mix_datasets(&sources, Path::new("datasets/combined_corpus.txt"))?
+                sources
+                    .into_iter()
+                    .map(|p| {
+                        let bytes = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(1).max(1);
+                        (p, bytes as f32)
+                    })
+                    .collect()
             };
 
             let tokenizer = if Path::new(custom_tokenizer_file).exists() {
@@ -664,7 +646,25 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
-            prepare_binary_dataset(&corpus_path, &args.output, &tokenizer, max_tokens, args.dedupe)?;
+            let max_chars = if args.max_chars == 0 { None } else { Some(args.max_chars) };
+            if weighted_sources.len() == 1 && max_chars.is_none() {
+                prepare_binary_dataset(
+                    &weighted_sources[0].0,
+                    &args.output,
+                    &tokenizer,
+                    max_tokens,
+                    args.dedupe,
+                )?;
+            } else {
+                prepare_binary_dataset_from_sources(
+                    &weighted_sources,
+                    &args.output,
+                    &tokenizer,
+                    max_tokens,
+                    max_chars,
+                    args.dedupe,
+                )?;
+            }
         }
         Commands::Train(args) => {
             let mut sources: Vec<PathBuf> = Vec::new();

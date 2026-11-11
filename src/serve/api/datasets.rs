@@ -30,7 +30,7 @@ fn list_dataset_infos(dir: &Path) -> Vec<DatasetInfo> {
                 continue;
             }
             let ext = p.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if ext != "txt" && ext != "bin" {
+            if !matches!(ext.as_str(), "txt" | "bin" | "parquet" | "jsonl" | "json") {
                 continue;
             }
             let meta = match p.metadata() {
