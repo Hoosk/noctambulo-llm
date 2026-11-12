@@ -28,7 +28,7 @@ cargo run --release -- import model.gguf --output-dir my-model --tokenizer token
 | Feature | `import-hf` | `import` (GGUF) |
 | :--- | :--- | :--- |
 | Architectures | Llama / Qwen2 / Mistral (CausalLM) | `llama`, `qwen2` metadata |
-| Weights | f32 / f16 / bf16 safetensors (sharded ok) | f32 / f16 tensors only (quantized GGUF rejected) |
+| Weights | f32 / f16 / bf16 safetensors (sharded ok) | f32 / f16 and quantized tensors: Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, Q8_K (dequantized to f32) |
 | Hidden size | any `intermediate_size` | any `feed_forward_length` |
 | RMSNorm eps | `rms_norm_eps` from config | `attention.layer_norm_rms_epsilon` |
 | RoPE base | `rope_theta` from config (1e6 for Qwen2.5, 5e5 for Llama-3) | `rope.freq_base` |
@@ -62,5 +62,6 @@ The web Train wizard exposes the same feature as “Warm start from a model”.
 - Some “fp16” GGUFs published by model vendors are re-quantized artifacts (their attention
   weights differ from the original safetensors). Prefer `import-hf` or an f16 GGUF known
   to be a straight conversion.
-- Quantized GGUFs (Q4_K_M, Q8_0, …) are not dequantized yet; convert from safetensors or
-  use an f16 GGUF.
+- Quantized GGUFs (Q4_K_M, Q8_0, Q5_K_M, …) are dequantized to f32 at import time.
+  IQ-quants (IQ2/IQ3/IQ4, importance-matrix formats) are not supported yet and are
+  rejected with a clear error; use a Q_K or Q8_0 quant of the same model instead.

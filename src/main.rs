@@ -681,6 +681,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 sources.push(PathBuf::from(file_path));
             }
 
+            let mut dataset_sources: Option<Vec<(PathBuf, f32)>> = None;
             let dataset_path_buf: Option<PathBuf> = if sources.is_empty() {
                 let mut found_dataset: Option<PathBuf> = None;
                 if let Ok(entries) = std::fs::read_dir(".") {
@@ -704,7 +705,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             } else if sources.len() == 1 {
                 Some(sources[0].clone())
             } else {
-                Some(combine_and_mix_datasets(&sources, Path::new("datasets/combined_corpus.txt"))?)
+                // Multiple sources are mixed at the document level in memory
+                // while tokenizing: no combined_corpus.txt is written to disk.
+                dataset_sources = Some(
+                    sources
+                        .iter()
+                        .map(|p| {
+                            let bytes = std::fs::metadata(p).map(|m| m.len()).unwrap_or(1).max(1);
+                            (p.clone(), bytes as f32)
+                        })
+                        .collect(),
+                );
+                None
             };
 
             // Warm start from a native model directory (e.g. an imported HF or
@@ -822,6 +834,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             train(
                 dataset_path_buf.as_deref(),
                 raw_text.as_deref(),
+                dataset_sources.as_deref(),
                 model_config,
                 &tokenizer,
                 args.epochs,

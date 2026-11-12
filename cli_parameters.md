@@ -144,7 +144,7 @@ Imports a GGUF file produced by `export` (or a compatible llama-style GGUF with 
 | `--force` | `bool` (flag) | `false` | Overwrite the output directory if it already contains a model. |
 | `--tokenizer` | `Option<String>` | `None` | Exact `tokenizer.json` to use instead of the one rebuilt from the GGUF vocabulary (recommended for third-party GGUFs whose pre-tokenizer differs). |
 
-The inverse of the exporter is exact (transposes + GPT-NeoX RoPE row permutation are inverted); quantized GGUFs (Q4/Q8...) are rejected with a clear error.
+The inverse of the exporter is exact (transposes + GPT-NeoX RoPE row permutation are inverted). Quantized tensors (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and K-quants Q2_K–Q6_K/Q8_K) are dequantized to f32 block by block; IQ-quants are rejected with a clear error.
 
 ---
 

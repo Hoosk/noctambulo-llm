@@ -277,6 +277,7 @@ pub fn launch_job(state: &Arc<ServerState>, registry: &Arc<JobRegistry>, params:
         let result = train_with_events(
             params.file.as_deref(),
             None,
+            None,
             config,
             &worker_tokenizer,
             params.epochs,

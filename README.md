@@ -79,7 +79,7 @@ Start it before bed. Check the loss curve over coffee.
 **Third-party models**
 - `import-hf`: convert Hugging Face safetensors (Llama / Qwen2 / Mistral, f32/f16/bf16,
   sharded, custom FFN size, RoPE base/eps from the config) on the CPU, without VRAM.
-- `import`: read compatible `llama`/`qwen2` GGUFs (f32/f16), with `--tokenizer` override.
+- `import`: read compatible `llama`/`qwen2` GGUFs (f32/f16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and Q2_K–Q6_K/Q8_K dequantized to f32), with `--tokenizer` override.
 - Fine-tune any imported model with `train --resume <model_dir>`.
 - Clear errors for QK-norms (Qwen3), SentencePiece tokenizers, untied `lm_head` and
   quantized safetensors.
@@ -215,7 +215,7 @@ doc/             architecture, training/, inference/, models/
 - **Fusion/autotune disabled**: Burn 0.22's fusion graph cache returned wrong matmul results in this engine (reproduced against a manual reference; Flex and no-fusion WGPU are exact). `Cargo.toml` uses `default-features = false` to keep them off; re-enable once upstream fixes the fusion cache. `NOCTAMBULO_CPU=1` forces Flex for debugging.
 
 - Training and records are **f32 only** (the trainer rejects f16); f16 inference and f16/int8/q4 KV caches are supported.
-- GGUF import accepts f32/f16 tensors; quantized GGUF dequantization is on the roadmap.
+- GGUF import accepts f32/f16 and standard quantized tensors (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, Q8_K); IQ-quants are rejected with a clear error.
 - QK-norm architectures (Qwen3) and SentencePiece tokenizers are not supported yet.
 - The CUDA backend is compile-checked; validate it on your NVIDIA host before relying on it.
 - The web console is meant for trusted local networks: use `--token` when exposing it.

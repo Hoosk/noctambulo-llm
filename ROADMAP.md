@@ -1,11 +1,11 @@
 # 🗺️ Noctámbulo Roadmap
 
-Last updated: 2026-10-21 (Burn 0.22 / wgpu 30 migration complete: runtime dispatch devices, burnpack storage and the new optimizer; fusion/autotune are disabled because Burn 0.22's fusion graph cache returned wrong matmul results).
+Last updated: 2026-11-12 (modular `data`/`model`/`train` layout; document-level dataset streaming; quantized GGUF import).
 
 ## Current Status
 
 - Complete engine: BPE tokenizer, datasets (txt/bin/parquet with direct ingest and dedupe), `train` (real gradient accumulation, full-state resume, safe stop, f16, RoPE context extension, sliding window + sinks, cross-layer KV sharing, MLA latent cache, label smoothing, z-loss, AdamW weight decay), `eval` (BPB, all batches, early stopping, `--max-tokens` slice), `generate` (CLI + SSE streaming, RoPE scaling flags, f32/f16, bounded ring cache), GGUF `export` (with `rope.scaling.*` and `attention.sliding_window` keys, `--approx` for grouped models, exact folding for MLA) and the `serve` web suite.
-- 113 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
+- 120 tests green (`cargo test`), `cargo clippy --all-targets` clean, ESLint + react-doctor 100/100 in `web/`, and CDP browser smoke tests on the built bundle.
 - Correctness fixes retained from the Burn 0.21 era (`WgpuHalf` and `align_compute_dtype` no longer exist in the 0.22 engine):
   1. **M=1 GEMV**: burn-wgpu's autotuned cubek GEMV kernel returned wrong results for output widths >= 32, so token-by-token decode silently diverged from the batched forward. Fusion/autotune are now disabled (see Dependency Upgrades) and the model still **pads single-token forwards to M=2** before every matmul and slices row 0 back out (`Llm::forward`/`forward_with_cache`) as a defensive workaround. Regression tests cover prefill + decode on WGPU and Flex.
   2. **f16 compute**: `Llm::cast_compute_dtype` casts parameters after loading, and the RoPE tables/cache scales follow the compute dtype. Records stay f32, so `generate --dtype f16` is in-memory only.
@@ -14,6 +14,10 @@ Last updated: 2026-10-21 (Burn 0.22 / wgpu 30 migration complete: runtime dispat
 - Quantized cache (`--kv-cache-dtype int8|q4`): packed i32 words (4 int8 or 8 int4) plus per-block f32 scales, written with `slice_assign` and dequantized on read. Burn's native `QFloat` lacks `slice`/`slice_assign`, so the packed representation sidesteps it and works on every backend. Tested for parity against the f32 cache (standard + MLA + window) and for real storage; int8 decode matches f32 bit-for-bit on the trained models.
 - Web: React 19 + Vite + TypeScript + Tailwind v4 built locally (no CDN), English UI, HttpOnly-cookie auth, served from `web/dist` by Axum. Train/Datasets/Generate/Models/Export/Devices views plus run history and live telemetry.
 - Docs: English-only (README, `cli_parameters.md`, `doc/*.md`, ROADMAP and the auxiliary notes).
+
+## Code Organization
+
+- ✅ **Modular pipeline**: `src/data/` (document readers, mixing, binary I/O, tokenizers, HF), `src/model/` (`quant`, `cache`, `rope`, `layers`, `llm`) and `src/train/` (`dataset`, `loss`, `state`, `eval`, `loop_runner`), each split out of the former 1.5–3.4k-line single files with the public API re-exported from the parent module.
 
 ## KV Cache Modernization (DeepSeek-style)
 
@@ -38,7 +42,7 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 2. ✅ **FP16**: `--dtype f32|f16` flag (single WGPU/Flex device; f16 training is rejected). `bf16` dropped: WGSL does not support it and cubecl crashes; an explicit error is returned instead. Records are always f32, so generate/export are unaffected.
 3. ✅ **Eval**: removed the fixed 100-batch cap (`--eval-batches`, 0 = all), added the BPB (bits-per-byte) metric and early stopping (`--early-stop-patience`).
 4. ✅ **RoPE scaling**: `linear`, `ntk` (dynamic NTK) and `yarn` strategies with a configurable factor. The per-layer RoPE cache extends to `factor × n_ctx` (capped), `generate`/`eval` take `--rope-scaling`/`--rope-factor`, the web Generate view exposes both, and GGUF exports carry `llama.rope.scaling.{type,factor,original_context_length}`.
-5. ✅ **Datasets**: `prepare-dataset` tokenizes Parquet text columns straight to `.bin` (no intermediate `.txt`) and `--dedupe` drops exact duplicate lines/documents (hashed) for both text and Parquet; mixing Parquet sources is rejected with an explicit error.
+5. ✅ **Datasets**: document-level streaming readers (`.parquet`, `.jsonl`, `.json`, `<|endoftext|>`-delimited `.txt`, line `.txt`), multi-source weighted mixing directly to `.bin`/training memory (no intermediate `combined_corpus.txt`/`weighted_mix.txt`), and `--dedupe` drops exact duplicate documents for every format.
 6. ✅ **Optimizer**: decoupled weight decay (AdamW) applied to all parameters with `--weight-decay`, plus optional `--label-smoothing` and `--z-loss` (also in the web Train form and API).
 7. ✅ **Optional CUDA backend**: `cargo build --features cuda` swaps the CLI (train/eval/generate/export) to `burn::backend::Cuda` for f32 and f16; the web server keeps WGPU for adapter enumeration. Compile-checked with `cargo check --features cuda` (runtime requires an NVIDIA GPU).
 
@@ -72,13 +76,13 @@ Known prerequisites discovered in Phase 0: all existing checkpoints are invalid 
 - ✅ **Relaxed GGUF import**: accepts `llama` and `qwen2` metadata prefixes, arbitrary `feed_forward_length`, `layer_norm_rms_epsilon` and `rope.freq_base` from metadata, GQA and biases; de-permutes Q/K only for the `llama` layout (qwen2 uses NEOX rope), and `--tokenizer <file>` overrides the rebuilt vocabulary when the GGUF pre-tokenizer differs. Fixed the non-square weight transpose that only round-tripped with this engine's own exporter (verified against bartowski's f16 Qwen2.5-0.5B: byte-identical to the HF safetensors, coherent generation) and added a golden-layout regression test.
 - ✅ **Fine-tuning imported models**: `train --resume <model_dir>` reads the directory `config.json` (architecture, eviction geometry) and `custom_tokenizer.json`, loading the weights as a warm start (fresh optimizer when no sidecars exist); the web Train wizard exposes it as “Warm start from a model”. The directory resume path resolves `model_weights.bpk`.
 - ✅ **Web/API**: `POST /api/models/import-hf` runs as a cancellable background op with phase progress; `ModelInfo` reports `ffn_hidden`, `rope_base`, `rms_norm_eps` and `import_source`, shown in the Models view together with a new “Import from Hugging Face” card.
-- ⏳ **Backlog — quantized GGUF dequantization** (Q4_0/Q8_0/K-quants) at import time; today only f32/f16 GGUF tensors are converted (the error suggests `import-hf` or an f16 GGUF).
+- ✅ **Quantized GGUF dequantization**: legacy quants Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K are dequantized block by block to f32 at import time, validated against the independent `gguf` Python reference implementation. End-to-end, a Qwen2.5-0.5B-Instruct Q4_K_M file (Q5_0/Q6_K/Q8_0/Q4_K tensors) imports and generates coherent English. IQ-quants (IQ2/IQ3/IQ4) remain unsupported with a clear error.
 
 ## Dependency Upgrades
 
-- ✅ **Rust edition 2024** (MSRV 1.95), `axum 0.8` / `tower 0.5` / `tower-http 0.7` (new `{param}` route syntax), `arrow`/`parquet` 60, and compatible patch/minor updates. Verified by 113 tests and `cargo clippy --all-targets`.
+- ✅ **Rust edition 2024** (MSRV 1.95), `axum 0.8` / `tower 0.5` / `tower-http 0.7` (new `{param}` route syntax), `arrow`/`parquet` 60, and compatible patch/minor updates. Verified by 120 tests and `cargo clippy --all-targets`.
 - ✅ **Burn 0.22 / wgpu 30 migration**: the engine now uses runtime-dispatched tensors (`Tensor<D>`), backend-agnostic modules and a single `Device` (WGPU, CUDA, Flex) instead of the old backend-generic types. Storage moved from `BinFileRecorder` to `burn-store` (`model_weights.bpk`, `optimizer_state.bpk`, `checkpoint_*.bpk`) and training uses `ModuleOptimizer` with per-parameter state. The CPU conversion backend is `Device::flex()` (burn-ndarray is deprecated in 0.22). **Breaking:** Burn 0.21 `.bin` checkpoints cannot be loaded; the web UI marks them as `legacy .bin` and they must be re-imported (GGUF/HF) or retrained. Fusion and autotune are disabled at compile time (`burn` dependency with `default-features = false`): Burn 0.22's fusion graph cache returned stale/wrong matmul results in this engine (diagnosed by comparing WGPU against a manual f64 reference; the same wrong values appeared on WGSL and SPIR-V, while Flex and no-fusion WGPU are exact). Cross-backend parity tests (`model::backend_parity_tests`) now run on every suite. `NOCTAMBULO_CPU=1` forces Flex for debugging. Re-enable fusion/autotune once the upstream fusion cache is fixed.
 
 ## Suggested Order
 
-Phases 0–6 of the KV cache modernization plus host-RAM spill/replay are complete, and third-party model support (HF safetensors converter, relaxed GGUF import, fine-tuning from a model directory, web/API surface) has landed. Remaining backlog: quantized GGUF dequantization. Separate known gap: the optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. Re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above) before measuring quality.
+Phases 0–6 of the KV cache modernization plus host-RAM spill/replay are complete, and third-party model support (HF safetensors converter, relaxed GGUF import, fine-tuning from a model directory, web/API surface) has landed. Remaining backlog: IQ-quant (importance-matrix) GGUF dequantization. The optional CUDA backend is compile-checked (`cargo check --features cuda`) but has not run on an NVIDIA host; validate it there before advertising runtime support. Re-prepare the datasets with the current tokenizer and retrain from scratch (see prerequisites above) before measuring quality.

@@ -5,8 +5,9 @@
 //! the Burn module layout onto llama.cpp's `llama` architecture (transposing
 //! linear weights into GGML's `[out][in]` row-major layout and applying the
 //! GPT-NeoX RoPE row permutation to Q/K), so importing inverts exactly those
-//! transforms. Only f32/f16 tensors are supported (the exporter always writes
-//! f32); quantized GGUFs are rejected with a clear error.
+//! transforms. f32/f16 tensors load as-is; quantized GGUF tensors (legacy
+//! q4_0/q4_1/q5_0/q5_1/q8_0 and the K-quants q2_k..q6_k/q8_k) are dequantized
+//! block by block to f32 before the layout transforms.
 
 use crate::config::{ModelConfig, RopeScalingKind};
 use crate::export::{transpose_2d, unpermute_rope_bias, unpermute_rope_weight};
@@ -34,6 +35,19 @@ const GGUF_TYPE_INT64: u32 = 11;
 const GGUF_TYPE_FLOAT64: u32 = 12;
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
+const GGML_TYPE_Q4_0: u32 = 2;
+const GGML_TYPE_Q4_1: u32 = 3;
+const GGML_TYPE_Q5_0: u32 = 6;
+const GGML_TYPE_Q5_1: u32 = 7;
+const GGML_TYPE_Q8_0: u32 = 8;
+const GGML_TYPE_Q2_K: u32 = 10;
+const GGML_TYPE_Q3_K: u32 = 11;
+const GGML_TYPE_Q4_K: u32 = 12;
+const GGML_TYPE_Q5_K: u32 = 13;
+const GGML_TYPE_Q6_K: u32 = 14;
+const GGML_TYPE_Q8_K: u32 = 15;
+/// Elements per K-quant super-block.
+const QK_K: usize = 256;
 const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -232,45 +246,367 @@ pub fn parse_gguf(path: &Path) -> Result<GgufFile, String> {
             .iter()
             .try_fold(1usize, |acc, d| acc.checked_mul(*d as usize))
             .ok_or_else(|| format!("tensor '{}' dimensions overflow", info.name))?;
-        let bytes_per = match info.kind {
-            GGML_TYPE_F32 => 4,
-            GGML_TYPE_F16 => 2,
-            other => {
-                return Err(format!(
-                    "tensor '{}' uses GGML type {other}; only f32/f16 GGUFs can be imported \
-                     (re-export the model without quantization)",
-                    info.name
-                ));
-            }
-        };
+        let (block_elems, block_bytes) = ggml_type_layout(info.kind).ok_or_else(|| {
+            format!(
+                "tensor '{}' uses unsupported GGML type {} ({}); supported: f32, f16, \
+                 q4_0, q4_1, q5_0, q5_1, q8_0, q2_k, q3_k, q4_k, q5_k, q6_k, q8_k",
+                info.name,
+                info.kind,
+                ggml_type_label(info.kind)
+            )
+        })?;
+        if !count.is_multiple_of(block_elems) {
+            return Err(format!(
+                "tensor '{}' has {count} elements, not a multiple of the {block_elems}-element \
+                 block required by {}",
+                info.name,
+                ggml_type_label(info.kind)
+            ));
+        }
+        let raw_len = (count / block_elems)
+            .checked_mul(block_bytes)
+            .ok_or_else(|| format!("tensor '{}' size overflow", info.name))?;
         let start = data_start
             .checked_add(info.offset as usize)
             .ok_or_else(|| format!("tensor '{}' offset overflow", info.name))?;
         let end = start
-            .checked_add(count * bytes_per)
+            .checked_add(raw_len)
             .ok_or_else(|| format!("tensor '{}' size overflow", info.name))?;
         if end > bytes.len() {
             return Err(format!(
                 "tensor '{}' runs past the end of the file (offset {} + {} bytes)",
-                info.name,
-                info.offset,
-                count * bytes_per
+                info.name, info.offset, raw_len
             ));
         }
-        let data = match info.kind {
-            GGML_TYPE_F32 => bytes[start..end]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect(),
-            _ => bytes[start..end]
-                .chunks_exact(2)
-                .map(|c| burn::tensor::f16::from_bits(u16::from_le_bytes(c.try_into().unwrap())).to_f32())
-                .collect(),
-        };
+        let data = dequantize_ggml_blocks(info.kind, &bytes[start..end], count)?;
         tensors.insert(info.name, GgufTensor { dims: info.dims, data });
     }
 
     Ok(GgufFile { metadata, tensors })
+}
+
+/// Element count per block and stored bytes per block for a supported GGML
+/// tensor type (`None` for unsupported/importance-matrix quants).
+fn ggml_type_layout(kind: u32) -> Option<(usize, usize)> {
+    match kind {
+        GGML_TYPE_F32 => Some((1, 4)),
+        GGML_TYPE_F16 => Some((1, 2)),
+        GGML_TYPE_Q4_0 => Some((32, 18)),
+        GGML_TYPE_Q4_1 => Some((32, 20)),
+        GGML_TYPE_Q5_0 => Some((32, 22)),
+        GGML_TYPE_Q5_1 => Some((32, 24)),
+        GGML_TYPE_Q8_0 => Some((32, 34)),
+        GGML_TYPE_Q2_K => Some((QK_K, 84)),
+        GGML_TYPE_Q3_K => Some((QK_K, 110)),
+        GGML_TYPE_Q4_K => Some((QK_K, 144)),
+        GGML_TYPE_Q5_K => Some((QK_K, 176)),
+        GGML_TYPE_Q6_K => Some((QK_K, 210)),
+        GGML_TYPE_Q8_K => Some((QK_K, 292)),
+        _ => None,
+    }
+}
+
+fn ggml_type_label(kind: u32) -> &'static str {
+    match kind {
+        GGML_TYPE_F32 => "f32",
+        GGML_TYPE_F16 => "f16",
+        GGML_TYPE_Q4_0 => "q4_0",
+        GGML_TYPE_Q4_1 => "q4_1",
+        GGML_TYPE_Q5_0 => "q5_0",
+        GGML_TYPE_Q5_1 => "q5_1",
+        GGML_TYPE_Q8_0 => "q8_0",
+        GGML_TYPE_Q2_K => "q2_k",
+        GGML_TYPE_Q3_K => "q3_k",
+        GGML_TYPE_Q4_K => "q4_k",
+        GGML_TYPE_Q5_K => "q5_k",
+        GGML_TYPE_Q6_K => "q6_k",
+        GGML_TYPE_Q8_K => "q8_k",
+        _ => "unsupported",
+    }
+}
+
+fn read_f16(raw: &[u8], at: usize) -> f32 {
+    let bits = u16::from_le_bytes([raw[at], raw[at + 1]]);
+    burn::tensor::f16::from_bits(bits).to_f32()
+}
+
+fn read_u32(raw: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(raw[at..at + 4].try_into().unwrap())
+}
+
+fn push_q4_0(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    for j in 0..16 {
+        out.push(((block[2 + j] & 0x0F) as i32 - 8) as f32 * d);
+    }
+    for j in 0..16 {
+        out.push(((block[2 + j] >> 4) as i32 - 8) as f32 * d);
+    }
+}
+
+fn push_q4_1(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    let m = read_f16(block, 2);
+    for j in 0..16 {
+        out.push((block[4 + j] & 0x0F) as f32 * d + m);
+    }
+    for j in 0..16 {
+        out.push((block[4 + j] >> 4) as f32 * d + m);
+    }
+}
+
+fn push_q5_0(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    let qh = read_u32(block, 2);
+    for j in 0..16 {
+        let xh = (((qh >> j) << 4) & 0x10) as u8;
+        let q = ((block[6 + j] & 0x0F) | xh) as i32 - 16;
+        out.push(q as f32 * d);
+    }
+    for j in 0..16 {
+        let xh = ((qh >> (j + 12)) & 0x10) as u8;
+        let q = ((block[6 + j] >> 4) | xh) as i32 - 16;
+        out.push(q as f32 * d);
+    }
+}
+
+fn push_q5_1(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    let m = read_f16(block, 2);
+    let qh = read_u32(block, 4);
+    for j in 0..16 {
+        let xh = (((qh >> j) << 4) & 0x10) as u8;
+        let q = ((block[8 + j] & 0x0F) | xh) as f32;
+        out.push(q * d + m);
+    }
+    for j in 0..16 {
+        let xh = ((qh >> (j + 12)) & 0x10) as u8;
+        let q = ((block[8 + j] >> 4) | xh) as f32;
+        out.push(q * d + m);
+    }
+}
+
+fn push_q8_0(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    for &q in &block[2..34] {
+        out.push(q as i8 as f32 * d);
+    }
+}
+
+/// Q2_K: 16 packed scale/min nibbles, 64 bytes of 2-bit quants, f16 `d`/`dmin`.
+fn push_q2_k(block: &[u8], out: &mut Vec<f32>) {
+    let scales = &block[0..16];
+    let qs = &block[16..80];
+    let d = read_f16(block, 80);
+    let dmin = read_f16(block, 82);
+    let mut is = 0usize;
+    for n in 0..2 {
+        let q = &qs[n * 32..(n + 1) * 32];
+        let mut shift = 0;
+        for _ in 0..4 {
+            let sc = scales[is];
+            is += 1;
+            let dl = d * (sc & 0x0F) as f32;
+            let ml = dmin * (sc >> 4) as f32;
+            for &byte in &q[0..16] {
+                out.push(dl * ((byte >> shift) & 3) as f32 - ml);
+            }
+            let sc = scales[is];
+            is += 1;
+            let dl = d * (sc & 0x0F) as f32;
+            let ml = dmin * (sc >> 4) as f32;
+            for &byte in &q[16..32] {
+                out.push(dl * ((byte >> shift) & 3) as f32 - ml);
+            }
+            shift += 2;
+        }
+    }
+}
+
+/// 6-bit scale/min pairs used by Q4_K/Q5_K.
+fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Q3_K: 32 high-mask bytes, 64 bytes of 2-bit quants, 12 bytes of packed scales.
+fn push_q3_k(block: &[u8], out: &mut Vec<f32>) {
+    let hmask = &block[0..32];
+    let qs = &block[32..96];
+    let mut aux = [0u32; 4];
+    for (i, word) in aux.iter_mut().enumerate().take(3) {
+        *word = read_u32(block, 96 + i * 4);
+    }
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+
+    let mut scales = [0u8; 16];
+    for (i, word) in aux.iter().enumerate() {
+        scales[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+
+    let d = read_f16(block, 108);
+    let mut m = 1u8;
+    let mut is = 0usize;
+    for n in 0..2 {
+        let q = &qs[n * 32..(n + 1) * 32];
+        let mut shift = 0;
+        for _ in 0..4 {
+            let dl = d * (scales[is] as i8 - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let qv = ((q[l] >> shift) & 3) as i32;
+                let hm = if hmask[l] & m != 0 { 0 } else { 4 };
+                out.push(dl * (qv - hm) as f32);
+            }
+            let dl = d * (scales[is] as i8 - 32) as f32;
+            is += 1;
+            for l in 0..16 {
+                let qv = ((q[16 + l] >> shift) & 3) as i32;
+                let hm = if hmask[16 + l] & m != 0 { 0 } else { 4 };
+                out.push(dl * (qv - hm) as f32);
+            }
+            shift += 2;
+            m <<= 1;
+        }
+    }
+}
+
+/// Q4_K: f16 `d`/`dmin`, 12 packed scale/min bytes, 128 bytes of 4-bit quants.
+fn push_q4_k(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    let dmin = read_f16(block, 2);
+    let scales = &block[4..16];
+    let qs = &block[16..144];
+    let mut is = 0usize;
+    for chunk in 0..4 {
+        let q = &qs[chunk * 32..(chunk + 1) * 32];
+        let (sc, m) = get_scale_min_k4(is, scales);
+        let d1 = d * sc as f32;
+        let m1 = dmin * m as f32;
+        for &byte in q {
+            out.push(d1 * (byte & 0x0F) as f32 - m1);
+        }
+        let (sc, m) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * sc as f32;
+        let m2 = dmin * m as f32;
+        for &byte in q {
+            out.push(d2 * (byte >> 4) as f32 - m2);
+        }
+        is += 2;
+    }
+}
+
+/// Q5_K: Q4_K plus 32 high-bit bytes selecting +16 on each nibble.
+fn push_q5_k(block: &[u8], out: &mut Vec<f32>) {
+    let d = read_f16(block, 0);
+    let dmin = read_f16(block, 2);
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+    let mut is = 0usize;
+    let mut u1 = 1u8;
+    let mut u2 = 2u8;
+    for chunk in 0..4 {
+        let q = &qs[chunk * 32..(chunk + 1) * 32];
+        let (sc, m) = get_scale_min_k4(is, scales);
+        let d1 = d * sc as f32;
+        let m1 = dmin * m as f32;
+        for l in 0..32 {
+            let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+            out.push(d1 * ((q[l] & 0x0F) + hi) as f32 - m1);
+        }
+        let (sc, m) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * sc as f32;
+        let m2 = dmin * m as f32;
+        for l in 0..32 {
+            let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+            out.push(d2 * ((q[l] >> 4) + hi) as f32 - m2);
+        }
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+/// Q6_K: 128 low-nibble bytes, 64 high-bit bytes, 16 int8 scales, f16 `d`.
+fn push_q6_k(block: &[u8], out: &mut Vec<f32>) {
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let scales = &block[192..208];
+    let d = read_f16(block, 208);
+    for n in 0..2 {
+        let ql = &ql[n * 64..(n + 1) * 64];
+        let qh = &qh[n * 32..(n + 1) * 32];
+        let sc = &scales[n * 8..(n + 1) * 8];
+        let base = out.len();
+        out.resize(base + 128, 0.0);
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = (((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) as i32) - 32;
+            let q2 = (((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) as i32) - 32;
+            let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32) - 32;
+            let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32) - 32;
+            out[base + l] = d * sc[is] as i8 as f32 * q1 as f32;
+            out[base + l + 32] = d * sc[is + 2] as i8 as f32 * q2 as f32;
+            out[base + l + 64] = d * sc[is + 4] as i8 as f32 * q3 as f32;
+            out[base + l + 96] = d * sc[is + 6] as i8 as f32 * q4 as f32;
+        }
+    }
+}
+
+/// Q8_K: f32 super-scale, 256 int8 quants, 16 int16 block sums (ignored).
+fn push_q8_k(block: &[u8], out: &mut Vec<f32>) {
+    let d = f32::from_le_bytes(block[0..4].try_into().unwrap());
+    for &q in &block[4..260] {
+        out.push(q as i8 as f32 * d);
+    }
+}
+
+/// Dequantize a raw GGML tensor payload to `count` f32 values.
+fn dequantize_ggml_blocks(kind: u32, raw: &[u8], count: usize) -> Result<Vec<f32>, String> {
+    let (block_elems, block_bytes) = ggml_type_layout(kind)
+        .ok_or_else(|| format!("unsupported GGML tensor type {} ({})", kind, ggml_type_label(kind)))?;
+    let blocks = count / block_elems;
+    if raw.len() != blocks * block_bytes {
+        return Err(format!(
+            "GGML {} payload is {} bytes, expected {}",
+            ggml_type_label(kind),
+            raw.len(),
+            blocks * block_bytes
+        ));
+    }
+    let mut out = Vec::with_capacity(count);
+    for block in raw.chunks_exact(block_bytes) {
+        match kind {
+            GGML_TYPE_F32 => out.push(f32::from_le_bytes(block.try_into().unwrap())),
+            GGML_TYPE_F16 => out.push(read_f16(block, 0)),
+            GGML_TYPE_Q4_0 => push_q4_0(block, &mut out),
+            GGML_TYPE_Q4_1 => push_q4_1(block, &mut out),
+            GGML_TYPE_Q5_0 => push_q5_0(block, &mut out),
+            GGML_TYPE_Q5_1 => push_q5_1(block, &mut out),
+            GGML_TYPE_Q8_0 => push_q8_0(block, &mut out),
+            GGML_TYPE_Q2_K => push_q2_k(block, &mut out),
+            GGML_TYPE_Q3_K => push_q3_k(block, &mut out),
+            GGML_TYPE_Q4_K => push_q4_k(block, &mut out),
+            GGML_TYPE_Q5_K => push_q5_k(block, &mut out),
+            GGML_TYPE_Q6_K => push_q6_k(block, &mut out),
+            GGML_TYPE_Q8_K => push_q8_k(block, &mut out),
+            _ => unreachable!("layout and dequantizer tables disagree"),
+        }
+    }
+    Ok(out)
 }
 
 fn gguf_value_u64(value: &GgufValue) -> Option<u64> {
@@ -802,6 +1138,186 @@ mod tests {
         assert_eq!(t.data, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn f16_le(value: f32) -> [u8; 2] {
+        let bits: u16 = match value {
+            0.0 => 0x0000,
+            0.5 => 0x3800,
+            1.0 => 0x3C00,
+            other => panic!("test helper only encodes 0.0/0.5/1.0, got {other}"),
+        };
+        bits.to_le_bytes()
+    }
+
+    #[test]
+    fn test_dequantize_q4_0_and_q8_0_blocks() {
+        // Q4_0: d=1, qs[0]=0x98 -> low nibble 0 (8-8), high nibble 1 (9-8).
+        let mut q4 = Vec::new();
+        q4.extend_from_slice(&f16_le(1.0));
+        q4.push(0x98);
+        q4.extend(std::iter::repeat_n(0x88u8, 15));
+        let out = dequantize_ggml_blocks(GGML_TYPE_Q4_0, &q4, 32).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[16], 1.0);
+        assert!(out.iter().enumerate().all(|(i, v)| i == 16 || *v == 0.0));
+
+        // Q8_0: d=0.5, first two quants -1 and 2.
+        let mut q8 = Vec::new();
+        q8.extend_from_slice(&f16_le(0.5));
+        q8.push((-1i8) as u8);
+        q8.push(2i8 as u8);
+        q8.extend(std::iter::repeat_n(0u8, 30));
+        let out = dequantize_ggml_blocks(GGML_TYPE_Q8_0, &q8, 32).unwrap();
+        assert_eq!(out[0], -0.5);
+        assert_eq!(out[1], 1.0);
+        assert!(out[2..].iter().all(|v| *v == 0.0));
+    }
+
+    fn f32_le(value: f32) -> [u8; 4] {
+        value.to_le_bytes()
+    }
+
+    /// Deterministic byte pattern shared with the independent `gguf` Python
+    /// reference implementation used to generate the expected sums/samples.
+    fn patterned_block(size: usize) -> Vec<u8> {
+        (0..size).map(|i| ((i * 37 + 11) & 0xFF) as u8).collect()
+    }
+
+    fn check_against_reference(
+        kind: u32,
+        size: usize,
+        elements: usize,
+        setup: impl Fn(&mut [u8]),
+        expected_sum: f64,
+        expected_ssq: f64,
+        samples: &[(usize, f32)],
+    ) {
+        let mut block = patterned_block(size);
+        setup(&mut block);
+        let out = dequantize_ggml_blocks(kind, &block, elements).unwrap();
+        assert_eq!(out.len(), elements, "{} value count", ggml_type_label(kind));
+        let sum: f64 = out.iter().map(|v| *v as f64).sum();
+        let ssq: f64 = out.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let tol = |expected: f64| expected.abs().max(1.0) * 1e-4;
+        assert!(
+            (sum - expected_sum).abs() <= tol(expected_sum),
+            "{} sum {sum} != {expected_sum}",
+            ggml_type_label(kind)
+        );
+        assert!(
+            (ssq - expected_ssq).abs() <= tol(expected_ssq),
+            "{} squared sum {ssq} != {expected_ssq}",
+            ggml_type_label(kind)
+        );
+        for (index, expected) in samples {
+            assert!(
+                (out[*index] - expected).abs() < 1e-3,
+                "{} value[{index}] = {} != {expected}",
+                ggml_type_label(kind),
+                out[*index]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dequantize_matches_reference_implementation() {
+        let d1 = f16_le(1.0);
+        let dh = f16_le(0.5);
+
+        check_against_reference(
+            GGML_TYPE_Q4_0, 18, 32,
+            |b| b[0..2].copy_from_slice(&d1), -21.0, 645.0,
+            &[(0, -3.0), (1, 2.0), (2, 7.0), (15, -8.0), (16, -3.0), (31, 0.0)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q4_1, 20, 32,
+            |b| { b[0..2].copy_from_slice(&d1); b[2..4].copy_from_slice(&dh); },
+            261.0, 2780.0,
+            &[(0, 15.5), (1, 4.5), (2, 9.5), (15, 10.5), (16, 9.5), (31, 12.5)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q5_0, 22, 32,
+            |b| b[0..2].copy_from_slice(&d1), 15.0, 2627.0,
+            &[(0, 9.0), (1, -2.0), (2, 3.0), (15, -12.0), (16, 14.0), (31, 1.0)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q5_1, 24, 32,
+            |b| { b[0..2].copy_from_slice(&d1); b[2..4].copy_from_slice(&dh); },
+            521.0, 11298.0,
+            &[(0, 19.5), (1, 24.5), (2, 29.5), (15, 30.5), (16, 19.5), (31, 5.5)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q8_0, 34, 32,
+            |b| b[0..2].copy_from_slice(&d1), -176.0, 190256.0,
+            &[(0, 85.0), (1, 122.0), (2, -97.0), (15, -128.0), (16, -91.0), (31, -48.0)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q2_K, 84, QK_K,
+            |b| { b[80..82].copy_from_slice(&d1); b[82..84].copy_from_slice(&dh); },
+            2059.0, 54476.0,
+            &[(0, 33.0), (1, 0.0), (2, 11.0), (15, 22.0), (16, -1.5), (31, -1.5),
+              (32, 7.5), (63, 6.5), (127, 42.0), (192, 15.0), (255, 4.5)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q3_K, 110, QK_K,
+            |b| b[108..110].copy_from_slice(&d1), 958.0, 568706.0,
+            &[(0, 81.0), (1, -108.0), (2, 27.0), (15, -54.0), (16, -96.0), (31, 64.0),
+              (32, -22.0), (63, 10.0), (64, 34.0), (127, 72.0), (192, 100.0), (255, 42.0)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q4_K, 144, QK_K,
+            |b| { b[0..2].copy_from_slice(&d1); b[2..4].copy_from_slice(&dh); },
+            54440.0, 24165220.0,
+            &[(0, 315.5), (1, -25.5), (2, 129.5), (31, 160.5), (32, 8.0), (63, 40.0),
+              (64, 420.5), (127, 81.0), (192, 530.5), (255, 48.5)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q5_K, 176, QK_K,
+            |b| { b[0..2].copy_from_slice(&d1); b[2..4].copy_from_slice(&dh); },
+            116216.0, 102828820.0,
+            &[(0, 811.5), (1, -25.5), (2, 625.5), (31, 160.5), (32, 112.0), (63, 80.0),
+              (64, 420.5), (127, -3.0), (192, 1314.5), (255, 108.5)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q6_K, 210, QK_K,
+            |b| b[208..210].copy_from_slice(&d1), 4612.0, 473900260.0,
+            &[(0, -1431.0), (1, 1696.0), (2, 583.0), (31, -96.0), (32, 231.0), (63, -580.0),
+              (64, -3040.0), (127, 1500.0), (192, -484.0), (255, -60.0)],
+        );
+        check_against_reference(
+            GGML_TYPE_Q8_K, 292, QK_K,
+            |b| b[0..4].copy_from_slice(&f32_le(1.0)), -128.0, 1398144.0,
+            &[(0, -97.0), (1, -60.0), (15, -54.0), (31, 26.0), (64, -33.0), (127, -6.0),
+              (192, 95.0), (255, 122.0)],
+        );
+    }
+
+    #[test]
+    fn test_dequantize_k_quant_blocks() {
+        // Q4_K: d=1, dmin=0, scale[0]=1, first quant 5 -> first value 5.
+        let mut q4k = vec![0u8; 144];
+        q4k[0..2].copy_from_slice(&f16_le(1.0));
+        q4k[4] = 1;
+        q4k[16] = 5;
+        let out = dequantize_ggml_blocks(GGML_TYPE_Q4_K, &q4k, QK_K).unwrap();
+        assert_eq!(out.len(), QK_K);
+        assert_eq!(out[0], 5.0);
+        assert!(out[1..].iter().all(|v| *v == 0.0));
+
+        // Q6_K: d=1, scales all 1, ql[0]=1 -> first value (1 - 32) = -31.
+        let mut q6k = vec![0u8; 210];
+        q6k[0] = 1;
+        for s in &mut q6k[192..208] {
+            *s = 1;
+        }
+        q6k[208..210].copy_from_slice(&f16_le(1.0));
+        let out = dequantize_ggml_blocks(GGML_TYPE_Q6_K, &q6k, QK_K).unwrap();
+        assert_eq!(out.len(), QK_K);
+        assert_eq!(out[0], -31.0);
+        assert_eq!(out[32], -32.0);
+        assert_eq!(out[64], -32.0);
     }
 }
 
