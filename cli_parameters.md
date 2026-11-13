@@ -4,8 +4,21 @@ This file contains the dictionary of all parameters accepted by the different su
 
 ---
 
+## 🌐 0. Global Options (all subcommands)
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `--device` | `Option<String>` | `None` | Backend/device selector. `auto` picks CUDA when compiled, then WGPU. Accepted forms: `wgpu`, `wgpu:discrete(0)`, `wgpu:integrated(0)`, `wgpu:cpu`, `vulkan`, `vulkan:integrated(0)`, `webgpu`, `metal`, `flex`, `cpu` (CubeCL CPU, opt-in feature), `cuda:0`, `rocm:0`, `ws://host:port#0` (Burn Remote over WebSocket) and `iroh://<endpoint-id>#0`. Legacy `DiscreteGpu(0)`/`IntegratedGpu(0)`/`Cpu` selectors still work. Also read from `NOCTAMBULO_DEVICE`. |
+| `--remote-token` | `Option<String>` | `$NOCTAMBULO_REMOTE_TOKEN` | Credential presented to a Burn Remote host selected with `ws://` or `iroh://`. |
+
+`NOCTAMBULO_CPU=1` remains a debug escape hatch that forces Flex regardless of the selector.
+
+---
+
 ## 🏋️ 1. `train` Subcommand Parameters
-Runs the neural network training pipeline on the GPU using WGPU.
+Runs the neural network training pipeline on the selected backend (WGPU auto, Vulkan, CUDA, Flex or a Burn Remote host).
+
+## 🏋️ 1. `train` Subcommand Parameters
 
 | Parameter | Type | Default | Technical Description / Function |
 | :--- | :--- | :--- | :--- |
@@ -187,3 +200,46 @@ Serves the web console (React build in `web/dist`) and the JSON/SSE API to contr
 | `--datasets-dir` | `String` | `"datasets"` | Directory containing datasets to list/train on. |
 | `--models-dir` | `String` | `"model_output"` | Directory containing model outputs and checkpoints. |
 
+
+---
+
+## 🔌 12. `devices` Subcommand Parameters
+Lists every backend compiled into this binary, the adapters/devices it can reach, supported float dtypes (`f32`/`f16`/`bf16`) and the exact selector to pass to `--device`.
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `--json` | `bool` (flag) | `false` | Emit machine-readable JSON instead of the table. Useful for scripts and health checks. |
+
+Example:
+
+```bash
+noctambulo devices
+noctambulo --device vulkan devices --json
+```
+
+---
+
+## 🛰️ 13. `remote-server` Subcommand Parameters
+Exposes local devices to other machines through **Burn Remote** so they can run `train`, `eval`, `generate` or `export` transparently. Clients select a device with `ws://host:port#index` or `iroh://<id>#index`.
+
+| Parameter | Type | Default | Technical Description / Function |
+| :--- | :--- | :--- | :--- |
+| `--transport` | `String` | `"websocket"` | `websocket` (unencrypted, trusted LAN) or `iroh` (encrypted, NAT traversal, authenticated endpoint id). |
+| `--bind` | `String` | `"0.0.0.0:3000"` | WebSocket listen address, or the UDP port Iroh binds (the host part is ignored for Iroh). |
+| `--devices` | `Vec<String>` | `[]` | Comma-separated selectors to expose (all must share one backend). Defaults to the global `--device`, or the automatic local backend. |
+| `--token` | `Option<String>` | `$NOCTAMBULO_REMOTE_TOKEN` | Token clients must present. WebSocket is unencrypted; use Iroh on untrusted networks. |
+| `--iroh-key` | `String` | `".noctambulo/iroh.key"` | Stable 32-byte identity file for the Iroh transport (created on first use). |
+
+Examples:
+
+```bash
+# WebSocket on a trusted LAN
+noctambulo remote-server --transport websocket --bind 0.0.0.0:3000 \
+  --devices vulkan --token secret
+
+# Iroh (prints the address clients dial)
+noctambulo remote-server --transport iroh --devices vulkan --token secret
+
+# Client
+noctambulo --device ws://gpu-host:3000#0 --remote-token secret train --file corpus.txt
+```

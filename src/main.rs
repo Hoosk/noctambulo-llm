@@ -13,7 +13,11 @@ mod tui;
 
 use clap::{Args, Parser, Subcommand};
 use config::{DType, ModelConfig, RopeScalingKind};
-use data::{combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf, extract_parquet_text_column, prepare_binary_dataset, prepare_binary_dataset_from_sources, train_custom_tokenizer, LlmTokenizer};
+use data::{
+    LlmTokenizer, combine_and_mix_datasets, combine_and_mix_weighted, download_dataset_from_hf,
+    extract_parquet_text_column, prepare_binary_dataset, prepare_binary_dataset_from_sources,
+    train_custom_tokenizer,
+};
 use export::export_to_gguf_cli as export_to_gguf;
 use generate::generate;
 use model::Llm;
@@ -50,14 +54,38 @@ struct ArchPreset {
 
 fn arch_preset(name: &str) -> Result<ArchPreset, String> {
     let preset = match name {
-        "nano" => ArchPreset { n_embd: 128, n_head: 4, n_kv_head: 2, n_layer: 4, n_ctx: 256 },
-        "tiny" => ArchPreset { n_embd: 256, n_head: 4, n_kv_head: 2, n_layer: 4, n_ctx: 256 },
-        "small" => ArchPreset { n_embd: 512, n_head: 8, n_kv_head: 2, n_layer: 8, n_ctx: 512 },
-        "base" => ArchPreset { n_embd: 768, n_head: 12, n_kv_head: 4, n_layer: 12, n_ctx: 1024 },
+        "nano" => ArchPreset {
+            n_embd: 128,
+            n_head: 4,
+            n_kv_head: 2,
+            n_layer: 4,
+            n_ctx: 256,
+        },
+        "tiny" => ArchPreset {
+            n_embd: 256,
+            n_head: 4,
+            n_kv_head: 2,
+            n_layer: 4,
+            n_ctx: 256,
+        },
+        "small" => ArchPreset {
+            n_embd: 512,
+            n_head: 8,
+            n_kv_head: 2,
+            n_layer: 8,
+            n_ctx: 512,
+        },
+        "base" => ArchPreset {
+            n_embd: 768,
+            n_head: 12,
+            n_kv_head: 4,
+            n_layer: 12,
+            n_ctx: 1024,
+        },
         other => {
             return Err(format!(
                 "Unknown preset '{other}'. Available presets: nano, tiny, small, base"
-            ))
+            ));
         }
     };
     Ok(preset)
@@ -599,22 +627,40 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     )
                     .into());
                 }
-                let weighted: Vec<(PathBuf, f32)> =
-                    sources.iter().cloned().zip(args.weights.iter().copied()).collect();
-                let max_chars = if args.max_chars == 0 { usize::MAX } else { args.max_chars };
-                combine_and_mix_weighted(&weighted, Path::new("datasets/weighted_mix.txt"), max_chars)?
-                    .to_string_lossy()
-                    .to_string()
+                let weighted: Vec<(PathBuf, f32)> = sources
+                    .iter()
+                    .cloned()
+                    .zip(args.weights.iter().copied())
+                    .collect();
+                let max_chars = if args.max_chars == 0 {
+                    usize::MAX
+                } else {
+                    args.max_chars
+                };
+                combine_and_mix_weighted(
+                    &weighted,
+                    Path::new("datasets/weighted_mix.txt"),
+                    max_chars,
+                )?
+                .to_string_lossy()
+                .to_string()
             } else if sources.len() == 1 {
                 sources[0].to_string_lossy().to_string()
             } else {
-                let combined = combine_and_mix_datasets(&sources, Path::new("datasets/combined_corpus.txt"))?;
+                let combined =
+                    combine_and_mix_datasets(&sources, Path::new("datasets/combined_corpus.txt"))?;
                 combined.to_string_lossy().to_string()
             };
 
-            println!("Training custom BPE tokenizer (vocab_size={}) on '{}'...", args.vocab_size, corpus_path);
+            println!(
+                "Training custom BPE tokenizer (vocab_size={}) on '{}'...",
+                args.vocab_size, corpus_path
+            );
             train_custom_tokenizer(&corpus_path, custom_tokenizer_file, args.vocab_size)?;
-            println!("Tokenizer successfully trained and saved to '{}'.", custom_tokenizer_file);
+            println!(
+                "Tokenizer successfully trained and saved to '{}'.",
+                custom_tokenizer_file
+            );
         }
         Commands::Download(args) => {
             let downloaded = download_dataset_from_hf(&args.repo, &args.file)?;
@@ -632,7 +678,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
 
             if args.extract_text && file_name.ends_with(".parquet") {
-                let txt_path = out_dir.join(format!("{}_text.txt", file_name.trim_end_matches(".parquet")));
+                let txt_path = out_dir.join(format!(
+                    "{}_text.txt",
+                    file_name.trim_end_matches(".parquet")
+                ));
                 extract_parquet_text_column(&saved, &txt_path)?;
                 println!("Extracted text written to {:?}", txt_path);
             } else {
@@ -694,8 +743,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 LlmTokenizer::from_file(custom_tokenizer_file)?
             };
 
-            let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
-            let max_chars = if args.max_chars == 0 { None } else { Some(args.max_chars) };
+            let max_tokens = if args.max_tokens == 0 {
+                None
+            } else {
+                Some(args.max_tokens)
+            };
+            let max_chars = if args.max_chars == 0 {
+                None
+            } else {
+                Some(args.max_chars)
+            };
             if weighted_sources.len() == 1 && max_chars.is_none() {
                 prepare_binary_dataset(
                     &weighted_sources[0].0,
@@ -736,7 +793,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Ok(entries) = std::fs::read_dir(".") {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with("dataset_") && (name.ends_with(".txt") || name.ends_with(".bin")) {
+                        if name.starts_with("dataset_")
+                            && (name.ends_with(".txt") || name.ends_with(".bin"))
+                        {
                             found_dataset = Some(entry.path());
                             break;
                         }
@@ -791,7 +850,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     LlmTokenizer::from_file(custom_tokenizer_file)?
                 }
             } else if Path::new(custom_tokenizer_file).exists() {
-                tui::print_info(&format!("Loading trained custom tokenizer from '{}'...", custom_tokenizer_file));
+                tui::print_info(&format!(
+                    "Loading trained custom tokenizer from '{}'...",
+                    custom_tokenizer_file
+                ));
                 LlmTokenizer::from_file(custom_tokenizer_file)?
             } else {
                 tui::print_warning("No custom tokenizer found. Training custom tokenizer first...");
@@ -800,13 +862,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             };
 
             let vocab_size = tokenizer.vocab_size();
-            tui::print_success(&format!("Tokenizer ready. Total vocabulary size: {}", tui::format_number(vocab_size)));
+            tui::print_success(&format!(
+                "Tokenizer ready. Total vocabulary size: {}",
+                tui::format_number(vocab_size)
+            ));
 
-            let max_tokens = if args.max_tokens == 0 { None } else { Some(args.max_tokens) };
+            let max_tokens = if args.max_tokens == 0 {
+                None
+            } else {
+                Some(args.max_tokens)
+            };
 
             let mut model_config = if let Some((_, cfg_path)) = &resume_model {
-                let cfg: ModelConfig =
-                    serde_json::from_str(&std::fs::read_to_string(cfg_path)?)?;
+                let cfg: ModelConfig = serde_json::from_str(&std::fs::read_to_string(cfg_path)?)?;
                 cfg.check_arch_version(&cfg_path.display().to_string())?;
                 if cfg.vocab_size != vocab_size {
                     return Err(format!(
@@ -845,8 +913,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     args.dropout,
                     args.attn_softcap,
                 );
-                cfg.sliding_window =
-                    (args.sliding_window > 0).then_some(args.sliding_window);
+                cfg.sliding_window = (args.sliding_window > 0).then_some(args.sliding_window);
                 cfg.sink_tokens = args.sink_tokens;
                 cfg.kv_share_group = args.kv_share_group.max(1);
                 cfg.mla_latent_dim = (args.mla_latent_dim > 0).then_some(args.mla_latent_dim);
@@ -962,7 +1029,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let weights_path = storage::model_weights_path(Path::new(&args.model_dir));
 
             if !config_path.exists() {
-                println!("Error: Model files not found in '{}'. Run 'cargo run train' first.", args.model_dir);
+                println!(
+                    "Error: Model files not found in '{}'. Run 'cargo run train' first.",
+                    args.model_dir
+                );
                 return Ok(());
             }
 
@@ -1036,7 +1106,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let config_path = Path::new(output_dir).join("config.json");
 
             if !config_path.exists() {
-                println!("Error: Model files not found in '{}'. Run 'cargo run train' first.", output_dir);
+                println!(
+                    "Error: Model files not found in '{}'. Run 'cargo run train' first.",
+                    output_dir
+                );
                 return Ok(());
             }
 
@@ -1047,7 +1120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let device = backend::default_device();
             tui::print_info(&format!("Backend: {}", backend::backend_label()));
             let model: Llm = model_config.init_model(&device);
-            let model = storage::load_module(model, &storage::model_weights_path(Path::new(output_dir)))?;
+            let model =
+                storage::load_module(model, &storage::model_weights_path(Path::new(output_dir)))?;
 
             let tokenizer_path = data::resolve_tokenizer_path(Some(Path::new(output_dir)))
                 .unwrap_or_else(|| std::path::PathBuf::from(custom_tokenizer_file));
@@ -1083,7 +1157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 _ => {
                     return Err(
                         "pass exactly one of --repo <id> or --dir <path> for import-hf".into(),
-                    )
+                    );
                 }
             };
             let output_dir = args.output_dir.unwrap_or_else(|| match &source {
@@ -1138,25 +1212,55 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let fp32_mb = fp32_bytes as f64 / (1024.0 * 1024.0);
             let flops_per_token = 2 * total_params;
 
-            println!("===============================================================================");
+            println!(
+                "==============================================================================="
+            );
             println!("Noctámbulo 2026 Model Architecture Statistics");
-            println!("===============================================================================");
+            println!(
+                "==============================================================================="
+            );
             println!("  Vocab Size       : {} tokens", vocab_size);
             println!("  Context Window   : {} tokens", model_config.n_ctx);
             println!("  Embedding Dim    : {}", n_embd);
             println!("  Hidden SwiGLU Dim: {} (aligned to 256)", hidden_dim);
             println!("  Query Heads      : {}", n_head);
-            println!("  KV Heads (GQA)   : {} (Ratio 1:{})", n_kv_head, n_head / n_kv_head);
+            println!(
+                "  KV Heads (GQA)   : {} (Ratio 1:{})",
+                n_kv_head,
+                n_head / n_kv_head
+            );
             println!("  Layers           : {}", n_layer);
-            println!("  Softcapping Cap  : {}", if model_config.attn_softcap > 0.0 { format!("{:.1}", model_config.attn_softcap) } else { "Disabled".to_string() });
+            println!(
+                "  Softcapping Cap  : {}",
+                if model_config.attn_softcap > 0.0 {
+                    format!("{:.1}", model_config.attn_softcap)
+                } else {
+                    "Disabled".to_string()
+                }
+            );
             if let Some(window) = model_config.sliding_window {
-                println!("  Sliding Window   : {} tokens ({} sink tokens)", window, model_config.sink_tokens);
+                println!(
+                    "  Sliding Window   : {} tokens ({} sink tokens)",
+                    window, model_config.sink_tokens
+                );
             }
-            println!("-------------------------------------------------------------------------------");
-            println!("  Total Parameters : {} ({:.2} Million)", total_params, total_params as f64 / 1_000_000.0);
+            println!(
+                "-------------------------------------------------------------------------------"
+            );
+            println!(
+                "  Total Parameters : {} ({:.2} Million)",
+                total_params,
+                total_params as f64 / 1_000_000.0
+            );
             println!("  Model Size (FP32): {:.2} MB", fp32_mb);
-            println!("  FLOPs per Token  : {:.2} GFLOPs", flops_per_token as f64 / 1_000_000_000.0);
-            println!("  GQA Cache Saving : {:.1}% KV-cache VRAM reduction", (1.0 - (n_kv_head as f64 / n_head as f64)) * 100.0);
+            println!(
+                "  FLOPs per Token  : {:.2} GFLOPs",
+                flops_per_token as f64 / 1_000_000_000.0
+            );
+            println!(
+                "  GQA Cache Saving : {:.1}% KV-cache VRAM reduction",
+                (1.0 - (n_kv_head as f64 / n_head as f64)) * 100.0
+            );
             let head_dim = n_embd / n_head;
             let groups = model_config.n_kv_groups();
             // Standard attention caches K and V; MLA caches only the latent.
@@ -1166,7 +1270,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 (n_kv_head * head_dim, 2usize)
             };
             let kv_bytes = |dtype: crate::model::KvCacheDtype| -> usize {
-                (row_len as f32 * dtype.bytes_per_elem(row_len) * cached_rows as f32
+                (row_len as f32
+                    * dtype.bytes_per_elem(row_len)
+                    * cached_rows as f32
                     * groups as f32)
                     .ceil() as usize
             };
@@ -1200,9 +1306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
             if let Some(geo) = model_config.eviction_geometry()? {
-                let map_mb = |bytes: usize| {
-                    bytes as f64 * geo.budget as f64 / (1024.0 * 1024.0)
-                };
+                let map_mb = |bytes: usize| bytes as f64 * geo.budget as f64 / (1024.0 * 1024.0);
                 println!(
                     "  KV Eviction      : h2o, budget {} rows ({} sinks + {} recent + {} hitters)",
                     geo.budget, geo.sinks, geo.recent, geo.hitters
@@ -1223,10 +1327,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                 }
             }
-            println!("===============================================================================");
+            println!(
+                "==============================================================================="
+            );
         }
         Commands::Serve(args) => {
-            let bind: std::net::SocketAddr = args.bind.parse().map_err(|e| format!("Invalid --bind '{}': {}", args.bind, e))?;
+            let bind: std::net::SocketAddr = args
+                .bind
+                .parse()
+                .map_err(|e| format!("Invalid --bind '{}': {}", args.bind, e))?;
             let token = args.token.or_else(|| {
                 let t = format!("{:x}", rand_like_token());
                 Some(t)
@@ -1284,8 +1393,8 @@ fn run_devices(args: DevicesArgs) -> Result<(), Box<dyn std::error::Error + Send
     println!("Default selector:  {}", backend::backend_label());
     println!();
     println!(
-        "{:<28} {:<14} {:<14} {:<16} {}",
-        "NAME", "BACKEND", "TYPE", "DTYPES", "SELECTOR"
+        "{:<28} {:<14} {:<14} {:<16} SELECTOR",
+        "NAME", "BACKEND", "TYPE", "DTYPES"
     );
     println!("{}", "-".repeat(96));
     for device in &devices {
@@ -1323,7 +1432,9 @@ fn truncate(value: &str, width: usize) -> String {
 fn run_remote_server(
     args: RemoteServerArgs,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use burn::server::{IrohIdentity, IrohTransport, RemoteServer, TokenAuthorizer, WebSocketTransport};
+    use burn::server::{
+        IrohIdentity, IrohTransport, RemoteServer, TokenAuthorizer, WebSocketTransport,
+    };
 
     let devices = if args.devices.is_empty() {
         vec![backend::default_device()]
@@ -1356,8 +1467,13 @@ fn run_remote_server(
         "websocket" | "ws" => {
             let listener = std::net::TcpListener::bind(&args.bind)?;
             let addr = listener.local_addr()?;
+            let host = if addr.ip().is_unspecified() {
+                format!("<this-host>:{}", addr.port())
+            } else {
+                addr.to_string()
+            };
             println!("Burn Remote server (WebSocket) listening on ws://{addr}");
-            println!("Connect from another machine with: --device ws://{addr}#0");
+            println!("Connect from another machine with: --device ws://{host}#0");
             server
                 .serve(WebSocketTransport::from_listener(listener))
                 .map_err(|err| format!("remote server failed: {err}"))?;
@@ -1385,10 +1501,9 @@ fn run_remote_server(
                 .map_err(|err| format!("remote server failed: {err}"))?;
         }
         other => {
-            return Err(format!(
-                "unknown transport '{other}' (expected 'websocket' or 'iroh')"
-            )
-            .into());
+            return Err(
+                format!("unknown transport '{other}' (expected 'websocket' or 'iroh')").into(),
+            );
         }
     }
     Ok(())
@@ -1443,14 +1558,20 @@ mod tests {
     #[test]
     fn test_arch_presets_and_overrides() {
         let tiny = arch_preset("tiny").unwrap();
-        assert_eq!(resolve_arch(Some(&tiny), None, None, None, None, None), (256, 4, Some(2), 4, 256));
+        assert_eq!(
+            resolve_arch(Some(&tiny), None, None, None, None, None),
+            (256, 4, Some(2), 4, 256)
+        );
 
         // Explicit flags win over the preset.
         let resolved = resolve_arch(Some(&tiny), Some(384), Some(8), Some(1), Some(6), Some(512));
         assert_eq!(resolved, (384, 8, Some(1), 6, 512));
 
         // Without a preset the historical defaults apply (MHA, no GQA).
-        assert_eq!(resolve_arch(None, None, None, None, None, None), (256, 4, None, 4, 256));
+        assert_eq!(
+            resolve_arch(None, None, None, None, None, None),
+            (256, 4, None, 4, 256)
+        );
 
         assert!(arch_preset("small").is_ok());
         assert!(arch_preset("base").is_ok());

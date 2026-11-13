@@ -55,6 +55,51 @@ function FilesPanel({ dir }: { dir: string }) {
   );
 }
 
+function ModelBadges({ model, isActive }: { model: ModelInfo; isActive: boolean }) {
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <span className="font-mono text-sm text-white">{model.name}</span>
+      {model.default ? <Badge tone="violet">default</Badge> : null}
+      {model.import_source ? <Badge tone="sky">{model.import_source}</Badge> : null}
+      {model.legacy_weights ? <Badge tone="amber">legacy .bin</Badge> : null}
+      {model.compatible ? null : <Badge tone="rose">incompatible</Badge>}
+      {model.steps != null && model.steps <= 2 ? <Badge tone="amber">demo</Badge> : null}
+      {isActive ? (
+        <Badge tone="emerald" pulse>
+          active
+        </Badge>
+      ) : null}
+    </div>
+  );
+}
+
+function ModelMeta({ model }: { model: ModelInfo }) {
+  const rope =
+    model.rope_base >= 1e5 ? model.rope_base.toExponential(0) : String(model.rope_base);
+  return (
+    <>
+      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-500 tnum font-mono">
+        <span>d {model.n_embd}</span>
+        <span>heads {model.n_head}</span>
+        <span>layers {model.n_layer}</span>
+        <span>ctx {model.n_ctx}</span>
+        <span>vocab {model.vocab}</span>
+        <span>ffn {model.ffn_hidden}</span>
+        <span>{model.params_m.toFixed(2)}M</span>
+        <span>{fmtBytes(model.size_mb * 1024 * 1024)}</span>
+      </div>
+      <div className="mt-1 text-[10px] text-slate-600 font-mono truncate">{model.dir}</div>
+      <div className="mt-0.5 text-[10px] text-slate-500 tnum">
+        arch v{model.arch_version}
+        {` · rope θ ${rope}`}
+        {` · eps ${model.rms_norm_eps.toExponential(0)}`}
+        {model.steps != null ? ` · ${model.steps} steps` : null}
+        {model.best_val_loss != null ? ` · best val ${model.best_val_loss.toFixed(3)}` : null}
+      </div>
+    </>
+  );
+}
+
 function ModelRow({
   model,
   isActive,
@@ -85,37 +130,8 @@ function ModelRow({
       }`}
     >
       <div className="flex-1 min-w-52">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="font-mono text-sm text-white">{model.name}</span>
-          {model.default ? <Badge tone="violet">default</Badge> : null}
-          {model.import_source ? <Badge tone="sky">{model.import_source}</Badge> : null}
-          {model.legacy_weights ? <Badge tone="amber">legacy .bin</Badge> : null}
-          {model.compatible ? null : <Badge tone="rose">incompatible</Badge>}
-          {model.steps != null && model.steps <= 2 ? <Badge tone="amber">demo</Badge> : null}
-          {isActive ? (
-            <Badge tone="emerald" pulse>
-              active
-            </Badge>
-          ) : null}
-        </div>
-        <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-slate-500 tnum font-mono">
-          <span>d {model.n_embd}</span>
-          <span>heads {model.n_head}</span>
-          <span>layers {model.n_layer}</span>
-          <span>ctx {model.n_ctx}</span>
-          <span>vocab {model.vocab}</span>
-          <span>ffn {model.ffn_hidden}</span>
-          <span>{model.params_m.toFixed(2)}M</span>
-          <span>{fmtBytes(model.size_mb * 1024 * 1024)}</span>
-        </div>
-        <div className="mt-1 text-[10px] text-slate-600 font-mono truncate">{model.dir}</div>
-        <div className="mt-0.5 text-[10px] text-slate-500 tnum">
-          arch v{model.arch_version}
-          {` · rope θ ${model.rope_base >= 1e5 ? model.rope_base.toExponential(0) : model.rope_base}`}
-          {` · eps ${model.rms_norm_eps.toExponential(0)}`}
-          {model.steps != null ? ` · ${model.steps} steps` : ""}
-          {model.best_val_loss != null ? ` · best val ${model.best_val_loss.toFixed(3)}` : ""}
-        </div>
+        <ModelBadges model={model} isActive={isActive} />
+        <ModelMeta model={model} />
       </div>
       <div className="flex gap-2 shrink-0 flex-wrap">
         <Button

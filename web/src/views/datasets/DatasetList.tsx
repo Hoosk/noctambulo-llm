@@ -35,6 +35,7 @@ function DatasetRow({
     <div className="lift grid grid-cols-[auto_1fr_auto_auto] gap-3 items-center px-4 py-2.5 rounded-xl bg-slate-950/70 border border-slate-800/70">
       <input
         type="checkbox"
+        aria-label={`Select ${dataset.name}`}
         checked={checked}
         onChange={(e) => onToggle(e.target.checked)}
         className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
@@ -80,6 +81,7 @@ function SelectAllCheckbox({
     <input
       ref={ref}
       type="checkbox"
+      aria-label="Select all datasets"
       checked={checked}
       onChange={(e) => onChange(e.target.checked)}
       className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
@@ -106,6 +108,7 @@ export function DatasetList({ datasets, selected, onToggle, onToggleAll, onInfo,
           </span>
           <input
             type="text"
+            aria-label="Filter datasets"
             placeholder="Filter by name…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}

@@ -4,8 +4,8 @@
 
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
 [![Burn](https://img.shields.io/badge/Burn-0.22-blue)](https://burn.dev/)
-[![GPU](https://img.shields.io/badge/GPU-WGPU%20%7C%20CUDA-6f42c1)](https://wgpu.rs/)
-[![Tests](https://img.shields.io/badge/tests-113%20passing-brightgreen)](#verification)
+[![GPU](https://img.shields.io/badge/GPU-WGPU%20%7C%20Vulkan%20%7C%20CUDA%20%7C%20Remote-6f42c1)](https://wgpu.rs/)
+[![Tests](https://img.shields.io/badge/tests-127%20passing-brightgreen)](#verification)
 [![GGUF](https://img.shields.io/badge/export-GGUF%20v3-9cf)](doc/models/export.md)
 [![Web](https://img.shields.io/badge/console-React%2019%20%2B%20Axum-0ea5e9)](#web-console)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -19,7 +19,7 @@ console. One CLI, one binary, no Python runtime.
 flowchart LR
   A[Text / Parquet / HF Hub] --> B[BPE tokenizer]
   B --> C[Tokenized .bin]
-  C --> D[Train<br/>WGPU / CUDA]
+  C --> D[Train<br/>WGPU / Vulkan / CUDA / Remote]
   D --> E[Checkpoints<br/>full-state resume]
   E --> F[Evaluate<br/>PPL + BPB]
   E --> G[Generate<br/>CLI + SSE]
@@ -56,7 +56,8 @@ Start it before bed. Check the loss curve over coffee.
 - AdamW with decoupled weight decay, gradient clipping, label smoothing, z-loss.
 - Datasets from plain text, Parquet (direct ingest, no intermediate `.txt`) or the Hugging
   Face Hub; exact-duplicate removal, weighted mixing, `.bin` fingerprints.
-- f32 training on WGPU (or CUDA with `--features cuda`); records are always f32.
+- f32 training on WGPU, Vulkan/SPIR-V, CUDA (`--features cuda`) or Flex CPU; records are always f32.
+- Burn Remote: expose a machine's accelerators with `remote-server` and train/generate on them with `--device ws://host:port#0` or `iroh://<id>#0`.
 
 **Inference**
 - Top-K, Top-P, Min-P, temperature and repetition penalty.
@@ -94,7 +95,8 @@ Start it before bed. Check the loss curve over coffee.
 - Datasets: HF file picker, downloads, weighted mixing, duplicate removal.
 - Models: source badges, architecture details, file downloads, rename/delete, GGUF and HF
   imports with progress.
-- Devices: CPU/GPU/NPU detection, host system card, real-time telemetry.
+- Devices: local accelerator inventory, per-device dtype/selector, a default-device switch, remote compute nodes, host system card and real-time telemetry.
+- Nocturnal observatory visual language: Fraunces/Instrument Sans/IBM Plex Mono, warm obsidian + brass + solar amber, instrument panels and staggered reveals.
 
 ## Quickstart
 
@@ -105,6 +107,23 @@ console.
 git clone https://github.com/Hoosk/noctambulo-llm.git
 cd noctambulo-llm
 cargo build --release
+```
+
+List every compiled backend and copy its selector:
+
+```bash
+cargo run --release -- devices
+cargo run --release -- --device vulkan devices --json
+```
+
+Optional: serve this machine's accelerators to another host over Burn Remote:
+
+```bash
+# on the GPU machine
+cargo run --release -- remote-server --transport websocket --bind 0.0.0.0:3000 --token secret
+
+# on the laptop
+cargo run --release -- --device ws://gpu-host:3000#0 --remote-token secret train --file corpus.txt
 ```
 
 ```bash
@@ -161,22 +180,26 @@ limitations.
 ## Verification
 
 ```bash
-cargo test                  # 113 tests
+cargo test                  # 127 tests
 cargo clippy --all-targets  # clean
-cd web && npm run lint && npm run build
+cd web && npm run lint && npm run doctor && npm run build
 ```
 
 Covered: tokenizer/datasets, full-state resume, gradient accumulation, eval/BPB, cached
 decode parity (f32/f16/int8/q4, MLA, sharing, sliding window), H2O eviction invariants,
 spill/replay dense-context parity, GGUF export/import golden layout, HF safetensors
-conversion roundtrip, API paths and web build.
+conversion roundtrip, backend selector parsing, remote-node API paths, API paths, web build
+and a 21/21 CDP browser smoke run.
 
 ### Measured on the development machine
 
-Internal smoke benchmarks on Burn 0.22 with fusion/autotune disabled (useful as a sanity check, not as marketing numbers):
+Internal smoke benchmarks on Burn 0.22 with fusion/autotune disabled by default (upstream burn#5257; useful as a sanity check, not as marketing numbers):
 
 | Workload | Result |
 | --- | --- |
+| Nano (2M), 400k tokens, n_ctx 128, batch 128 — WGPU auto | 45.8 s |
+| Same, pinned Vulkan/SPIR-V | 46.3 s |
+| Same, Flex CPU (SIMD + Rayon) | 185.0 s |
 | Tiny 2-layer model, dense decode | ~69 tok/s |
 | Same model, H2O eviction (budget 64) | ~53 tok/s (~25% overhead) |
 | Same model, spill/replay with budget growth | 36–43 tok/s |
@@ -189,6 +212,7 @@ Internal smoke benchmarks on Burn 0.22 with fusion/autotune disabled (useful as 
 ```text
 src/
   main.rs        CLI (clap)
+  backend.rs     selector parser, device enumeration, remote registry
   model.rs       decoder, attention, KV cache formats + eviction
   train.rs       training loop, eval, checkpoints
   generate.rs    sampling, SSE streaming, growth schedule
@@ -196,7 +220,7 @@ src/
   export.rs      GGUF v3 writer
   import.rs      GGUF reader
   hf_import.rs   safetensors → native converter
-  serve/         Axum API, ops, run history, telemetry
+  serve/         Axum API, ops, run history, telemetry, remote nodes
 web/             React console (Vite + Tailwind)
 doc/             architecture, training/, inference/, models/
 ```
@@ -212,7 +236,8 @@ doc/             architecture, training/, inference/, models/
 
 ## Known limits
 
-- **Fusion/autotune disabled**: Burn 0.22's fusion graph cache returned wrong matmul results in this engine (reproduced against a manual reference; Flex and no-fusion WGPU are exact). `Cargo.toml` uses `default-features = false` to keep them off; re-enable once upstream fixes the fusion cache. `NOCTAMBULO_CPU=1` forces Flex for debugging.
+- **Fusion/autotune disabled by default**: Burn 0.22 returns wrong results when fusion and autotune are enabled together in cached decode (upstream `tracel-ai/burn#5257`, root cause `cubecl#1451` / `gfx-rs/wgpu#9523`). Both are opt-in Cargo features (`--features fusion`, `--features autotune`); fusion alone is exact here but gives no measurable training speedup. `NOCTAMBULO_CPU=1` still forces Flex for debugging.
+- Remote transport is unencrypted over WebSocket; use a token on trusted networks and Iroh for untrusted ones. The remote device receives the full tensor stream, so bandwidth matters.
 
 - Training and records are **f32 only** (the trainer rejects f16); f16 inference and f16/int8/q4 KV caches are supported.
 - GGUF import accepts f32/f16 and standard quantized tensors (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K–Q6_K, Q8_K); IQ-quants are rejected with a clear error.

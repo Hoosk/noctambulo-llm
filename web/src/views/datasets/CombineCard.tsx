@@ -113,6 +113,7 @@ export function CombineCard({
                   type="number"
                   min={0}
                   step={0.5}
+                  aria-label={`Weight for ${name}`}
                   value={weightOf(name)}
                   onChange={(e) => setWeights((prev) => ({ ...prev, [name]: e.target.value }))}
                   className="w-full px-2 py-1.5 rounded-lg bg-slate-950/70 border border-slate-700/60 text-white text-xs tnum focus:outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/30 transition"

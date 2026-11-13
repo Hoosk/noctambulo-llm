@@ -171,7 +171,7 @@ function Meter({
       </div>
       <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
         <div
-          className={`h-full rounded-full bg-gradient-to-r ${colors[tone]} transition-all duration-300`}
+          className={`h-full rounded-full bg-gradient-to-r ${colors[tone]} transition-[height] duration-300`}
           style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
         />
       </div>
@@ -255,7 +255,7 @@ function SystemCard() {
                   <div
                     key={i}
                     title={`core ${i}: ${usage.toFixed(0)}%`}
-                    className="flex-1 min-w-[3px] rounded-sm bg-gradient-to-t from-amber-600 to-amber-300 transition-all duration-300"
+                    className="flex-1 min-w-[3px] rounded-sm bg-gradient-to-t from-amber-600 to-amber-300 transition-[height] duration-300"
                     style={{ height: `${Math.max(4, Math.min(100, usage))}%` }}
                   />
                 ))}
@@ -550,8 +550,24 @@ export function DevicesView() {
   }, []);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    let cancelled = false;
+    Promise.all([api.getDevices(), api.getRemoteNodes()])
+      .then(([list, remotes]) => {
+        if (cancelled) return;
+        setDevices(list);
+        setNodes(remotes);
+        setError("");
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : "unknown");
+      })
+      .finally(() => {
+        if (!cancelled) setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const onDefault = async (selector: string) => {
     try {

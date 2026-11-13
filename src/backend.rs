@@ -87,10 +87,19 @@ pub fn probe_remote_nodes() -> Vec<RemoteNodeDevices> {
 
 /// Test that `url` accepts connections and report how many devices it hosts.
 pub fn probe_remote_url(url: &str, token: Option<&str>) -> Result<usize, String> {
-    let host = make_remote_host(url, token)?;
-    Ok(host.devices().map_err(|err| err.to_string())?.len())
+    #[cfg(feature = "remote")]
+    {
+        let host = make_remote_host(url, token)?;
+        Ok(host.devices().map_err(|err| err.to_string())?.len())
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = (url, token);
+        Err("remote support is not compiled in (enable the `remote` feature)".into())
+    }
 }
 
+#[cfg(feature = "remote")]
 fn remote_devices_for(node: &RemoteNode) -> Result<Vec<DeviceChoice>, String> {
     let host = make_remote_host(&node.url, node.token.as_deref())?;
     let devices = host.devices().map_err(|err| err.to_string())?;
@@ -203,7 +212,14 @@ pub fn training_device() -> Device {
 
 /// CPU-only device: deterministic tests and GPU-free model conversion.
 pub fn cpu_device() -> Device {
-    Device::flex()
+    #[cfg(feature = "flex")]
+    {
+        Device::flex()
+    }
+    #[cfg(not(feature = "flex"))]
+    {
+        panic!("CPU model conversion requires the `flex` feature");
+    }
 }
 
 /// Human-readable backend name for logs.
@@ -234,21 +250,17 @@ pub fn backend_label() -> String {
 fn auto_device() -> Device {
     #[cfg(feature = "cuda")]
     {
-        return Device::cuda(0);
+        Device::cuda(0)
     }
     #[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
     {
-        return Device::wgpu(DeviceKind::DefaultDevice);
+        Device::wgpu(DeviceKind::DefaultDevice)
     }
     #[cfg(all(not(feature = "cuda"), not(feature = "wgpu"), feature = "flex"))]
     {
-        return Device::flex();
+        Device::flex()
     }
-    #[cfg(all(
-        not(feature = "cuda"),
-        not(feature = "wgpu"),
-        not(feature = "flex")
-    ))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "wgpu"), not(feature = "flex")))]
     {
         panic!("no Burn execution backend compiled in");
     }
@@ -279,9 +291,7 @@ pub fn resolve_device_with_token(
     let raw = selector.trim();
     let lower = raw.to_ascii_lowercase();
 
-    if raw.is_empty()
-        || matches!(lower.as_str(), "auto" | "default" | "defaultdevice")
-    {
+    if raw.is_empty() || matches!(lower.as_str(), "auto" | "default" | "defaultdevice") {
         let device = auto_device();
         return Ok(SelectedDevice {
             device,
@@ -303,34 +313,30 @@ pub fn resolve_device_with_token(
         return Ok(selected(wgpu_device(kind)?, "WGPU", canonical));
     }
 
-    if let Some((prefix, rest)) = split_prefix(&lower) {
-        if let Some(kind) = wgpu_kind(rest) {
-            let canonical = canonical_wgpu(&kind, prefix);
-            let backend = match prefix {
-                "wgpu" => wgpu_device(kind)?,
-                "vulkan" => vulkan_device(kind)?,
-                "webgpu" => webgpu_device(kind)?,
-                "metal" => metal_device(kind)?,
-                other => return Err(format!("unknown backend prefix '{other}'")),
-            };
-            let name = match prefix {
-                "vulkan" => "Vulkan",
-                "webgpu" => "WebGPU",
-                "metal" => "Metal",
-                _ => "WGPU",
-            };
-            return Ok(selected(backend, name, canonical));
-        }
+    if let Some((prefix, rest)) = split_prefix(&lower)
+        && let Some(kind) = wgpu_kind(rest)
+    {
+        let canonical = canonical_wgpu(&kind, prefix);
+        let backend = match prefix {
+            "wgpu" => wgpu_device(kind)?,
+            "vulkan" => vulkan_device(kind)?,
+            "webgpu" => webgpu_device(kind)?,
+            "metal" => metal_device(kind)?,
+            other => return Err(format!("unknown backend prefix '{other}'")),
+        };
+        let name = match prefix {
+            "vulkan" => "Vulkan",
+            "webgpu" => "WebGPU",
+            "metal" => "Metal",
+            _ => "WGPU",
+        };
+        return Ok(selected(backend, name, canonical));
     }
 
     let default_kind = DeviceKind::DefaultDevice;
     match lower.as_str() {
         "wgpu" => {
-            return Ok(selected(
-                wgpu_device(default_kind)?,
-                "WGPU",
-                "wgpu".into(),
-            ));
+            return Ok(selected(wgpu_device(default_kind)?, "WGPU", "wgpu".into()));
         }
         "vulkan" => {
             return Ok(selected(
@@ -362,7 +368,7 @@ pub fn resolve_device_with_token(
     }
 
     if matches!(lower.as_str(), "flex" | "cpu-flex" | "flex-cpu") {
-        return Ok(selected(Device::flex(), "Flex (CPU)", "flex".into()));
+        return Ok(selected(flex_device()?, "Flex (CPU)", "flex".into()));
     }
 
     if matches!(lower.as_str(), "cpu" | "cubecl-cpu" | "cubecl") {
@@ -401,21 +407,17 @@ fn selected(device: Device, backend: impl Into<String>, selector: String) -> Sel
 fn auto_label() -> String {
     #[cfg(feature = "cuda")]
     {
-        return "CUDA".into();
+        "CUDA".into()
     }
     #[cfg(all(not(feature = "cuda"), feature = "wgpu"))]
     {
-        return "WGPU".into();
+        "WGPU".into()
     }
     #[cfg(all(not(feature = "cuda"), not(feature = "wgpu"), feature = "flex"))]
     {
-        return "Flex (CPU)".into();
+        "Flex (CPU)".into()
     }
-    #[cfg(all(
-        not(feature = "cuda"),
-        not(feature = "wgpu"),
-        not(feature = "flex")
-    ))]
+    #[cfg(all(not(feature = "cuda"), not(feature = "wgpu"), not(feature = "flex")))]
     {
         "unknown".into()
     }
@@ -557,6 +559,17 @@ fn metal_device(kind: DeviceKind) -> Result<Device, String> {
     }
 }
 
+fn flex_device() -> Result<Device, String> {
+    #[cfg(feature = "flex")]
+    {
+        Ok(Device::flex())
+    }
+    #[cfg(not(feature = "flex"))]
+    {
+        Err("Flex is not compiled in (enable the `flex` feature)".into())
+    }
+}
+
 fn cpu_backend_device() -> Result<Device, String> {
     #[cfg(feature = "cpu")]
     {
@@ -593,30 +606,39 @@ fn rocm_device(index: usize) -> Result<Device, String> {
 }
 
 fn resolve_remote(selector: &str, token: Option<&str>) -> Result<SelectedDevice, String> {
-    let (base, index) = split_remote_index(selector);
-    let (url, canonical_base, token) = if let Some(id) = base.strip_prefix("remote://") {
-        let id = id.split(['/', '?']).next().unwrap_or(id);
-        let node =
-            remote_node(id).ok_or_else(|| format!("unknown remote node '{id}'"))?;
-        let token = node.token.clone().or_else(|| token.map(str::to_string));
-        (node.url, format!("remote://{id}"), token)
-    } else {
-        (
-            base.to_string(),
-            base.to_string(),
-            token.map(str::to_string),
-        )
-    };
-    let host = make_remote_host(&url, token.as_deref())?;
-    let device = Device::remote_options(&host)
-        .device_index(index)
-        .init()
-        .map_err(|err| format!("cannot connect to remote compute host '{canonical_base}': {err}"))?;
-    Ok(SelectedDevice {
-        device,
-        backend: "Remote".into(),
-        selector: format!("{canonical_base}#{index}"),
-    })
+    #[cfg(feature = "remote")]
+    {
+        let (base, index) = split_remote_index(selector);
+        let (url, canonical_base, token) = if let Some(id) = base.strip_prefix("remote://") {
+            let id = id.split(['/', '?']).next().unwrap_or(id);
+            let node = remote_node(id).ok_or_else(|| format!("unknown remote node '{id}'"))?;
+            let token = node.token.clone().or_else(|| token.map(str::to_string));
+            (node.url, format!("remote://{id}"), token)
+        } else {
+            (
+                base.to_string(),
+                base.to_string(),
+                token.map(str::to_string),
+            )
+        };
+        let host = make_remote_host(&url, token.as_deref())?;
+        let device = Device::remote_options(&host)
+            .device_index(index)
+            .init()
+            .map_err(|err| {
+                format!("cannot connect to remote compute host '{canonical_base}': {err}")
+            })?;
+        Ok(SelectedDevice {
+            device,
+            backend: "Remote".into(),
+            selector: format!("{canonical_base}#{index}"),
+        })
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        let _ = (selector, token);
+        Err("remote support is not compiled in (enable the `remote` feature)".into())
+    }
 }
 
 #[cfg(feature = "remote")]
@@ -647,6 +669,11 @@ fn make_remote_host(url: &str, token: Option<&str>) -> Result<burn::remote::Remo
         Some(token) if !token.is_empty() => host.with_credential(token),
         _ => host,
     })
+}
+
+#[cfg(not(feature = "remote"))]
+fn remote_devices_for(_node: &RemoteNode) -> Result<Vec<DeviceChoice>, String> {
+    Err("remote support is not compiled in (enable the `remote` feature)".into())
 }
 
 #[cfg(not(feature = "remote"))]
@@ -684,12 +711,7 @@ pub fn local_devices() -> Vec<DeviceChoice> {
 
     #[cfg(feature = "vulkan")]
     if !out.iter().any(|d| d.backend == "Vulkan") {
-        out.push(synthetic(
-            "Vulkan (pinned)",
-            "Vulkan",
-            "GPU",
-            "vulkan",
-        ));
+        out.push(synthetic("Vulkan (pinned)", "Vulkan", "GPU", "vulkan"));
     }
 
     #[cfg(feature = "cuda")]
@@ -701,7 +723,8 @@ pub fn local_devices() -> Vec<DeviceChoice> {
     #[cfg(feature = "cpu")]
     out.push(synthetic("CPU (CubeCL)", "CubeCL CPU", "CPU", "cpu"));
 
-    if cfg!(feature = "flex") {
+    #[cfg(feature = "flex")]
+    {
         let device = Device::flex();
         out.push(DeviceChoice {
             name: "CPU (Flex, SIMD + Rayon)".into(),
@@ -801,9 +824,9 @@ fn wgpu_choices() -> Vec<DeviceChoice> {
         };
 
         let mut vram_bytes = None;
-        if let Ok((device, _queue)) = futures::executor::block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor::default()),
-        ) {
+        if let Ok((device, _queue)) =
+            futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        {
             let max_buf = device.limits().max_buffer_size;
             if max_buf > 0 {
                 vram_bytes = Some(max_buf);

@@ -20,22 +20,18 @@ export function GenerateOutput({
   status: { text: string; tone: StatusTone };
 }) {
   const preRef = useRef<HTMLPreElement | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copiedText, setCopiedText] = useState("");
 
   useEffect(() => {
     const node = preRef.current;
     if (node) node.scrollTop = node.scrollHeight;
   }, [text]);
 
-  useEffect(() => {
-    setCopied(false);
-  }, [text]);
-
   const copy = async () => {
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
-      setCopied(true);
+      setCopiedText(text);
     } catch {
       /* clipboard unavailable */
     }
@@ -54,7 +50,7 @@ export function GenerateOutput({
           disabled={!text}
           onClick={() => void copy()}
         >
-          {copied ? "Copied" : "Copy"}
+          {copiedText === text ? "Copied" : "Copy"}
         </Button>
       </div>
       <div className="flex items-start gap-3">
