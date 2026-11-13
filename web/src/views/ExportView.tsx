@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
-import type { ModelInfo } from "../api/types";
+import type { DeviceInfo, ModelInfo } from "../api/types";
 import { Button } from "../components/Button";
 import { ExportResult } from "../components/ExportResult";
 import { OpProgress } from "../components/OpProgress";
@@ -13,6 +13,8 @@ export function ExportView() {
   const { activeModel, cancelOp } = useAppState();
   const toast = useToast();
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
+  const [device, setDevice] = useState("auto");
   const [modelDir, setModelDir] = useState(activeModel);
   const [name, setName] = useState("noctambulo");
   const [approx, setApprox] = useState(false);
@@ -37,18 +39,25 @@ export function ExportView() {
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .getModels()
-      .then((list) => {
+    Promise.allSettled([api.getModels(), api.getDevices()])
+      .then(([modelsResult, devicesResult]) => {
         if (cancelled) return;
-        setModels(list);
-        // Self-heal a stale persisted selection (model deleted/renamed outside
-        // the UI) so Export never posts a non-existent model dir.
-        setModelDir((current) =>
-          current && list.some((m) => m.dir === current)
-            ? current
-            : (list.find((m) => m.default)?.dir ?? list[0]?.dir ?? ""),
-        );
+        if (modelsResult.status === "fulfilled") {
+          const list = modelsResult.value;
+          setModels(list);
+          // Self-heal a stale persisted selection (model deleted/renamed outside
+          // the UI) so Export never posts a non-existent model dir.
+          setModelDir((current) =>
+            current && list.some((m) => m.dir === current)
+              ? current
+              : (list.find((m) => m.default)?.dir ?? list[0]?.dir ?? ""),
+          );
+        }
+        if (devicesResult.status === "fulfilled") {
+          setDevices(devicesResult.value);
+          const preferred = devicesResult.value.find((d) => d.default)?.selector;
+          if (preferred) setDevice(preferred);
+        }
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(e instanceof Error ? e.message : "unknown");
@@ -71,6 +80,7 @@ export function ExportView() {
         modelDir: selectedDir,
         modelName: name || "noctambulo",
         approx,
+        device: device || undefined,
       });
       setOpId(res.opId);
     } catch (e) {
@@ -84,9 +94,9 @@ export function ExportView() {
         title="Export to GGUF"
         subtitle="Convert a trained model to GGUF for llama.cpp and other runtimes."
       />
-      <div className="max-w-md glass-card rounded-2xl p-5">
-        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4">
-          Configuration
+      <div className="max-w-xl glass-card corner-tick rounded-xl p-5">
+        <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500 mb-4">
+          Export instrument
         </h3>
         <div className="mb-3">
           <Field label="Model">
@@ -103,9 +113,20 @@ export function ExportView() {
             </Select>
           </Field>
         </div>
-        <div className="mb-4">
+        <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="GGUF name">
             <Input type="text" value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+          <Field label="Device">
+            <Select value={device} onChange={(e) => setDevice(e.target.value)}>
+              {devices.length === 0 ? <option value="auto">auto</option> : null}
+              {devices.map((d) => (
+                <option key={d.selector} value={d.selector} disabled={!d.selectable}>
+                  {d.name} · {d.backend}
+                  {d.selectable ? "" : " · offline"}
+                </option>
+              ))}
+            </Select>
           </Field>
         </div>
         <label className="flex items-center gap-2.5 text-xs text-slate-400 cursor-pointer select-none mb-4">
@@ -113,7 +134,7 @@ export function ExportView() {
             type="checkbox"
             checked={approx}
             onChange={(e) => setApprox(e.target.checked)}
-            className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+            className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
           />
           Approx export (standard-attention approximation for grouped KV models)
         </label>

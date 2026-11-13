@@ -19,9 +19,9 @@ export function LastRunStrip() {
   const steps = job.step || lastLossPoint?.x || 0;
 
   return (
-    <div className="mb-4 rounded-xl border border-slate-800/70 bg-slate-950/40 px-3 py-2">
+    <div className="mb-4 rounded-lg border border-slate-800/70 bg-slate-950/40 px-3 py-2">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+        <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">
           Last run
         </span>
         <Badge tone={badge.tone}>{badge.label}</Badge>

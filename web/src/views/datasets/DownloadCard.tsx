@@ -80,8 +80,8 @@ export function DownloadCard({ onDownloaded }: { onDownloaded: () => void }) {
   };
 
   return (
-    <div className="glass-card rounded-2xl p-5">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4">
+    <div className="glass-card corner-tick rounded-xl p-5">
+      <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500 mb-4">
         Download from Hugging Face
       </h3>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">

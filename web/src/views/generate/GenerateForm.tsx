@@ -1,4 +1,4 @@
-import type { ModelInfo } from "../../api/types";
+import type { DeviceInfo, ModelInfo } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Field, Input, Select, Textarea } from "../../components/ui";
 
@@ -21,14 +21,17 @@ export interface GenForm {
   kvMaxBudget: string;
   kvGrow: string;
   kvGrowInterval: string;
+  device: string;
 }
 
 interface Props {
   models: ModelInfo[];
+  devices: DeviceInfo[];
   modelDir: string;
   onModelChange: (dir: string) => void;
   form: GenForm;
   onField: (key: keyof GenForm, value: string | boolean) => void;
+  onPreset: (name: string) => void;
   busy: boolean;
   onRun: () => void;
   onStop: () => void;
@@ -36,18 +39,20 @@ interface Props {
 
 export function GenerateForm({
   models,
+  devices,
   modelDir,
   onModelChange,
   form,
   onField,
+  onPreset,
   busy,
   onRun,
   onStop,
 }: Props) {
   return (
-    <div className="glass-card rounded-2xl p-5 min-w-0">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4">
-        Configuration
+    <div className="glass-card corner-tick rounded-xl p-5 min-w-0">
+      <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500 mb-4">
+        Generation instrument
       </h3>
 
       <div className="mb-3">
@@ -68,6 +73,23 @@ export function GenerateForm({
       </div>
 
       <div className="mb-3">
+        <Field label="Device">
+          <Select value={form.device} onChange={(e) => onField("device", e.target.value)}>
+            {devices.length === 0 ? <option value="auto">auto</option> : null}
+            {devices.map((d) => (
+              <option key={d.selector} value={d.selector} disabled={!d.selectable}>
+                {d.name} · {d.backend}
+                {d.selectable ? "" : " · offline"}
+              </option>
+            ))}
+          </Select>
+        </Field>
+        <p className="mt-1 text-[10px] leading-relaxed text-slate-500">
+          Vulkan, WGPU, Flex or a remote node. Defaults to the server selection.
+        </p>
+      </div>
+
+      <div className="mb-3">
         <Field label="Prompt">
           <Textarea
             rows={4}
@@ -76,6 +98,21 @@ export function GenerateForm({
             onChange={(e) => onField("prompt", e.target.value)}
           />
         </Field>
+      </div>
+
+      <div className="mb-2 mt-4 flex flex-wrap items-center gap-2">
+        <span className="font-mono text-[9px] uppercase tracking-[0.18em] text-slate-500">
+          Sampling preset
+        </span>
+        <Button variant="ghost" className="px-2.5 py-1 text-[10px]" onClick={() => onPreset("story")}>
+          Story
+        </Button>
+        <Button variant="ghost" className="px-2.5 py-1 text-[10px]" onClick={() => onPreset("balanced")}>
+          Balanced
+        </Button>
+        <Button variant="ghost" className="px-2.5 py-1 text-[10px]" onClick={() => onPreset("precise")}>
+          Precise
+        </Button>
       </div>
 
       <div className="grid grid-cols-3 gap-3 mt-2">
@@ -187,7 +224,7 @@ export function GenerateForm({
             type="checkbox"
             checked={form.kvSpill}
             onChange={(e) => onField("kvSpill", e.target.checked)}
-            className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+            className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
           />
           Archive evicted rows in host RAM and replay them
         </label>

@@ -8,7 +8,7 @@ import { fmtNum } from "../../lib/format";
 import { useAppState } from "../../state/appContext";
 import { LastRunStrip } from "./LastRunStrip";
 
-const COLORS = ["#8b5cf6", "#38bdf8", "#f59e0b", "#34d399", "#fb7185"];
+const COLORS = ["#f2a93b", "#7ec7cf", "#8bc39d", "#e4897c", "#c9a467"];
 const MAX_SELECTED = 3;
 
 function statusTone(status: string): Tone {
@@ -110,9 +110,9 @@ export function RunHistoryCard() {
   });
 
   return (
-    <div className="glass-card rounded-2xl p-5">
+    <div className="glass-card corner-tick rounded-xl p-5">
       <div className="flex items-center justify-between gap-3 mb-2">
-        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Run history</h3>
+        <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Run history</h3>
         <Button
           icon="refresh"
           className="px-3 py-1.5 text-xs"
@@ -133,7 +133,7 @@ export function RunHistoryCard() {
       <LastRunStrip />
 
       {loaded && runs.length === 0 ? (
-        <div className="p-8 rounded-xl border border-dashed border-slate-700/70 text-center text-slate-500 text-sm">
+        <div className="p-8 rounded-lg border border-dashed border-slate-700/70 text-center text-slate-500 text-sm">
           No runs yet. Start a training job and it will show up here.
         </div>
       ) : null}
@@ -150,7 +150,7 @@ export function RunHistoryCard() {
                     checked={checked}
                     disabled={!checked && selected.length >= MAX_SELECTED}
                     onChange={() => toggleRun(run.id)}
-                    className="accent-violet-500"
+                    className="accent-amber-500"
                   />
                   <span className="text-sm text-slate-200 font-mono truncate">{run.dataset}</span>
                 </label>

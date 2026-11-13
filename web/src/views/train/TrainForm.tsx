@@ -49,7 +49,7 @@ const PRESETS: Record<string, { nEmbd: string; nHead: string; nKvHead: string; n
 
 const DEFAULT_FORM: FormState = {
   file: "",
-  device: "DefaultDevice",
+  device: "auto",
   dtype: "f32",
   earlyStop: "0",
   epochs: "1",
@@ -344,8 +344,8 @@ export function TrainForm() {
   const running = job.status === "running";
 
   return (
-    <div className="glass-card rounded-2xl p-5 self-start min-w-0">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-4">
+    <div className="glass-card corner-tick rounded-xl p-5 self-start min-w-0">
+      <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500 mb-4">
         Training wizard
       </h3>
 
@@ -357,10 +357,10 @@ export function TrainForm() {
               onClick={() => setStep(i)}
               className={`w-full min-w-0 truncate rounded-lg px-1 py-1.5 text-[10px] leading-tight transition ${
                 i === step
-                  ? "bg-violet-500/20 text-violet-200"
+                  ? "bg-amber-500/15 text-amber-200 border border-amber-500/30"
                   : i < step
-                    ? "text-emerald-300 hover:bg-slate-800/60"
-                    : "text-slate-500 hover:bg-slate-800/60"
+                    ? "text-emerald-300 hover:bg-slate-800/60 border border-transparent"
+                    : "text-slate-500 hover:bg-slate-800/60 border border-transparent"
               }`}
             >
               {i + 1}. {label}
@@ -469,13 +469,15 @@ function StepData({
       <Field label="Device">
         <Select value={form.device} onChange={(e) => set("device", e.target.value)}>
           {devices.length === 0 ? (
-            <option value="DefaultDevice">DefaultDevice</option>
+            <option value="auto">auto</option>
           ) : (
             devices.map((d) => {
               const selector = d.selector || d.name;
               return (
-                <option key={selector} value={selector}>
-                  {selector}
+                <option key={selector} value={selector} disabled={!d.selectable}>
+                  {d.name} · {d.backend}
+                  {d.default ? " · default" : ""}
+                  {d.selectable ? "" : " · offline"}
                 </option>
               );
             })
@@ -498,7 +500,7 @@ function StepData({
             type="checkbox"
             checked={resumeOn}
             onChange={(e) => onToggleResume(e.target.checked)}
-            className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+            className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
           />
           Resume weights from a checkpoint (warm start)
         </label>
@@ -579,8 +581,8 @@ function StepArchitecture({
         <NumberField label="Dropout" step={0.05} min={0} max={0.9} value={form.dropout} onChange={(v) => set("dropout", v)} />
       </div>
 
-      <details className="mt-4 rounded-xl border border-slate-800/70 bg-slate-950/30 px-3 py-2">
-        <summary className="text-xs text-slate-400 cursor-pointer select-none">
+      <details className="mt-4 rounded-lg border border-slate-800/70 bg-slate-950/30 px-3 py-2">
+        <summary className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400 cursor-pointer select-none hover:text-amber-300 transition">
           Attention & cache (advanced)
         </summary>
         <div className="grid grid-cols-2 gap-3 mt-3">
@@ -630,8 +632,8 @@ function StepTraining({
         <NumberField label="Seq warmup steps" min={0} value={form.seqWarmup} onChange={(v) => set("seqWarmup", v)} />
         <NumberField label="Early stop (epochs)" min={0} value={form.earlyStop} onChange={(v) => set("earlyStop", v)} />
       </div>
-      <details className="mt-4 rounded-xl border border-slate-800/70 bg-slate-950/30 px-3 py-2">
-        <summary className="text-xs text-slate-400 cursor-pointer select-none">
+      <details className="mt-4 rounded-lg border border-slate-800/70 bg-slate-950/30 px-3 py-2">
+        <summary className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400 cursor-pointer select-none hover:text-amber-300 transition">
           Regularization (advanced)
         </summary>
         <div className="grid grid-cols-2 gap-3 mt-3">
@@ -680,7 +682,7 @@ function StepReview({
     ["Resume", resumeOn && resumePath ? resumePath : "no"],
   ];
   return (
-    <div className="rounded-xl border border-slate-800/70 bg-slate-950/30 divide-y divide-slate-800/60">
+    <div className="rounded-lg border border-slate-800/70 bg-slate-950/30 divide-y divide-slate-800/60">
       {rows.map(([label, value]) => (
         <div key={label} className="flex justify-between gap-3 px-3 py-2 text-xs">
           <span className="text-slate-500">{label}</span>

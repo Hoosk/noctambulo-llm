@@ -141,7 +141,7 @@ export function DatasetsView() {
       <div className="h-6" />
       <SearchCard onDownloaded={() => void load()} />
       {loaded && datasets.length === 0 ? (
-        <div className="mt-6 p-8 rounded-2xl border border-dashed border-slate-700/70 text-center text-slate-500">
+        <div className="mt-6 p-8 rounded-xl border border-dashed border-slate-700/70 text-center text-slate-500">
           No local datasets. Download one or drop .txt/.bin into datasets/.
         </div>
       ) : null}

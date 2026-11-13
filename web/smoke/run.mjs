@@ -422,7 +422,7 @@ try {
     const imported = modelsList.find((m) => m.name === importedName);
     record(
       "E8 import GGUF",
-      impRes.ok && imported?.compatible === true && imported?.arch_version === 4,
+      impRes.ok && imported?.compatible === true && imported?.arch_version === 5,
       impBody?.error ?? `compatible=${imported?.compatible}`,
     );
     await apiFetch(`/api/models/${encodeURIComponent(importedName)}`, { method: "DELETE" });

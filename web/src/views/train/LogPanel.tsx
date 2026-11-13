@@ -4,7 +4,7 @@ import { useAppState } from "../../state/appContext";
 function lineClass(line: string): string {
   if (/error|panic|failed|fatal/i.test(line)) return "text-rose-400";
   if (/warn/i.test(line)) return "text-amber-300";
-  if (/^== |checkpoint/i.test(line)) return "text-violet-300";
+  if (/^== |checkpoint/i.test(line)) return "text-amber-300";
   return "text-slate-400";
 }
 

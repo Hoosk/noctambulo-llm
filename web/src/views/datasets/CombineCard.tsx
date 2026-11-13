@@ -86,9 +86,9 @@ export function CombineCard({
   };
 
   return (
-    <div className="glass-card rounded-2xl p-5 mt-6">
+    <div className="glass-card corner-tick rounded-xl p-5 mt-6">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Combine with weights</h3>
+        <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Combine with weights</h3>
         <span className="text-xs text-slate-400 tnum">{selectedNames.length} selected</span>
       </div>
       <p className="text-xs text-slate-500 mb-2">

@@ -80,7 +80,7 @@ function ModelRow({
 
   return (
     <li
-      className={`lift rounded-2xl border p-4 flex flex-wrap items-center gap-4 ${
+      className={`lift rounded-xl border p-4 flex flex-wrap items-center gap-4 ${
         isActive ? "border-emerald-500/40 bg-emerald-500/5" : "border-slate-800/70 bg-slate-900/40"
       }`}
     >
@@ -191,8 +191,8 @@ function ImportPanel({ onDone }: { onDone: () => void }) {
   };
 
   return (
-    <div className="mb-5 glass-card rounded-2xl p-4">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-3">
+    <div className="mb-5 glass-card corner-tick rounded-xl p-4">
+      <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500 mb-3">
         Import GGUF
       </h3>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -218,7 +218,7 @@ function ImportPanel({ onDone }: { onDone: () => void }) {
           type="checkbox"
           checked={force}
           onChange={(e) => setForce(e.target.checked)}
-          className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+          className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
         />
         Overwrite if the model directory already exists
       </label>
@@ -261,8 +261,8 @@ function ImportHfPanel({ onStarted }: { onStarted: (opId: string) => void }) {
   };
 
   return (
-    <div className="mb-5 glass-card rounded-2xl p-4">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-3">
+    <div className="mb-5 glass-card corner-tick rounded-xl p-4">
+      <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500 mb-3">
         Import from Hugging Face
       </h3>
       <div className="flex gap-2 mb-3">
@@ -315,7 +315,7 @@ function ImportHfPanel({ onStarted }: { onStarted: (opId: string) => void }) {
           type="checkbox"
           checked={force}
           onChange={(e) => setForce(e.target.checked)}
-          className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+          className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
         />
         Overwrite if the model directory already exists
       </label>
@@ -473,7 +473,7 @@ export function ModelsView() {
       ) : null}
 
       {active ? (
-        <div className="mb-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/10 p-4 flex items-center gap-3 shadow-lg shadow-emerald-500/10">
+        <div className="mb-4 rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4 flex items-center gap-3 shadow-lg shadow-emerald-500/10">
           <span className="text-lg text-emerald-300">✓</span>
           <div className="flex-1 min-w-0">
             <div className="text-sm text-emerald-200 font-medium truncate">
@@ -486,7 +486,7 @@ export function ModelsView() {
       ) : null}
 
       {loaded && models.length === 0 ? (
-        <div className="p-10 rounded-2xl border border-dashed border-slate-700/70 text-center text-slate-500">
+        <div className="p-10 rounded-xl border border-dashed border-slate-700/70 text-center text-slate-500">
           No models. Train one first.
         </div>
       ) : null}

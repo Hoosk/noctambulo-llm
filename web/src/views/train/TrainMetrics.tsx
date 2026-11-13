@@ -53,7 +53,7 @@ function ProgressBar({ job }: { job: JobInfo }) {
   return (
     <div className="mt-5">
       <div className="flex items-center justify-between gap-3 mb-2">
-        <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+        <h4 className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
           {preparing ? "Preparing dataset (tokenizing)…" : "Progress"}
         </h4>
         {preparing ? null : (
@@ -75,8 +75,8 @@ function ProgressBar({ job }: { job: JobInfo }) {
 function PreviewPane({ text }: { text: string }) {
   return (
     <div className="mt-5">
-      <h4 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-2">Preview</h4>
-      <pre className="p-3.5 rounded-xl bg-slate-950/70 border border-slate-800/70 border-l-2 border-l-violet-500/60 text-xs whitespace-pre-wrap text-slate-300 min-h-16 leading-relaxed">
+      <h4 className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500 mb-2">Preview</h4>
+      <pre className="p-3.5 rounded-lg bg-slate-950/70 border border-slate-800/70 border-l-2 border-l-amber-500/60 text-xs whitespace-pre-wrap text-slate-300 min-h-16 leading-relaxed">
         {text || "—"}
       </pre>
     </div>
@@ -85,10 +85,10 @@ function PreviewPane({ text }: { text: string }) {
 
 function lossSeries(job: JobInfo): ChartSeries[] {
   const series: ChartSeries[] = [
-    { label: "train loss", points: job.lossPoints, color: "#8b5cf6" },
+    { label: "train loss", points: job.lossPoints, color: "#f2a93b" },
   ];
   if (job.valPoints.length > 0) {
-    series.push({ label: "val loss", points: job.valPoints, color: "#f59e0b", dashed: true });
+    series.push({ label: "val loss", points: job.valPoints, color: "#7ec7cf", dashed: true });
   }
   return series;
 }
@@ -114,10 +114,10 @@ export function TrainMetrics() {
   };
 
   return (
-    <div className="glass-card rounded-2xl p-5 min-w-0">
+    <div className="glass-card corner-tick rounded-xl p-5 min-w-0">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-5">
         <div className="flex items-center gap-3">
-          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+          <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">
             Live metrics
           </h3>
           <Badge tone={badge.tone} pulse={badge.pulse}>
@@ -154,7 +154,7 @@ export function TrainMetrics() {
       <ProgressBar job={job} />
       <PreviewPane text={job.preview} />
       <details className="mt-5 group" open>
-        <summary className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 cursor-pointer select-none hover:text-slate-300 transition">
+        <summary className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500 cursor-pointer select-none hover:text-slate-300 transition">
           Worker logs
         </summary>
         <LogPanel />

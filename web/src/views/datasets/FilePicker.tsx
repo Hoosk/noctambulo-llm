@@ -66,7 +66,7 @@ export function FilePicker({ files, selected, onChange, limit = 300 }: FilePicke
             <label className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-800/60 cursor-pointer">
               <input
                 type="checkbox"
-                className="accent-violet-500 cursor-pointer shrink-0"
+                className="accent-amber-500 cursor-pointer shrink-0"
                 checked={selectedSet.has(file)}
                 onChange={() => toggle(file)}
               />

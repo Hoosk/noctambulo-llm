@@ -37,7 +37,7 @@ function DatasetRow({
         type="checkbox"
         checked={checked}
         onChange={(e) => onToggle(e.target.checked)}
-        className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+        className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
       />
       <span className="flex items-center gap-2 text-sm text-slate-200 font-mono truncate">
         <Badge tone={dataset.ext === "bin" ? "violet" : "sky"}>{dataset.ext}</Badge>
@@ -82,7 +82,7 @@ function SelectAllCheckbox({
       type="checkbox"
       checked={checked}
       onChange={(e) => onChange(e.target.checked)}
-      className="w-4 h-4 rounded accent-violet-500 cursor-pointer"
+      className="w-4 h-4 rounded accent-amber-500 cursor-pointer"
     />
   );
 }
@@ -97,9 +97,9 @@ export function DatasetList({ datasets, selected, onToggle, onToggleAll, onInfo,
     : datasets;
 
   return (
-    <div className="glass-card rounded-2xl p-5">
+    <div className="glass-card corner-tick rounded-xl p-5">
       <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-        <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">Local datasets</h3>
+        <h3 className="font-mono text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Local datasets</h3>
         <div className="flex items-center gap-3">
           <span className="text-xs text-slate-500 tnum">
             {datasets.length} datasets · {fmtBytes(totalBytes)}

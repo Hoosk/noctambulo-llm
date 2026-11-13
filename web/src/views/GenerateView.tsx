@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
-import type { ModelInfo } from "../api/types";
+import type { DeviceInfo, ModelInfo } from "../api/types";
 import { ViewHeader } from "../components/ui";
 import { readSseData } from "../lib/sseStream";
 import { useAppState } from "../state/appContext";
@@ -26,6 +26,13 @@ const DEFAULT_FORM: GenForm = {
   kvMaxBudget: "",
   kvGrow: "",
   kvGrowInterval: "64",
+  device: "auto",
+};
+
+const PRESETS: Record<string, Partial<GenForm>> = {
+  story: { temperature: "0.85", topK: "50", topP: "0.95", minP: "0.03", rep: "1.15" },
+  balanced: { temperature: "0.8", topK: "40", topP: "0.9", minP: "0.05", rep: "1.2" },
+  precise: { temperature: "0.3", topK: "20", topP: "0.8", minP: "0.1", rep: "1.05" },
 };
 
 interface RunStatus {
@@ -36,6 +43,7 @@ interface RunStatus {
 export function GenerateView() {
   const { activeModel } = useAppState();
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [modelDir, setModelDir] = useState(activeModel);
   const [form, setForm] = useState<GenForm>(DEFAULT_FORM);
   const [output, setOutput] = useState("");
@@ -45,18 +53,25 @@ export function GenerateView() {
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .getModels()
-      .then((list) => {
+    Promise.allSettled([api.getModels(), api.getDevices()])
+      .then(([modelsResult, devicesResult]) => {
         if (cancelled) return;
-        setModels(list);
-        // A persisted selection can point at a model that no longer exists
-        // (deleted/renamed outside the UI): fall back to the default model.
-        setModelDir((current) =>
-          current && list.some((m) => m.dir === current)
-            ? current
-            : (list.find((m) => m.default)?.dir ?? list[0]?.dir ?? ""),
-        );
+        if (modelsResult.status === "fulfilled") {
+          const list = modelsResult.value;
+          setModels(list);
+          // A persisted selection can point at a model that no longer exists
+          // (deleted/renamed outside the UI): fall back to the default model.
+          setModelDir((current) =>
+            current && list.some((m) => m.dir === current)
+              ? current
+              : (list.find((m) => m.default)?.dir ?? list[0]?.dir ?? ""),
+          );
+        }
+        if (devicesResult.status === "fulfilled") {
+          setDevices(devicesResult.value);
+          const preferred = devicesResult.value.find((d) => d.default)?.selector;
+          if (preferred) setForm((f) => ({ ...f, device: preferred }));
+        }
       })
       .catch((e: unknown) => {
         if (!cancelled) {
@@ -75,6 +90,10 @@ export function GenerateView() {
     : (models.find((m) => m.default)?.dir ?? models[0]?.dir ?? "");
   const onField = (key: keyof GenForm, value: string | boolean) =>
     setForm((f) => ({ ...f, [key]: value }) as GenForm);
+  const applyPreset = (name: string) => {
+    const preset = PRESETS[name];
+    if (preset) setForm((f) => ({ ...f, ...preset }));
+  };
 
   const run = async () => {
     if (busy || !selectedDir) return;
@@ -125,6 +144,7 @@ export function GenerateView() {
           kvMaxBudget: Number(form.kvMaxBudget) || 0,
           kvGrow: Number(form.kvGrow) || 0,
           kvGrowInterval: Number(form.kvGrowInterval) || 64,
+          device: form.device || undefined,
         }),
         signal: controller.signal,
       });
@@ -160,17 +180,19 @@ export function GenerateView() {
     <>
       <ViewHeader title="Generate" subtitle="Autoregressive generation with sampling parameters." />
       {models.length === 0 ? (
-        <div className="mb-5 p-4 rounded-2xl border border-dashed border-slate-700/70 text-center text-slate-500">
+        <div className="mb-5 p-4 rounded-xl border border-dashed border-slate-700/70 text-center text-slate-500">
           No models yet. Train one first.
         </div>
       ) : null}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 items-start">
         <GenerateForm
           models={models}
+          devices={devices}
           modelDir={selectedDir}
           onModelChange={setModelDir}
           form={form}
           onField={onField}
+          onPreset={applyPreset}
           busy={busy}
           onRun={() => void run()}
           onStop={() => abortRef.current?.abort()}
