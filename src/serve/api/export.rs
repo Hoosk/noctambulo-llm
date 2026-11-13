@@ -16,6 +16,9 @@ pub(super) struct ExportRequest {
     /// approximation (duplicated K/V weights).
     #[serde(default)]
     approx: bool,
+    /// Device selector override. Absent uses the server default.
+    #[serde(default)]
+    device: Option<String>,
 }
 
 fn default_model_name() -> String {
@@ -38,13 +41,23 @@ pub(super) async fn export_model(
     // progress and cancel a long export.
     let name = req.model_name;
     let approx = req.approx;
+    let device_selector = req
+        .device
+        .or_else(|| state.server.default_device_selector());
     let label = format!("{} → {}.gguf", model_dir.display(), name);
     let op = state.ops.start("export", &label);
     let op_id = op.id().to_string();
     tokio::task::spawn_blocking(move || {
         let progress = |phase: &str, done: u64, total: u64, unit: &str| op.progress(phase, done, total, unit);
         let cancelled = || op.is_cancelled();
-        match run_export(model_dir, &name, approx, &progress, &cancelled) {
+        match run_export(
+            model_dir,
+            &name,
+            approx,
+            device_selector.as_deref(),
+            &progress,
+            &cancelled,
+        ) {
             Ok(path) => op.finish(
                 &format!("GGUF exported: {path}"),
                 Some(serde_json::json!({ "gguf": path })),
@@ -66,6 +79,7 @@ fn run_export(
     model_dir: std::path::PathBuf,
     model_name: &str,
     approx: bool,
+    device_selector: Option<&str>,
     progress: &dyn Fn(&str, u64, u64, &str),
     cancelled: &dyn Fn() -> bool,
 ) -> Result<String, String> {
@@ -79,7 +93,10 @@ fn run_export(
         .check_arch_version(&config_path.display().to_string())
         .map_err(|e| format!("incompatible checkpoint: {e}"))?;
 
-    let device = crate::backend::default_device();
+    let device = match device_selector {
+        Some(selector) => crate::backend::device_from_selector_or_default(selector),
+        None => crate::backend::default_device(),
+    };
     let model: crate::model::Llm = config.init_model(&device);
     let model = crate::storage::load_module(model, &weights_path)
         .map_err(|e| format!("failed to load weights: {e}"))?;

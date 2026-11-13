@@ -10,6 +10,7 @@ import type {
   ModelFilesResponse,
   ModelInfo,
   OpStatus,
+  RemoteNodeInfo,
   RepoFiles,
   RunRecord,
   RunSummary,
@@ -101,6 +102,21 @@ export const api = {
   combineDatasets: (body: CombineRequest) =>
     request<{ opId: string; status: string }>("/api/datasets/combine", { method: "POST", json: body }),
   getDevices: () => request<DeviceInfo[]>("/api/devices"),
+  getRemoteNodes: () => request<RemoteNodeInfo[]>("/api/devices/remote"),
+  addRemoteNode: (body: { name?: string; url: string; token?: string }) =>
+    request<{ id: string; name: string; url: string; devices: number; status: string }>(
+      "/api/devices/remote",
+      { method: "POST", json: body },
+    ),
+  removeRemoteNode: (id: string) =>
+    request<{ removed: string }>(`/api/devices/remote/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  setDefaultDevice: (selector: string) =>
+    request<{ default: string }>("/api/devices/default", {
+      method: "POST",
+      json: { selector },
+    }),
   getTelemetry: () => request<Telemetry>("/api/telemetry"),
   getSystem: () => request<SystemInfo>("/api/system"),
   getModels: () => request<ModelInfo[]>("/api/models"),

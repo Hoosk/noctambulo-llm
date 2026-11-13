@@ -31,7 +31,9 @@ use datasets::{
     dataset_combine, dataset_delete, dataset_download, dataset_info, dataset_rename,
     dataset_repo_files, dataset_search, datasets,
 };
-use devices::devices;
+use devices::{
+    add_remote_node, devices, remote_nodes, remove_remote_node, set_default_device,
+};
 use download::download;
 use export::export_model;
 use generate::{generate_stream, generate_text};
@@ -51,6 +53,9 @@ pub fn router(state: Arc<ServerState>) -> (Router, Arc<JobRegistry>) {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/devices", get(devices))
+        .route("/api/devices/default", post(set_default_device))
+        .route("/api/devices/remote", get(remote_nodes).post(add_remote_node))
+        .route("/api/devices/remote/{id}", delete(remove_remote_node))
         .route("/api/telemetry", get(telemetry::telemetry))
         .route("/api/system", get(system::system))
         .route("/api/datasets", get(datasets))

@@ -85,14 +85,10 @@ pub(super) struct TrainRequest {
     resume: Option<String>,
     #[serde(default = "default_output_dir")]
     output_dir: String,
-    #[serde(default = "default_device")]
-    device: String,
+    #[serde(default)]
+    device: Option<String>,
     #[serde(default = "default_dtype")]
     dtype: String,
-}
-
-fn default_device() -> String {
-    "DefaultDevice".into()
 }
 
 fn default_dtype() -> String {
@@ -255,7 +251,10 @@ pub(super) async fn train(
         save_dir: req.save_dir.map(path_buf_from),
         resume: req.resume.map(path_buf_from),
         output_dir: req.output_dir,
-        device: req.device,
+        device: req
+            .device
+            .or_else(|| state.server.default_device_selector())
+            .unwrap_or_else(|| "auto".into()),
         early_stop_patience: req.early_stop_patience,
         weight_decay: req.weight_decay,
         label_smoothing: req.label_smoothing,

@@ -61,6 +61,10 @@ pub(super) struct GenerateRequest {
     /// Processed tokens between growth steps.
     #[serde(default)]
     kv_grow_interval: Option<usize>,
+    /// Device selector override (`vulkan:integrated(0)`, `flex`,
+    /// `remote://node#0`, ...). Absent uses the server default.
+    #[serde(default)]
+    device: Option<String>,
 }
 
 fn default_max_new_tokens() -> usize {
@@ -111,6 +115,7 @@ struct Sampling {
     kv_max_budget: usize,
     kv_grow: usize,
     kv_grow_interval: usize,
+    device_selector: Option<String>,
 }
 
 impl Sampling {
@@ -153,6 +158,7 @@ impl Sampling {
             kv_max_budget: req.kv_max_budget.unwrap_or(0),
             kv_grow: req.kv_grow.unwrap_or(0),
             kv_grow_interval: req.kv_grow_interval.unwrap_or(64),
+            device_selector: req.device,
         })
     }
 }
@@ -165,7 +171,10 @@ pub(super) async fn generate_text(
     check_token(&state.server, &headers, None)?;
 
     let model_dir = resolve_model_dir(&state.server.models_dir, &req.model_dir)?;
-    let s = Sampling::from_request(req)?;
+    let mut s = Sampling::from_request(req)?;
+    if s.device_selector.is_none() {
+        s.device_selector = state.server.default_device_selector();
+    }
 
     let result = tokio::task::spawn_blocking(move || run_generate(model_dir, s, false, None)).await;
 
@@ -186,7 +195,10 @@ pub(super) async fn generate_stream(
     check_token(&state.server, &headers, None)?;
 
     let model_dir = resolve_model_dir(&state.server.models_dir, &req.model_dir)?;
-    let s = Sampling::from_request(req)?;
+    let mut s = Sampling::from_request(req)?;
+    if s.device_selector.is_none() {
+        s.device_selector = state.server.default_device_selector();
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     tokio::task::spawn_blocking(move || {
@@ -259,7 +271,10 @@ fn run_generate(
     let tokenizer = crate::data::resolve_tokenizer(Some(model_dir.as_path()))
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
-    let device = crate::backend::default_device();
+    let device = match s.device_selector.as_deref() {
+        Some(selector) => crate::backend::device_from_selector_or_default(selector),
+        None => crate::backend::default_device(),
+    };
     run_generate_backend(config, weights_path, tokenizer, s, eviction, device, stream, tx)
 }
 

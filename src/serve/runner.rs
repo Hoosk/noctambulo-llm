@@ -43,11 +43,11 @@ pub struct TrainParams {
     pub z_loss: f32,
 }
 
-/// Parse the machine-readable device selector (`DiscreteGpu(0)`, `Cpu`,
-/// `DefaultDevice`, ...) into a `WgpuDevice`. Unknown selectors fall back to
-/// the default so a stale frontend can never crash the worker.
+/// Parse a device selector (`vulkan:integrated(0)`, `flex`, `remote://id#0`,
+/// ...). Unknown selectors fall back to the automatic backend so a stale
+/// frontend can never crash the worker.
 fn parse_device(selector: &str) -> burn::tensor::Device {
-    crate::backend::wgpu_device_from_selector(selector)
+    crate::backend::device_from_selector_or_default(selector)
 }
 
 /// Shared handle for the currently running job, used to request a graceful stop

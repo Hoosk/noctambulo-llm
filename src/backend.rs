@@ -6,13 +6,118 @@
 //! from user-facing selectors (`wgpu:integrated(0)`, `vulkan`, `flex`,
 //! `ws://host:port#0`, ...) to that device, plus startup defaults for the CLI.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use burn::tensor::{Device, DeviceKind, FloatDType};
 
 static DEFAULT_LABEL: OnceLock<String> = OnceLock::new();
 static REMOTE_TOKEN: OnceLock<String> = OnceLock::new();
+
 static REQUESTED_SELECTOR: OnceLock<String> = OnceLock::new();
+static REMOTE_NODES: LazyLock<Mutex<Vec<RemoteNode>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// A remote compute host registered by the CLI or Web UI.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemoteNode {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub token: Option<String>,
+    pub created_unix: u64,
+}
+
+/// The devices a registered remote node currently exposes.
+#[derive(Debug, Clone)]
+pub struct RemoteNodeDevices {
+    pub node: RemoteNode,
+    pub devices: Vec<DeviceChoice>,
+    pub error: Option<String>,
+}
+
+/// Register (or replace) a remote host in the process-wide registry.
+pub fn register_remote_node(node: RemoteNode) {
+    let mut nodes = REMOTE_NODES.lock().unwrap();
+    if let Some(existing) = nodes.iter_mut().find(|n| n.id == node.id) {
+        *existing = node;
+    } else {
+        nodes.push(node);
+    }
+}
+
+/// Remove a remote host from the registry.
+pub fn unregister_remote_node(id: &str) -> bool {
+    let mut nodes = REMOTE_NODES.lock().unwrap();
+    let before = nodes.len();
+    nodes.retain(|n| n.id != id);
+    nodes.len() != before
+}
+
+/// Snapshot of the registered remote hosts (tokens included: internal use only).
+pub fn remote_nodes() -> Vec<RemoteNode> {
+    REMOTE_NODES.lock().unwrap().clone()
+}
+
+fn remote_node(id: &str) -> Option<RemoteNode> {
+    REMOTE_NODES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|n| n.id == id)
+        .cloned()
+}
+
+/// Connect to every registered remote host and list its devices.
+pub fn probe_remote_nodes() -> Vec<RemoteNodeDevices> {
+    remote_nodes()
+        .into_iter()
+        .map(|node| match remote_devices_for(&node) {
+            Ok(devices) => RemoteNodeDevices {
+                node,
+                devices,
+                error: None,
+            },
+            Err(error) => RemoteNodeDevices {
+                node,
+                devices: Vec::new(),
+                error: Some(error),
+            },
+        })
+        .collect()
+}
+
+/// Test that `url` accepts connections and report how many devices it hosts.
+pub fn probe_remote_url(url: &str, token: Option<&str>) -> Result<usize, String> {
+    let host = make_remote_host(url, token)?;
+    Ok(host.devices().map_err(|err| err.to_string())?.len())
+}
+
+fn remote_devices_for(node: &RemoteNode) -> Result<Vec<DeviceChoice>, String> {
+    let host = make_remote_host(&node.url, node.token.as_deref())?;
+    let devices = host.devices().map_err(|err| err.to_string())?;
+    let mut out = Vec::with_capacity(devices.len());
+    for (index, device) in devices.iter().enumerate() {
+        let identity = device.identity().map(|id| id.name);
+        out.push(DeviceChoice {
+            name: match identity {
+                Some(name) if !name.is_empty() => format!("{name} · {}", node.name),
+                _ => format!("{} · device {index}", node.name),
+            },
+            backend: "Remote".into(),
+            device_type: "Remote".into(),
+            selector: format!("remote://{}#{index}", node.id),
+            vendor: 0,
+            device: index as u32,
+            driver: String::new(),
+            vram_bytes: None,
+            supports_f32: supports(device, FloatDType::F32),
+            supports_f16: supports(device, FloatDType::F16),
+            supports_bf16: supports(device, FloatDType::BF16),
+            remote: true,
+            selectable: true,
+        });
+    }
+    Ok(out)
+}
 
 /// A resolved backend selector.
 #[derive(Debug, Clone)]
@@ -166,11 +271,6 @@ pub fn device_from_selector_or_default(selector: &str) -> Device {
     }
 }
 
-/// Backwards-compatible helper used by the web runner.
-pub fn wgpu_device_from_selector(selector: &str) -> Device {
-    device_from_selector_or_default(selector)
-}
-
 /// Parse a selector, using `token` for remote hosts instead of the environment.
 pub fn resolve_device_with_token(
     selector: &str,
@@ -190,7 +290,11 @@ pub fn resolve_device_with_token(
         });
     }
 
-    if lower.starts_with("ws://") || lower.starts_with("wss://") || lower.starts_with("iroh://") {
+    if lower.starts_with("ws://")
+        || lower.starts_with("wss://")
+        || lower.starts_with("iroh://")
+        || lower.starts_with("remote://")
+    {
         return resolve_remote(raw, token);
     }
 
@@ -490,51 +594,64 @@ fn rocm_device(index: usize) -> Result<Device, String> {
 
 fn resolve_remote(selector: &str, token: Option<&str>) -> Result<SelectedDevice, String> {
     let (base, index) = split_remote_index(selector);
-    #[cfg(feature = "remote")]
-    {
-        use burn::remote::{EndpointId, RemoteHost};
+    let (url, canonical_base, token) = if let Some(id) = base.strip_prefix("remote://") {
+        let id = id.split(['/', '?']).next().unwrap_or(id);
+        let node =
+            remote_node(id).ok_or_else(|| format!("unknown remote node '{id}'"))?;
+        let token = node.token.clone().or_else(|| token.map(str::to_string));
+        (node.url, format!("remote://{id}"), token)
+    } else {
+        (
+            base.to_string(),
+            base.to_string(),
+            token.map(str::to_string),
+        )
+    };
+    let host = make_remote_host(&url, token.as_deref())?;
+    let device = Device::remote_options(&host)
+        .device_index(index)
+        .init()
+        .map_err(|err| format!("cannot connect to remote compute host '{canonical_base}': {err}"))?;
+    Ok(SelectedDevice {
+        device,
+        backend: "Remote".into(),
+        selector: format!("{canonical_base}#{index}"),
+    })
+}
 
-        let host = if base.starts_with("ws://") || base.starts_with("wss://") {
-            #[cfg(feature = "remote-websocket")]
-            {
-                RemoteHost::websocket(base)
-            }
-            #[cfg(not(feature = "remote-websocket"))]
-            {
-                return Err(
-                    "WebSocket remote support is not compiled in (enable `remote-websocket`)"
-                        .into(),
-                );
-            }
-        } else {
-            let id = base
-                .strip_prefix("iroh://")
-                .ok_or_else(|| format!("invalid remote selector '{selector}'"))?;
-            let id = id.split(['/', '?']).next().unwrap_or(id);
-            let id: EndpointId = id
-                .parse()
-                .map_err(|_| format!("invalid Iroh endpoint id '{id}'"))?;
-            RemoteHost::iroh(id)
-        };
-        let host = match token {
-            Some(token) if !token.is_empty() => host.with_credential(token),
-            _ => host,
-        };
-        let device = Device::remote_options(&host)
-            .device_index(index)
-            .init()
-            .map_err(|err| format!("cannot connect to remote compute host '{base}': {err}"))?;
-        Ok(SelectedDevice {
-            device,
-            backend: "Remote".into(),
-            selector: format!("{base}#{index}"),
-        })
-    }
-    #[cfg(not(feature = "remote"))]
-    {
-        let _ = (base, index, token);
-        Err("remote support is not compiled in (enable the `remote` feature)".into())
-    }
+#[cfg(feature = "remote")]
+fn make_remote_host(url: &str, token: Option<&str>) -> Result<burn::remote::RemoteHost, String> {
+    use burn::remote::{EndpointId, RemoteHost};
+
+    let host = if url.starts_with("ws://") || url.starts_with("wss://") {
+        #[cfg(feature = "remote-websocket")]
+        {
+            RemoteHost::websocket(url)
+        }
+        #[cfg(not(feature = "remote-websocket"))]
+        {
+            return Err(
+                "WebSocket remote support is not compiled in (enable `remote-websocket`)".into(),
+            );
+        }
+    } else if let Some(id) = url.strip_prefix("iroh://") {
+        let id = id.split(['/', '?']).next().unwrap_or(id);
+        let id: EndpointId = id
+            .parse()
+            .map_err(|_| format!("invalid Iroh endpoint id '{id}'"))?;
+        RemoteHost::iroh(id)
+    } else {
+        return Err(format!("invalid remote URL '{url}'"));
+    };
+    Ok(match token {
+        Some(token) if !token.is_empty() => host.with_credential(token),
+        _ => host,
+    })
+}
+
+#[cfg(not(feature = "remote"))]
+fn make_remote_host(_url: &str, _token: Option<&str>) -> Result<(), String> {
+    Err("remote support is not compiled in (enable the `remote` feature)".into())
 }
 
 fn split_remote_index(selector: &str) -> (&str, usize) {
@@ -548,7 +665,22 @@ fn split_remote_index(selector: &str) -> (&str, usize) {
 
 /// Every locally selectable backend/device, with canonical selectors.
 pub fn local_devices() -> Vec<DeviceChoice> {
-    let mut out = wgpu_choices();
+    let mut out = vec![DeviceChoice {
+        name: "Automatic (best backend)".into(),
+        backend: auto_label(),
+        device_type: "Auto".into(),
+        selector: "auto".into(),
+        vendor: 0,
+        device: 0,
+        driver: String::new(),
+        vram_bytes: None,
+        supports_f32: true,
+        supports_f16: true,
+        supports_bf16: false,
+        remote: false,
+        selectable: true,
+    }];
+    out.extend(wgpu_choices());
 
     #[cfg(feature = "vulkan")]
     if !out.iter().any(|d| d.backend == "Vulkan") {

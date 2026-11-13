@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+use crate::backend::RemoteNode;
 use crate::train::TrainingEvent;
 
 use super::runs::{RUNS_FILE, RunsStore};
@@ -37,6 +38,10 @@ struct PersistedState {
     loss_points: Vec<LossPoint>,
     #[serde(default)]
     val_points: Vec<LossPoint>,
+    #[serde(default)]
+    remote_nodes: Vec<RemoteNode>,
+    #[serde(default)]
+    default_device: Option<String>,
 }
 
 /// Minimum interval between `persist()` writes during a running job. Progress
@@ -72,6 +77,11 @@ pub struct ServerState {
     val_points: RwLock<Vec<LossPoint>>,
     /// Persisted history of training runs (curves included).
     pub runs: RunsStore,
+    /// Remote compute hosts registered from this server, also mirrored into the
+    /// backend registry so selectors resolve without client-side tokens.
+    remote_nodes: RwLock<Vec<RemoteNode>>,
+    /// Device selector used when a request does not specify one.
+    default_device: RwLock<Option<String>>,
 }
 
 #[derive(Default)]
@@ -97,6 +107,8 @@ impl ServerState {
             loss_points: RwLock::new(Vec::new()),
             val_points: RwLock::new(Vec::new()),
             runs: RunsStore::load(PathBuf::from(RUNS_FILE)),
+            remote_nodes: RwLock::new(Vec::new()),
+            default_device: RwLock::new(None),
         };
         state.load_state();
         state
@@ -215,6 +227,8 @@ impl ServerState {
             job: self.job.read().unwrap().clone(),
             loss_points: self.loss_points_snapshot(),
             val_points: self.val_points_snapshot(),
+            remote_nodes: self.remote_nodes_snapshot(),
+            default_device: self.default_device_selector(),
         };
         if let Ok(bytes) = serde_json::to_vec(&state)
             && std::fs::create_dir_all(".noctambulo").is_ok() && std::fs::write(STATE_TMP, bytes).is_ok() {
@@ -237,6 +251,64 @@ impl ServerState {
         *self.job.write().unwrap() = job;
         *self.loss_points.write().unwrap() = state.loss_points;
         *self.val_points.write().unwrap() = state.val_points;
+        *self.default_device.write().unwrap() = state.default_device;
+        for node in &state.remote_nodes {
+            crate::backend::register_remote_node(node.clone());
+        }
+        *self.remote_nodes.write().unwrap() = state.remote_nodes;
+    }
+
+    /// Remote compute hosts registered with this server.
+    pub fn remote_nodes_snapshot(&self) -> Vec<RemoteNode> {
+        self.remote_nodes.read().unwrap().clone()
+    }
+
+    /// Register or replace a remote host and persist the change.
+    pub fn put_remote_node(&self, node: RemoteNode) {
+        crate::backend::register_remote_node(node.clone());
+        let mut nodes = self.remote_nodes.write().unwrap();
+        if let Some(existing) = nodes.iter_mut().find(|n| n.id == node.id) {
+            *existing = node;
+        } else {
+            nodes.push(node);
+        }
+        drop(nodes);
+        self.persist();
+    }
+
+    /// Remove a remote host and persist the change.
+    pub fn remove_remote_node(&self, id: &str) -> bool {
+        let removed = {
+            let mut nodes = self.remote_nodes.write().unwrap();
+            let before = nodes.len();
+            nodes.retain(|n| n.id != id);
+            nodes.len() != before
+        };
+        if removed {
+            crate::backend::unregister_remote_node(id);
+            let prefix = format!("remote://{id}");
+            let mut default = self.default_device.write().unwrap();
+            if default
+                .as_deref()
+                .is_some_and(|sel| sel == prefix || sel.starts_with(&format!("{prefix}#")))
+            {
+                *default = None;
+            }
+            drop(default);
+            self.persist();
+        }
+        removed
+    }
+
+    /// Selector used by requests that do not specify a device.
+    pub fn default_device_selector(&self) -> Option<String> {
+        self.default_device.read().unwrap().clone()
+    }
+
+    /// Set (or clear) the default device selector and persist it.
+    pub fn set_default_device_selector(&self, selector: Option<String>) {
+        *self.default_device.write().unwrap() = selector;
+        self.persist();
     }
 }
 
@@ -270,6 +342,8 @@ mod tests {
             },
             loss_points: vec![LossPoint { x: 1, y: 8.0 }, LossPoint { x: 2, y: 7.5 }],
             val_points: vec![LossPoint { x: 2, y: 7.8 }],
+            remote_nodes: Vec::new(),
+            default_device: None,
         };
 
         let bytes = serde_json::to_vec(&state).unwrap();

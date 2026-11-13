@@ -119,6 +119,20 @@ export interface DeviceInfo {
   vram_bytes: number | null;
   selectable: boolean;
   selector: string;
+  supports_f32: boolean;
+  supports_f16: boolean;
+  supports_bf16: boolean;
+  remote: boolean;
+  default: boolean;
+  status: string;
+}
+
+export interface RemoteNodeInfo {
+  id: string;
+  name: string;
+  url: string;
+  has_token: boolean;
+  created_unix: number;
 }
 
 export interface CheckpointInfo {
@@ -236,6 +250,7 @@ export interface ExportRequestBody {
   modelDir: string;
   modelName: string;
   approx?: boolean;
+  device?: string;
 }
 
 export type OpEvent =
