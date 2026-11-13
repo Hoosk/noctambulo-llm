@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 
 use burn::tensor::{Device, DeviceKind, FloatDType};
 
-static DEFAULT_DEVICE: OnceLock<Device> = OnceLock::new();
 static DEFAULT_LABEL: OnceLock<String> = OnceLock::new();
 static REMOTE_TOKEN: OnceLock<String> = OnceLock::new();
+static REQUESTED_SELECTOR: OnceLock<String> = OnceLock::new();
 
 /// A resolved backend selector.
 #[derive(Debug, Clone)]
@@ -42,17 +42,20 @@ pub struct DeviceChoice {
     pub selectable: bool,
 }
 
-/// Install the process-wide default device before any command runs.
-pub fn set_default_device(device: Device, label: impl Into<String>) -> Result<(), Device> {
-    let label = label.into();
-    DEFAULT_LABEL.set(label).ok();
-    DEFAULT_DEVICE.set(device).map_err(|device| device)
-}
-
 /// Token used by remote selectors when `NOCTAMBULO_REMOTE_TOKEN` is not set.
 pub fn set_remote_token(token: Option<String>) {
     if let Some(token) = token.filter(|t| !t.is_empty()) {
         REMOTE_TOKEN.set(token).ok();
+    }
+}
+
+/// Request the process-wide device without connecting yet. [`default_device`]
+/// resolves it on first use, so commands that never touch tensors (datasets,
+/// stats, ...) do not open GPUs or dial remote hosts.
+pub fn request_device(selector: Option<String>, token: Option<String>) {
+    set_remote_token(token);
+    if let Some(selector) = selector.filter(|s| !s.trim().is_empty()) {
+        REQUESTED_SELECTOR.set(selector).ok();
     }
 }
 
@@ -67,17 +70,23 @@ fn remote_token() -> Option<String> {
 /// Default compute device for the CLI: an explicit selector, then `cuda` when
 /// compiled, then WGPU, then Flex. `NOCTAMBULO_CPU=1` still forces Flex.
 pub fn default_device() -> Device {
-    if let Some(device) = DEFAULT_DEVICE.get() {
-        return device.clone();
+    let requested = REQUESTED_SELECTOR
+        .get()
+        .cloned()
+        .or_else(|| std::env::var("NOCTAMBULO_DEVICE").ok());
+    if let Some(selector) = requested {
+        match resolve_device_with_token(&selector, remote_token().as_deref()) {
+            Ok(selected) => {
+                DEFAULT_LABEL
+                    .set(format!("{} ({})", selected.backend, selected.selector))
+                    .ok();
+                return selected.device;
+            }
+            Err(err) => eprintln!("warning: {err}; using the automatic backend"),
+        }
     }
     if std::env::var_os("NOCTAMBULO_CPU").is_some() {
         return Device::flex();
-    }
-    if let Ok(selector) = std::env::var("NOCTAMBULO_DEVICE") {
-        match device_from_selector(&selector) {
-            Ok(device) => return device,
-            Err(err) => eprintln!("warning: {err}; using the automatic backend"),
-        }
     }
     auto_device()
 }
@@ -96,6 +105,9 @@ pub fn cpu_device() -> Device {
 pub fn backend_label() -> String {
     if let Some(label) = DEFAULT_LABEL.get() {
         return label.clone();
+    }
+    if let Some(selector) = REQUESTED_SELECTOR.get() {
+        return selector.clone();
     }
     if std::env::var_os("NOCTAMBULO_CPU").is_some() {
         return "Flex (CPU)".into();

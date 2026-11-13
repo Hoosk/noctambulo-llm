@@ -7,7 +7,7 @@ rust-version = "1.95"
 [features]
 # Portable backends: WGPU (auto graphics API), Vulkan/SPIR-V, WebGPU, Flex CPU
 # (SIMD + Rayon), and Burn Remote (client + server over WebSocket/Iroh).
-default = ["wgpu", "vulkan", "webgpu", "flex", "simd", "rayon", "remote"]
+default = ["wgpu", "vulkan", "webgpu", "flex", "simd", "rayon", "remote-server", "remote-websocket"]
 
 wgpu = ["burn/wgpu"]
 vulkan = ["burn/vulkan"]
@@ -15,7 +15,9 @@ webgpu = ["burn/webgpu"]
 flex = ["burn/flex"]
 simd = ["burn/simd"]
 rayon = ["burn/rayon"]
-remote = ["burn/remote", "burn/remote-server", "burn/remote-websocket"]
+remote = ["burn/remote"]
+remote-server = ["remote", "burn/remote-server"]
+remote-websocket = ["remote", "burn/remote-websocket"]
 
 # Hardware backends / experiments are opt-in.
 cuda = ["burn/cuda"]

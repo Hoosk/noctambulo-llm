@@ -87,6 +87,14 @@ fn resolve_arch(
 #[derive(Parser)]
 #[command(name = "noctambulo", author, version, about = "Noctámbulo 2026 Engine", long_about = None)]
 struct Cli {
+    /// Backend/device selector (auto, wgpu, vulkan:integrated(0), flex, cuda:0,
+    /// ws://host:port#0, iroh://<id>#0, ...). Applies to every command that
+    /// creates tensors.
+    #[arg(long, global = true, value_name = "SELECTOR")]
+    device: Option<String>,
+    /// Token for Burn Remote compute hosts (also NOCTAMBULO_REMOTE_TOKEN).
+    #[arg(long, global = true, value_name = "TOKEN")]
+    remote_token: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -111,6 +119,11 @@ enum Commands {
     Import(ImportArgs),
     /// Convert a Hugging Face model (safetensors) into the native format
     ImportHf(ImportHfArgs),
+    /// List every backend/device available to this binary and its selector
+    Devices(DevicesArgs),
+    /// Serve local compute devices to other machines over Burn Remote
+    #[cfg(feature = "remote-server")]
+    RemoteServer(RemoteServerArgs),
     /// Print model parameter count, VRAM footprint, and FLOPs statistics
     Stats,
     /// Serve a web UI to control training/generate/export from the browser
@@ -132,6 +145,34 @@ struct ServeArgs {
     /// Directory containing model outputs and checkpoints
     #[arg(long, default_value = "model_output")]
     models_dir: String,
+}
+
+#[derive(Args)]
+struct DevicesArgs {
+    /// Emit JSON instead of a table
+    #[arg(long)]
+    json: bool,
+}
+
+#[cfg(feature = "remote-server")]
+#[derive(Args)]
+struct RemoteServerArgs {
+    /// Transport: `websocket` (trusted LAN) or `iroh` (encrypted, NAT traversal)
+    #[arg(long, default_value = "websocket")]
+    transport: String,
+    /// WebSocket bind address, or the port Iroh binds (default 0.0.0.0:3000)
+    #[arg(long, default_value = "0.0.0.0:3000")]
+    bind: String,
+    /// Devices to expose (comma-separated selectors). Defaults to the global
+    /// --device, or the automatic local backend.
+    #[arg(long, value_delimiter = ',')]
+    devices: Vec<String>,
+    /// Token clients must present (also NOCTAMBULO_REMOTE_TOKEN)
+    #[arg(long)]
+    token: Option<String>,
+    /// File holding the stable Iroh server identity
+    #[arg(long, default_value = ".noctambulo/iroh.key")]
+    iroh_key: String,
 }
 
 #[derive(Args)]
@@ -514,7 +555,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
     let output_dir = "model_output";
     let custom_tokenizer_file = "custom_tokenizer.json";
-    let device = backend::default_device();
+    let remote_token = cli
+        .remote_token
+        .clone()
+        .or_else(|| std::env::var("NOCTAMBULO_REMOTE_TOKEN").ok());
+    let selector = cli
+        .device
+        .clone()
+        .or_else(|| std::env::var("NOCTAMBULO_DEVICE").ok());
+    backend::request_device(selector, remote_token);
 
     match cli.command {
         Commands::TrainTokenizer(args) => {
@@ -822,7 +871,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let dtype = DType::parse(&args.dtype)?;
             tui::print_info(&format!("Compute precision: {}", dtype.as_str()));
-            tui::print_info(&format!("Backend: {}", backend::backend_label()));
             if dtype == DType::F16 {
                 return Err(
                     "f16 training is not supported (AdamW moment estimates underflow); \
@@ -831,6 +879,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
             let train_device = backend::training_device();
+            tui::print_info(&format!("Backend: {}", backend::backend_label()));
             train(
                 dataset_path_buf.as_deref(),
                 raw_text.as_deref(),
@@ -894,6 +943,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 None
             };
 
+            let device = backend::default_device();
             run_eval(
                 Path::new(&args.model_dir),
                 &dataset_path,
@@ -931,6 +981,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let tokenizer = data::resolve_tokenizer(Some(Path::new(&args.model_dir)))?;
 
+            let device = backend::default_device();
             let dtype = DType::parse(&args.dtype)?;
             tui::print_info(&format!("Compute precision: {}", dtype.as_str()));
             tui::print_info(&format!("Backend: {}", backend::backend_label()));
@@ -993,6 +1044,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let model_config: ModelConfig = serde_json::from_str(&config_str)?;
             model_config.check_arch_version(&config_path.display().to_string())?;
 
+            let device = backend::default_device();
+            tui::print_info(&format!("Backend: {}", backend::backend_label()));
             let model: Llm = model_config.init_model(&device);
             let model = storage::load_module(model, &storage::model_weights_path(Path::new(output_dir)))?;
 
@@ -1054,6 +1107,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 &backend::cpu_device(),
                 &mut progress,
             )?;
+        }
+        Commands::Devices(args) => {
+            run_devices(args)?;
+        }
+        #[cfg(feature = "remote-server")]
+        Commands::RemoteServer(args) => {
+            run_remote_server(args)?;
         }
         Commands::Stats => {
             let config_path = Path::new(output_dir).join("config.json");
@@ -1181,6 +1241,156 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    Ok(())
+}
+
+fn run_devices(args: DevicesArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let devices = backend::local_devices();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&devices)?);
+        return Ok(());
+    }
+
+    let mut compiled = Vec::new();
+    if cfg!(feature = "cuda") {
+        compiled.push("CUDA");
+    }
+    if cfg!(feature = "vulkan") {
+        compiled.push("Vulkan");
+    }
+    if cfg!(feature = "webgpu") {
+        compiled.push("WebGPU");
+    }
+    if cfg!(feature = "wgpu") {
+        compiled.push("WGPU");
+    }
+    if cfg!(feature = "rocm") {
+        compiled.push("ROCm");
+    }
+    if cfg!(feature = "metal") {
+        compiled.push("Metal");
+    }
+    if cfg!(feature = "cpu") {
+        compiled.push("CubeCL CPU");
+    }
+    if cfg!(feature = "flex") {
+        compiled.push("Flex CPU");
+    }
+    if cfg!(feature = "remote") {
+        compiled.push("Remote");
+    }
+
+    println!("Compiled backends: {}", compiled.join(", "));
+    println!("Default selector:  {}", backend::backend_label());
+    println!();
+    println!(
+        "{:<28} {:<14} {:<14} {:<16} {}",
+        "NAME", "BACKEND", "TYPE", "DTYPES", "SELECTOR"
+    );
+    println!("{}", "-".repeat(96));
+    for device in &devices {
+        let mut dtypes = vec!["f32"];
+        if device.supports_f16 {
+            dtypes.push("f16");
+        }
+        if device.supports_bf16 {
+            dtypes.push("bf16");
+        }
+        println!(
+            "{:<28} {:<14} {:<14} {:<16} {}",
+            truncate(&device.name, 28),
+            truncate(&device.backend, 14),
+            truncate(&device.device_type, 14),
+            dtypes.join(" "),
+            device.selector,
+        );
+    }
+    println!("\nUse one with: noctambulo --device <SELECTOR> <command>");
+    Ok(())
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        value.to_string()
+    } else {
+        let mut text: String = value.chars().take(width.saturating_sub(1)).collect();
+        text.push('…');
+        text
+    }
+}
+
+#[cfg(feature = "remote-server")]
+fn run_remote_server(
+    args: RemoteServerArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use burn::server::{IrohIdentity, IrohTransport, RemoteServer, TokenAuthorizer, WebSocketTransport};
+
+    let devices = if args.devices.is_empty() {
+        vec![backend::default_device()]
+    } else {
+        args.devices
+            .iter()
+            .map(|selector| backend::device_from_selector(selector))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if devices.is_empty() {
+        return Err("no devices to expose".into());
+    }
+
+    let mut server = RemoteServer::new(devices);
+    let token = args
+        .token
+        .clone()
+        .or_else(|| std::env::var("NOCTAMBULO_REMOTE_TOKEN").ok())
+        .filter(|t| !t.is_empty());
+    if let Some(token) = token {
+        let authorizer =
+            TokenAuthorizer::new(token).map_err(|err| format!("invalid remote token: {err}"))?;
+        server = server.with_authorizer(authorizer);
+        println!("Remote authentication: token required");
+    } else {
+        println!("Remote authentication: disabled (trusted networks only)");
+    }
+
+    match args.transport.as_str() {
+        "websocket" | "ws" => {
+            let listener = std::net::TcpListener::bind(&args.bind)?;
+            let addr = listener.local_addr()?;
+            println!("Burn Remote server (WebSocket) listening on ws://{addr}");
+            println!("Connect from another machine with: --device ws://{addr}#0");
+            server
+                .serve(WebSocketTransport::from_listener(listener))
+                .map_err(|err| format!("remote server failed: {err}"))?;
+        }
+        "iroh" => {
+            let port = args
+                .bind
+                .rsplit(':')
+                .next()
+                .unwrap_or("3000")
+                .parse::<u16>()
+                .map_err(|_| format!("invalid Iroh port in '{}'", args.bind))?;
+            let key_path = Path::new(&args.iroh_key);
+            if let Some(parent) = key_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let identity = IrohIdentity::load_or_create(key_path)?;
+            let id = identity.id();
+            println!("Burn Remote server (Iroh) id: {id}");
+            println!("Connect from another machine with: --device iroh://{id}#0");
+            server
+                .serve(IrohTransport::new(identity).with_port(port))
+                .map_err(|err| format!("remote server failed: {err}"))?;
+        }
+        other => {
+            return Err(format!(
+                "unknown transport '{other}' (expected 'websocket' or 'iroh')"
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
