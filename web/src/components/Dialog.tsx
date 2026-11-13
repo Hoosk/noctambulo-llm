@@ -108,7 +108,7 @@ export function Dialog({ dialog, onClose }: { dialog: DialogState; onClose: Dial
         className="absolute inset-0 bg-slate-950/70 backdrop-blur-sm cursor-default"
         onClick={() => onClose(null)}
       />
-      <div className="relative glass-card rounded-2xl p-5 w-full max-w-sm animate-scale-in">
+      <div className="relative glass-card corner-tick rounded-xl p-5 w-full max-w-sm animate-scale-in">
         {dialog.kind === "prompt" ? (
           <PromptBody options={dialog.options} onClose={onClose} />
         ) : dialog.kind === "alert" ? (

@@ -2,7 +2,7 @@ import { lazy, Suspense, useMemo } from "react";
 import type { ChartData, ChartOptions } from "chart.js";
 import type { LossPoint } from "../api/types";
 
-const FONT = "'JetBrains Mono', ui-monospace, monospace";
+const FONT = "'IBM Plex Mono', ui-monospace, monospace";
 
 export interface ChartSeries {
   label: string;
@@ -30,20 +30,20 @@ function options(showLegend: boolean): ChartOptions<"line"> {
         display: showLegend,
         position: "top",
         labels: {
-          color: "#94a3b8",
+          color: "#b3a999",
           boxWidth: 12,
           boxHeight: 2,
           font: { family: FONT, size: 10 },
         },
       },
       tooltip: {
-        backgroundColor: "rgba(2, 6, 23, 0.92)",
-        borderColor: "rgba(139, 92, 246, 0.35)",
+        backgroundColor: "rgba(7, 8, 11, 0.96)",
+        borderColor: "rgba(242, 169, 59, 0.38)",
         borderWidth: 1,
-        cornerRadius: 10,
+        cornerRadius: 6,
         padding: 10,
-        titleColor: "#e2e8f0",
-        bodyColor: "#c4b5fd",
+        titleColor: "#f1e8d8",
+        bodyColor: "#f8c978",
         titleFont: { family: FONT, size: 10 },
         bodyFont: { family: FONT, size: 12, weight: 600 },
       },
@@ -51,16 +51,16 @@ function options(showLegend: boolean): ChartOptions<"line"> {
     scales: {
       x: {
         type: "linear",
-        grid: { color: "rgba(51, 65, 85, 0.15)" },
-        border: { color: "rgba(51, 65, 85, 0.4)" },
-        ticks: { color: "#64748b", maxTicksLimit: 10, font: { family: FONT, size: 10 } },
-        title: { display: true, text: "step", color: "#475569", font: { size: 10 } },
+        grid: { color: "rgba(241, 232, 216, 0.055)" },
+        border: { color: "rgba(138, 106, 63, 0.35)" },
+        ticks: { color: "#8f8779", maxTicksLimit: 10, font: { family: FONT, size: 10 } },
+        title: { display: true, text: "step", color: "#6b655c", font: { size: 10 } },
       },
       y: {
-        grid: { color: "rgba(51, 65, 85, 0.15)" },
-        border: { color: "rgba(51, 65, 85, 0.4)" },
-        ticks: { color: "#64748b", font: { family: FONT, size: 10 } },
-        title: { display: true, text: "loss", color: "#475569", font: { size: 10 } },
+        grid: { color: "rgba(241, 232, 216, 0.055)" },
+        border: { color: "rgba(138, 106, 63, 0.35)" },
+        ticks: { color: "#8f8779", font: { family: FONT, size: 10 } },
+        title: { display: true, text: "loss", color: "#6b655c", font: { size: 10 } },
       },
     },
   };
@@ -103,7 +103,7 @@ export function LineChart({
         pointRadius: (ctx) =>
           s.points.length > 1 && ctx.dataIndex === s.points.length - 1 ? 3 : 0,
         pointBackgroundColor: s.color,
-        pointBorderColor: "#0f172a",
+        pointBorderColor: "#0c0e12",
         pointBorderWidth: 1.5,
         pointHoverRadius: 4,
         borderWidth: 2,

@@ -7,9 +7,9 @@ import type {
 import { Icon, type IconName } from "./Icon";
 
 const TONES = {
-  slate: "bg-slate-700/40 text-slate-300",
-  violet: "bg-violet-500/15 text-violet-300",
-  fuchsia: "bg-fuchsia-500/15 text-fuchsia-300",
+  slate: "bg-slate-800/70 text-slate-300",
+  violet: "bg-amber-500/15 text-amber-300",
+  fuchsia: "bg-orange-500/15 text-fuchsia-300",
   emerald: "bg-emerald-500/15 text-emerald-300",
   amber: "bg-amber-500/15 text-amber-300",
   rose: "bg-rose-500/15 text-rose-300",
@@ -20,7 +20,7 @@ export type Tone = keyof typeof TONES;
 
 const BORDERS: Record<Tone, string> = {
   slate: "border-slate-700",
-  violet: "border-violet-500/30",
+  violet: "border-amber-500/30",
   fuchsia: "border-fuchsia-500/30",
   emerald: "border-emerald-500/30",
   amber: "border-amber-500/30",
@@ -38,12 +38,25 @@ export function ViewHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="flex items-end justify-between gap-4 mb-6">
-      <div className="min-w-0">
-        <h2 className="text-xl font-semibold text-white tracking-tight">{title}</h2>
-        {subtitle ? <p className="text-sm text-slate-400 mt-1">{subtitle}</p> : null}
+    <div className="mb-7">
+      <div className="flex items-end justify-between gap-4">
+        <div className="min-w-0">
+          <div className="mb-2 flex items-center gap-2.5">
+            <span className="h-px w-7 bg-amber-500/70" />
+            <span className="font-mono text-[9px] uppercase tracking-[0.3em] text-amber-300/70">
+              Instrument
+            </span>
+          </div>
+          <h2 className="font-display text-3xl sm:text-4xl font-medium text-ivory tracking-tight">
+            {title}
+          </h2>
+          {subtitle ? (
+            <p className="text-sm text-slate-400 mt-1.5 max-w-2xl">{subtitle}</p>
+          ) : null}
+        </div>
+        {actions ? <div className="flex gap-2 shrink-0">{actions}</div> : null}
       </div>
-      {actions ? <div className="flex gap-2 shrink-0">{actions}</div> : null}
+      <div className="mt-4 h-px bg-gradient-to-r from-brass/60 via-slate-700/40 to-transparent" />
     </div>
   );
 }
@@ -54,7 +67,7 @@ export function StatCard({
   icon,
   tone = "slate",
   sub,
-  valueClass = "text-white",
+  valueClass = "text-ivory",
 }: {
   label: string;
   value: ReactNode;
@@ -64,19 +77,22 @@ export function StatCard({
   valueClass?: string;
 }) {
   return (
-    <div className="rounded-xl border border-slate-800 bg-slate-950/70 px-3.5 py-3 min-w-0 transition-colors hover:border-slate-700">
+    <div className="relative overflow-hidden rounded-lg border border-slate-800/80 bg-slate-950/55 px-3.5 py-3 min-w-0 transition-colors hover:border-brass/50">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[11px] font-medium uppercase tracking-wide text-slate-500 truncate">
+        <span className="font-mono text-[9px] font-medium uppercase tracking-[0.16em] text-slate-500 truncate">
           {label}
         </span>
         {icon ? (
-          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${TONES[tone]}`}>
-            <Icon name={icon} className="w-4 h-4" />
+          <div className={`w-7 h-7 rounded-md flex items-center justify-center ${TONES[tone]}`}>
+            <Icon name={icon} className="w-3.5 h-3.5" />
           </div>
         ) : null}
       </div>
-      <div className={`tnum font-mono text-lg font-semibold mt-1 truncate ${valueClass}`}>{value}</div>
-      {sub ? <div className="text-[11px] text-slate-500 mt-0.5 truncate">{sub}</div> : null}
+      <div className={`tnum font-mono text-lg font-semibold mt-1.5 truncate ${valueClass}`}>
+        {value}
+      </div>
+      {sub ? <div className="text-[10px] text-slate-500 mt-0.5 truncate">{sub}</div> : null}
+      <span className="pointer-events-none absolute bottom-0 left-3 right-3 h-px bg-gradient-to-r from-transparent via-amber-500/20 to-transparent" />
     </div>
   );
 }
@@ -92,7 +108,7 @@ export function Badge({
 }) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full border ${TONES[tone]} ${BORDERS[tone]}`}
+      className={`inline-flex items-center gap-1.5 font-mono text-[9px] font-medium uppercase tracking-[0.12em] px-1.5 py-0.5 rounded-[3px] border ${TONES[tone]} ${BORDERS[tone]}`}
     >
       {pulse ? (
         <span className="relative flex w-1.5 h-1.5">
@@ -106,12 +122,12 @@ export function Badge({
 }
 
 const FIELD_BASE =
-  "w-full px-3 py-2 rounded-lg bg-slate-950/70 border border-slate-700/60 text-white text-sm placeholder-slate-500 focus:outline-none focus:border-violet-500 focus:ring-2 focus:ring-violet-500/30 transition";
+  "w-full px-3 py-2 rounded-md bg-slate-950/75 border border-slate-700/70 text-ivory text-sm placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-2 focus:ring-amber-500/20 transition";
 
 export function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="block">
-      <span className="block text-[11px] font-semibold uppercase tracking-wider text-slate-500 mb-1.5">
+      <span className="block font-mono text-[9px] font-semibold uppercase tracking-[0.18em] text-slate-500 mb-1.5">
         {label}
       </span>
       {children}
