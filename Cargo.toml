@@ -5,17 +5,33 @@ edition = "2024"
 rust-version = "1.95"
 
 [features]
-# Optional CUDA backend for the CLI (train/eval/generate/export). Build with
-# `cargo build --release --features cuda`; the web server keeps using WGPU.
+# Portable backends: WGPU (auto graphics API), Vulkan/SPIR-V, WebGPU, Flex CPU
+# (SIMD + Rayon), and Burn Remote (client + server over WebSocket/Iroh).
+default = ["wgpu", "vulkan", "webgpu", "flex", "simd", "rayon", "remote"]
+
+wgpu = ["burn/wgpu"]
+vulkan = ["burn/vulkan"]
+webgpu = ["burn/webgpu"]
+flex = ["burn/flex"]
+simd = ["burn/simd"]
+rayon = ["burn/rayon"]
+remote = ["burn/remote", "burn/remote-server", "burn/remote-websocket"]
+
+# Hardware backends / experiments are opt-in.
 cuda = ["burn/cuda"]
+rocm = ["burn/rocm"]
+metal = ["burn/metal"]
+cpu = ["burn/cpu"]
+x86-v4 = ["burn/x86-v4"]
+fusion = ["burn/fusion"]
+autotune = ["burn/autotune"]
 
 [dependencies]
 # Deep Learning (Burn 0.22 dispatch tensors; models use the burnpack store).
-# Default features are disabled: they pull burn-wgpu's fusion/autotune, and
-# Burn 0.22's fusion graph cache returned wrong matmul results in this engine
-# (reproduced against a manual f64 reference; Flex and no-fusion WGPU are
-# exact). Re-enable default features once the upstream fusion cache is fixed.
-burn = { version = "0.22", default-features = false, features = ["std", "wgpu", "flex", "train", "autodiff", "store"] }
+# Backend features are selected above and default to the portable set. Fusion
+# and autotune stay opt-in: Burn 0.22 returns wrong results when both are
+# enabled together in cached decode (upstream burn#5257).
+burn = { version = "0.22", default-features = false, features = ["std", "train", "autodiff", "store"] }
 
 
 # Tokenización y acceso a Hugging Face
